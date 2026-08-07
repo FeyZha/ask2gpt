@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ask2GPT Relay</title>
+    <link rel="stylesheet" href="/src/popup.css" />
+  </head>
+  <body>
+    <main>
+      <header class="app-header">
+        <div class="product-mark" aria-hidden="true">A2G</div>
+        <div class="app-heading">
+          <h1>Ask2GPT</h1>
+          <p>Chrome Relay</p>
+        </div>
+        <span id="status-dot" class="status-dot status-dot--pending" aria-hidden="true"></span>
+      </header>
+
+      <section class="summary" aria-labelledby="status-title" aria-live="polite" aria-atomic="true">
+        <span class="eyebrow">连接状态</span>
+        <strong id="status-title">正在检测连接…</strong>
+        <p id="status-detail">请保持弹窗打开，通常几秒内完成。</p>
+      </section>
+
+      <section
+        id="guidance"
+        class="guidance"
+        data-state="working"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      >
+        <div class="guidance-icon" aria-hidden="true">
+          <span></span>
+        </div>
+        <div class="guidance-copy">
+          <strong id="guidance-title">正在连接</strong>
+          <p id="guidance-detail">通常只需几秒。</p>
+        </div>
+      </section>
+
+      <section
+        id="project-section"
+        class="project-section"
+        data-bound="false"
+        data-state="unbound"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      >
+        <div class="project-heading-row">
+          <div class="project-copy">
+            <span class="eyebrow">会话保存位置</span>
+            <strong id="project-title">选择一个 Project</strong>
+            <p id="project-detail">选择后，Ask2GPT 的新会话会保存到这里。</p>
+          </div>
+          <span id="project-badge" class="project-badge">未选择</span>
+        </div>
+
+        <div id="project-action-slot" class="project-action-slot"></div>
+
+        <div id="project-chooser" class="project-chooser">
+          <div class="chooser-lead">
+            <span class="step-index" aria-hidden="true">1</span>
+            <div>
+              <strong>选择已有 Project，或新建一个专用 Project</strong>
+              <p>Project 会保留 ChatGPT 中的完整会话历史。</p>
+            </div>
+          </div>
+          <div class="project-choice-grid">
+            <button id="discover-projects" class="choice-card" type="button">
+              <span class="choice-card__icon" aria-hidden="true">↗</span>
+              <span class="choice-card__copy">
+                <strong>选择已有 Project</strong>
+                <small>从已打开的 ChatGPT 页面中选择</small>
+              </span>
+            </button>
+            <button id="create-project" class="choice-card choice-card--accent" type="button">
+              <span class="choice-card__icon" aria-hidden="true">＋</span>
+              <span class="choice-card__copy">
+                <strong>新建专用 Project</strong>
+                <small>自动命名为 Ask2GPT，创建后立即关联</small>
+              </span>
+            </button>
+          </div>
+          <button id="open-chatgpt" class="link-button" type="button">打开 ChatGPT</button>
+        </div>
+
+        <div id="project-discovery" class="project-discovery" hidden>
+          <div class="discovery-heading">
+            <span class="eyebrow">可选择的 Project</span>
+            <button id="refresh-projects" class="text-button" type="button">重新查找</button>
+          </div>
+          <div
+            id="project-candidates"
+            class="project-candidates"
+            role="listbox"
+            aria-label="可选择的 Project"
+          ></div>
+          <p id="project-discovery-message" class="project-discovery-message" hidden></p>
+          <div id="project-discovery-actions" class="project-discovery-actions">
+            <button id="bind-project" class="project-button" type="button" hidden>
+              关联所选 Project
+            </button>
+            <button id="cancel-project-change" class="text-button" type="button" hidden>
+              取消
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <div id="primary-actions" class="primary-actions" hidden>
+        <button id="rescan" class="primary-button" type="button">重新检测</button>
+      </div>
+
+      <section
+        id="relay-recovery"
+        class="relay-recovery"
+        data-recommended="false"
+        aria-label="Relay 恢复操作"
+        hidden
+      >
+        <div id="recovery-action-slot">
+          <button
+            id="reload-relay"
+            class="reload-button"
+            type="button"
+            aria-describedby="status-detail"
+          >
+            重启 Relay
+          </button>
+        </div>
+      </section>
+
+      <details id="advanced" class="advanced">
+        <summary>连接详情</summary>
+        <div class="advanced-content">
+          <section
+            id="background-reception"
+            class="background-reception"
+            aria-labelledby="background-reception-title"
+          >
+            <div class="background-reception__heading">
+              <div>
+                <span class="eyebrow">后台接收</span>
+                <strong id="background-reception-title">增强后台接收</strong>
+              </div>
+              <span id="background-reception-badge" class="mode-badge">默认开启</span>
+            </div>
+            <label class="setting-toggle" for="enhanced-background-toggle">
+              <span class="setting-toggle__copy">
+                <strong>浏览器最小化时优先保持接收</strong>
+                <small id="background-reception-detail"
+                  >默认开启，仅在回答期间连接 Chrome 网络调试接口。</small
+                >
+              </span>
+              <input id="enhanced-background-toggle" type="checkbox" role="switch" />
+              <span class="setting-toggle__control" aria-hidden="true"></span>
+            </label>
+            <p class="permission-note">
+              调试权限由 Chrome 在扩展安装或重新加载时统一确认。开启后仅在回答期间使用；Chrome
+              会显示“正在调试”提示，且同一标签页暂时不能同时使用 DevTools。
+            </p>
+          </section>
+
+          <section id="window-section" class="window-section" aria-labelledby="window-title" hidden>
+            <div class="section-heading">
+              <span id="window-title" class="eyebrow">VS Code 窗口</span>
+              <span id="window-count" class="count-badge">0</span>
+            </div>
+            <div id="window-list" class="window-list" aria-label="VS Code 窗口连接状态"></div>
+          </section>
+
+          <div id="maintenance-actions" class="maintenance-actions"></div>
+
+          <p class="privacy-note">
+            仅连接本机 <code>127.0.0.1:32171–32180</code>；不读取 Cookie、密码或登录凭据。
+          </p>
+          <p id="last-error" class="last-error" hidden></p>
+        </div>
+      </details>
+    </main>
+    <script type="module" src="/src/popup.ts"></script>
+  </body>
+</html>

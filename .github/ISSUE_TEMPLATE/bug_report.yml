@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible Ask2GPT problem without sharing private ChatGPT or code data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include prompts, answers, source code, ChatGPT URLs, cookies, tokens, account details or conversation exports. Report security issues privately as described in SECURITY.md.
+  - type: input
+    id: ask2gpt-version
+    attributes:
+      label: Ask2GPT version
+      placeholder: 0.0.1
+    validations:
+      required: true
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code version
+    validations:
+      required: true
+  - type: input
+    id: chrome-version
+    attributes:
+      label: Chrome version
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic text and redact all private content.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Paste only the output of Ask2GPT's Copy Diagnostics command after reviewing it.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed prompts, answers, code, URLs, identifiers, credentials and account data.
+          required: true

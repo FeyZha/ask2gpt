@@ -1,0 +1,52 @@
+{
+  "name": "ask2gpt-workspace",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Ask2GPT: Codex-style coding chat for VS Code through Chrome Relay.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FeyZha/ask2gpt.git"
+  },
+  "homepage": "https://github.com/FeyZha/ask2gpt#readme",
+  "bugs": {
+    "url": "https://github.com/FeyZha/ask2gpt/issues"
+  },
+  "packageManager": "pnpm@11.20.0",
+  "engines": {
+    "node": "^22.13.0 || >=24.0.0"
+  },
+  "scripts": {
+    "audit:dependencies": "pnpm audit --registry=https://registry.npmjs.org --audit-level=low",
+    "audit:production": "pnpm audit --registry=https://registry.npmjs.org --prod --audit-level=low",
+    "build": "pnpm -r --if-present build",
+    "check": "pnpm -r --if-present check && tsc -p examples/ask2gpt-tour/tsconfig.json",
+    "dev": "pnpm --parallel -r --if-present dev",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "notices:generate": "node scripts/generate-third-party-notices.mjs --write",
+    "notices:check": "node scripts/generate-third-party-notices.mjs --check",
+    "package": "pnpm notices:check && pnpm build && node scripts/package-chrome.mjs && node scripts/package-vscode.mjs && pnpm verify:artifacts && pnpm verify:isolation",
+    "smoke:live": "node scripts/live-relay-smoke.mjs",
+    "test:smoke-script": "node --test scripts/live-relay-smoke.test.mjs scripts/smoke-profile.test.mjs",
+    "test:webview-preview": "node --test scripts/webview-preview.test.mjs",
+    "verify:smoke-harness": "pnpm test:smoke-script && pnpm test:smoke-script",
+    "test": "pnpm -r --if-present test",
+    "verify:boundaries": "node scripts/verify-boundaries.mjs",
+    "verify:artifacts": "node scripts/verify-artifacts.mjs",
+    "verify:isolation": "node scripts/verify-isolation.mjs",
+    "verify": "pnpm format:check && pnpm check && pnpm lint && pnpm verify:boundaries && pnpm verify:isolation && pnpm notices:check && pnpm test && pnpm verify:smoke-harness && pnpm build && pnpm test:webview-preview"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^24.10.0",
+    "eslint": "^9.39.5",
+    "fflate": "^0.8.3",
+    "globals": "^17.3.0",
+    "prettier": "^3.9.6",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.66.0",
+    "ws": "^8.21.2"
+  }
+}

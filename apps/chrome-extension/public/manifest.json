@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Ask2GPT Relay",
+  "version": "0.0.1",
+  "description": "The local Chrome relay for Ask2GPT's Codex-style VS Code chat.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7s8WLRhM/2e33HoSVSzEguHhMUWAS4I+ndZmnChv6HA/B7Mkofw15Tku2yX4JVBgPgN5u74Kk5GZbzCB5PEQcAKTvatNlREYONFHEUbShHzEYsz4xl2AkZDD7pVV/3LeMQtR++G4O8/znVKO0V60rLYL5rXM6kIo5Ip+GUrWaYZjENljOAsW1Ntu0ok98TjVNNesWsBOO1Ct0kZbVGs+Bty/wZGTDr/IyOfF8Z6WDUVduIfdzwWLJ8135ITyXonqdBZONb5tt4MMDxdg//erj+qNxRTr3kUyAJSx38CZ112z/fiGo0J1j9cKqbaTIbJfR8oj04k7/iAE8UCcpVqgxwIDAQAB",
+  "permissions": ["tabs", "storage", "alarms", "debugger", "scripting"],
+  "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Ask2GPT Relay"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["page-model-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:32171 ws://127.0.0.1:32172 ws://127.0.0.1:32173 ws://127.0.0.1:32174 ws://127.0.0.1:32175 ws://127.0.0.1:32176 ws://127.0.0.1:32177 ws://127.0.0.1:32178 ws://127.0.0.1:32179 ws://127.0.0.1:32180"
+  }
+}

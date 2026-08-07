@@ -1,0 +1,367 @@
+# Ask2GPT 0.0.1 — 人工验收
+
+本清单针对 Relay protocol v15。验收前不要混用旧 VSIX 和旧 Chrome Relay。
+
+## 构建、安装与同步升级
+
+- [ ] 从不含 `node_modules`、`dist`、VSIX、ZIP 或旧版本归档的干净 checkout 执行
+      `pnpm install --frozen-lockfile`、`pnpm audit:dependencies` 与 `pnpm verify`，全部通过。
+- [ ] `pnpm package` 生成 `ask2gpt-0.0.1.vsix` 与
+      `ask2gpt-relay-0.0.1.zip`。
+- [ ] `pnpm verify:artifacts` 通过；Release 中两个安装包的 SHA-256 与
+      `SHA256SUMS.txt` 一致。
+- [ ] 根目录 `THIRD_PARTY_NOTICES.txt` 通过 `pnpm notices:check`；VSIX 和 Relay ZIP 都包含
+      完全一致的第三方许可证声明，且同时保留 Ask2GPT 的 MIT `LICENSE`。
+- [ ] 安装 `ask2gpt-0.0.1.vsix` 后执行 **Reload / 重新加载**；没有提示时运行
+      `Developer: Reload Window`。
+- [ ] 在 `chrome://extensions` 中加载 0.0.1 Relay 目录；升级时必须完整替换解压目录，禁止只覆盖
+      `service-worker.js`、`content-script.js` 等个别文件，然后从 Chrome
+      工具栏打开 Relay Popup 并点击“重新加载 Relay”（工具栏无入口时再使用扩展卡片的重载）。
+- [ ] Popup 明确说明重载无需验证码，也不会删除或重命名 ChatGPT 会话。
+- [ ] Chrome 中只保留一个 Ask2GPT Relay 开发者模式目录，扩展 ID 为
+      `jieljndeocnmdlfbmfknfgglfaoneceb`。
+- [ ] Activity Bar 和命令面板
+      `Ask2GPT: 打开问答窗口 / Open Q&A` 都可以召唤视图并聚焦输入框；状态栏不再重复提供入口。
+- [ ] 视图移动到 Secondary Sidebar 后仍能正确定位；运行 `View: Reset View Locations`
+      可以恢复入口。
+- [ ] v15 发布线内按任意顺序更新 VSIX 和 Relay 时，仅 `0.0.1` 起且产品补丁版本一致或相差 1
+      的双端保持连接；正式安装仍要求同版。低于 `0.0.1`、相差两版及以上或跨出 `0.0.x` 时
+      明确显示版本不兼容。同步更新并重载后恢复。
+- [ ] 版本不一致持续存在时，Relay 重试逐步退避到 30 秒，不以亚秒级频率刷连接与日志；
+      同步更新后首次完整握手立即清零退避。
+- [ ] Host 在 `relay.hello` 后拒绝产品版本时，Relay 仍显示明确的版本错误，不出现短暂“已连接”
+      假象；来自伪造 loopback 服务的错误不得触发自动重载或任何 ChatGPT 操作。
+- [ ] 从 0.1.5 或更早版本升级时，不要求输入旧验证码、清除 HMAC 密钥或执行双端配对
+      重置；旧配对数据不参与 protocol v15 连接。
+
+## 零配置 loopback 连接
+
+- [ ] Chrome 已启动、Relay 已启用时，打开 Ask2GPT 后自动连接，无验证码、配对按钮、
+      HMAC、信任码或 SecretStorage 配对步骤。
+- [ ] 安装或 reload VS Code 后不打开 Ask2GPT 侧栏；Extension Host 启动完成即自动监听
+      `127.0.0.1:32171–32180`，Chrome 自动握手，不依赖 `onStartupFinished` 是否被重放。
+- [ ] 人为让首次监听失败一次后释放端口；Host 自动退避重试并恢复监听，无需打开侧栏或点击
+      “重新检查”。在重试计时器存续时关闭 Extension Host，不留下计时器或孤立监听器。
+- [ ] 正常连接时 Webview 不显示端口、实例 ID、连接卡片或“已连接”徽章，用户可以直接
+      输入发送。
+- [ ] 短于 800ms 的启动或重连不显示状态；持续连接中只显示一条轻量行内提示，不遮挡
+      消息、不清空草稿、不提供多余按钮。
+- [ ] Chrome 未启动或 Relay 被禁用时，只显示一个明确的恢复操作；启动或启用后点击
+      “重新检查”可以恢复。
+- [ ] 旧状态意外报告 `pairing-required` 时，Webview 不显示任何验证码，而是给出一个
+      非破坏性的“重新连接”操作。
+- [ ] 运行 `Ask2GPT: 检查 Chrome 连接 / Check Chrome Connection` 只触发重新发现，
+      不删除会话、标签页映射或本地加密历史。
+- [ ] 错误 Chrome Origin、错误扩展 ID、错误 WebSocket subprotocol、错误协议版本、错误
+      消息方向和错误 schema 被拒绝。
+- [ ] 单帧超过 2 MiB、重复 envelope ID 或目标 `instanceId` 不匹配时 fail closed。
+- [ ] 脱敏诊断可以显示版本、端口、连接阶段和错误码，但不包含问题、回答、代码、远端
+      URL、会话 ID 或 `instanceId`。
+
+## 多 VS Code 窗口
+
+- [ ] 同时打开两个不同工作区，每个窗口获得不同端口和 `instanceId`，两边都自动连接。
+- [ ] 同一工作区同时打开两个 VS Code 窗口，确认它们租用不同存储槽位、端口和
+      `instanceId`。
+- [ ] 在全新配置中同时启动两个窗口并各自立即保存第一段会话；重载两个窗口后，两边记录
+      都能解密恢复，SecretStorage 只生成一个主密钥，初始化锁中从未出现密钥材料。
+- [ ] 在两个窗口中分别创建会话并同时提问，问题、标题、流式快照、Stop 和终态不串线。
+- [ ] 在三个窗口中各启动一个回答，三个任务可以并行；第四个活动会话被明确拒绝。
+- [ ] 关闭或 Reload 其中一个窗口，只重连该实例，其他窗口的 socket、标签页和回答不受
+      影响。
+- [ ] Chrome Relay Reload 后，所有打开的 VS Code 窗口分别恢复连接，不要求任何逐窗口
+      人工操作。
+- [ ] 在一个回答生成中点击 Relay Reload；按钮先显示保存状态，重载后原 tab/run 恢复，问题
+      不重复提交，回答继续或从同一页面可见快照收口。
+- [ ] 连续双击 Relay Reload 只产生一次检查点和一次重载；模拟检查点写入失败时不执行重载，
+      原连接保持可用并显示明确错误。
+- [ ] 注入过期或畸形重载检查点后启动 Relay；记录被删除，不恢复其中的标签、Project 或 run。
+- [ ] VS Code 全部关闭后重新打开多个窗口，Chrome 按端口段发现每个实例；退避期间运行
+      “检查 Chrome 连接”可以立即开始新扫描。
+- [ ] 人为把同一 `conversationId` 放入两个实例路由，事件仍由 `instanceId` 隔离，不会
+      进入错误窗口。
+
+## ChatGPT Project 与会话映射
+
+- [ ] 未绑定时 Webview 明确显示 `Ask2GPT Project` 引导；允许保留问题草稿，但发送按钮
+      和模型选择不可用，且 Chrome 不创建 `https://chatgpt.com/` 根页面会话。
+- [ ] 在 Chrome 打开名为 `Ask2GPT` 的 Project 首页或其中任意对话后，Relay Popup 的
+      “绑定当前 Project”显示成功；绑定必须由同一侧栏条目或受限目录数据中的精确名称证明，
+      不能凭正文链接、页面标题、URL slug 或 Project-shaped URL 猜测；关闭 Popup、重载 Relay、
+      重启 Chrome 后可信 `projectBindingV6` 仍直接可用。
+- [ ] 旧 `projectBindingV5` 没有同一 scope 的严格证据时保持待验证且不可发送；核验成功后写入
+      V6 并移除 V5。伪造正文、标题或其他 scope 均不得产生 V6。
+- [ ] 已绑定 Project A 时，即使另一个同名 Project B 可见也不得隐式替换；只有用户在 Popup 中
+      明确点击“重新绑定”并严格验证 B 后才允许切换。
+- [ ] Project 位于另一个 Chrome 窗口且当前窗口没有 Project 时，唯一候选仍可绑定；同时打开
+      多个不同 Project 时明确提示先切换，不会绑定随机候选。
+- [ ] 只打开 ChatGPT 首页且侧栏可见 `Ask2GPT` 时可以直接发现并绑定；没有任何 ChatGPT
+      标签页时，首次提问会新建后台首页、发现 Project、关闭临时页，再从 Project 根页创建
+      会话。没有匹配 Project 时问题保持未发送，并聚焦该首页供用户处理。
+- [ ] 折叠侧栏后仍能通过同一合法侧栏条目的可访问名称识别 Ask2GPT；图标节点或
+      “Project/项目”后缀不会导致漏判，多个不同匹配仍会被拒绝。
+- [ ] 绑定一次后同时打开多个 VS Code 窗口，每个窗口都直接使用同一 Project，不重复绑定。
+- [ ] 每个新会话标签页都先打开绑定的 `https://chatgpt.com/g/.../project`，发送后 URL 保持为
+      同一 scope 的 `https://chatgpt.com/g/.../c/...`。
+- [ ] 页面意外跳到普通 `/c/...` 或另一个 Project scope 时返回
+      `CHATGPT_PROJECT_MISMATCH`，停止同步且不自动重发问题。
+- [ ] 升级前已映射的普通 `/c/...` 会话仍可恢复，但新会话绝不以普通根页为模板。
+- [ ] 普通 `/c/...` 与 Project `/g/.../c/...` 都通过受支持 URL 校验；非
+      `https://chatgpt.com`、非会话路由或畸形 URL 被拒绝。
+- [ ] 新建会话时只管理 Ask2GPT 创建的标签页。
+- [ ] 恢复会话时只接管与本地 `instanceId + conversationId + remoteUrl` 明确匹配的标签页。
+- [ ] 在 ChatGPT 侧栏创建多个无关会话和 Project；Ask2GPT 不读取、枚举、导入或修改
+      它们。
+- [ ] 关闭已映射标签页后，下一轮仅通过该会话保存的 `remoteUrl` 恢复，不扫描侧栏寻找
+      相似标题。
+- [ ] 本地删除或重命名不删除、重命名或移动网站会话。
+- [ ] 远端会话不存在、无权访问或 URL 身份不一致时明确失败，不自动重放本地历史。
+- [ ] 首次从绑定 Project 根页发送时，即使回答 DOM 早于 `/g/.../c/...` URL 出现，也不会
+      报 `CHATGPT_REMOTE_UNAVAILABLE`，最终回答正常落入当前本地会话。
+- [ ] 首次发送依次出现临时 `/c/A`、首个流式快照，并在约 4 秒后切换到最终 `/c/B` 时，
+      回答继续生成；快照、终态、历史和持久化映射最终都指向 B，且全程没有 relay error。
+- [ ] 使用短回答复现 `snapshot(A) → complete(A) → 约 4 秒后 B`；回答在 complete(A) 时立即
+      结束流式状态，随后同一 owned 标签页的完整可见快照把持久化映射更新为 B，不出现假忙。
+- [ ] 使用更快的回答，让 complete 时页面仍停在根地址且 3 秒后仍无 `/c/...`；终态仍正常
+      到达 VS Code，稍后出现 B 时由完整可见历史补齐 URL，不报远端不可用。
+- [ ] 在 complete(A) 后立即追问或重新生成；即使 Host 缓存仍是 A，Relay 也保持当前 owned
+      标签页 B，不把页面反向导航到 A，并把新请求发到当前会话。
+- [ ] 让 B 的页面 DOM 或 Content Script 延迟 5–15 秒才可读取；Relay 保留标签映射并持续重验，
+      一次读取失败不能解绑或报告 `CHATGPT_REMOTE_UNAVAILABLE`。
+- [ ] 回答生成超过 30 秒后再从 A 跳转到 B；exact run 在整个生命周期内仍可采用 B。
+- [ ] 在 A 上于首个回答 token 前点击 Stop，使远端快照只有 user 消息；本地停止状态立即完成，
+      B 稍后仍可通过完整可见历史同步，下一轮正常发送。
+- [ ] 在生成期间重载 ChatGPT 页面或 Chrome Service Worker；Content Script 通过可见 Stop 控件
+      恢复当前 run 后仍保持 canonicalizing，随后的 A→B 不会被锁死或解绑。
+- [ ] 分别让 owned 标签页保持 Chrome 当前选中、切到后台、再切回；这些显示状态都不改变
+      会话所有权，流式、终态和 A→B 同样成功。
+- [ ] 在正常（未最小化）的 Chrome 窗口中把 exact owned 标签页切到后台并选中一个无关用户标签页；
+      发送追问时 owned 标签页进入 `focused=false`、最大 980×760 的桌面布局临时窗口，用户标签页始终保持选中且 Chrome
+      窗口不抢焦点。追问只新增一条用户消息并正常完成，终态后 owned 标签页原位恢复、临时窗口关闭。
+- [ ] Relay Popup 首次使用时“增强后台接收”默认开启。把整个 Chrome 窗口最小化后发送长回答，
+      VS Code 在终态前至少收到两个递增快照；原 Chrome 窗口始终保持最小化且边界不变，exact owned
+      标签页进入不超过 980×760、`type=normal`、`focused=false` 的桌面布局临时窗口。临时窗口不成为前台，终态后
+      标签页移回原窗口、恢复此前 active 标签页、关闭临时窗口，且原 Chrome 仍保持最小化。
+- [ ] 在 Chrome 已经最小化时，从 VS Code 连续两次发送相同的短问题；每次都只新增一条用户
+      消息并收到回答，第二次不会因旧的同文消息误判为已提交；每次运行的临时窗口都不弹到
+      前台、不抢焦点，并在终态后关闭且原窗口仍保持最小化。
+- [ ] 在标签页刚移入临时窗口时立即发送首轮和追问；Relay 必须先取得间隔 350 ms 的两次 composer
+      就绪证明再执行唯一一次页面按钮动作。不得因旧 DOM 短暂可见而留下未提交草稿或永久 busy run。
+- [ ] 临时窗口接收中，用户主动聚焦临时窗口或从任务栏打开 Chrome；Relay 立即把 exact owned 标签页
+      移回使用原尺寸显示的正常 Chrome 窗口并关闭临时窗口，回答结束后保持用户打开的状态，不切回原
+      标签页，也不再次最小化。
+- [ ] 明确关闭“增强后台接收”后，在 Chrome 已最小化时发送短问题；仍使用同一临时窗口完成提交，
+      不出现完整浏览窗口或 `focused:true`。只有流式网络捕获能力随该开关关闭。
+- [ ] 分别在 Chrome 前台与最小化状态发送，均在同一次页面 MAIN-world 调用中验证 owned composer、
+      发送按钮、表单、可见区域和命中点唯一。普通窗口在该事务中只 `click()` 一次；Relay 临时停放窗口只在
+      已验证命中点派发一次 CDP 左键按下/释放。不得聚焦用户的 Chrome 窗口、派发键盘输入、调用
+      `requestSubmit()`、执行备用激活或自动重试。按下或释放结果不确定时只能只读恢复。
+      默认增强模式下，每次激活前须先把 exact owned renderer 的 lifecycle 设为 active 并启用页面焦点
+      模拟；普通后台标签页和最小化窗口中的临时窗口均走同一路径，且不得切换操作系统窗口焦点。
+      关闭增强后台接收时，可建立一个不启用 Network 域的短时 debugger 会话，仅完成该指针动作后
+      立即断开。
+      `scripting` 不可用、标记不唯一、按钮无效、几何异常或命中点被遮挡时必须在操作前失败；激活
+      结果不确定时只能只读恢复，不得重试。仅出现 request-start 不得确认发送；必须观察到匹配的用户
+      消息或 response lifecycle。故意吞掉该次提交时，约 1.5 秒后应提示草稿仍在输入框，不得误报
+      “已显示本轮用户消息”；即使独立 `relay.error` 事件丢失，直接响应也必须释放活动 run 并返回
+      同一脱敏错误码。
+- [ ] 让 ChatGPT 的完整 HTTP 响应仅包含 `stream_handoff`，并让对应 WebSocket 首帧紧接
+      `loadingFinished` 到达；VS Code 仍按顺序收到增量与 `[DONE]`，不提前 detach 或超时。
+- [ ] 回答完成、停止或失败后，Chrome 的调试连接立即断开；另一个标签页或另一个 VS Code
+      窗口的回答不会被当前 run 捕获。
+- [ ] 用户明确关闭“增强后台接收”后，重载 Relay 仍保持关闭，Popup 明确提示最小化时流式
+      内容可能延迟；再次开启后恢复上述后台流式行为。
+- [ ] 在无活动 run 时，用户在同一个 owned 标签页内从 B 主动切换到会话 C；Relay 不导入 C、
+      不改写 B 的绑定。重新选择本地会话或再次发送时，同一标签页恢复到 B。
+- [ ] 新建第二个本地会话会建立独立后台标签页；在两个本地会话间反复切换时，各自始终回到
+      原远端 URL，不新增第三个映射、不交叉同步历史。
+- [ ] 用户关闭 B 的 owned 标签页后，重新选择该本地会话只按保存的 B URL 创建一个替代页；
+      其他本地会话的标签页和映射保持不变。
+- [ ] 完成上述 A→B 会话后，在同一本地会话继续提问；Relay 直接使用当前 B，回答正常完成。
+- [ ] 在上述时序中提前触发页面预热/历史检查，不会把 owned 标签页从当前 B 导航回缓存 A。
+- [ ] 错误 `instanceId`、`conversationId`、`runId`、非 owned tab、非 ChatGPT 域名或畸形快照
+      仍被拒绝，不能修改 URL、标题或回答正文。
+- [ ] `/c/...` 导航之后迟到的首页 `tabs.onUpdated` 事件被忽略，不删除新映射、不终止 run。
+- [ ] 同时连接两个 VS Code 窗口并切换两个 owned 标签页的前后台状态；每个窗口只收到自己
+      的标题、历史和 run 事件，关闭其中一个窗口不影响另一个。
+
+## 标题与当前可见分支同步
+
+- [ ] ChatGPT 为 Ask2GPT 创建或明确映射的会话归纳标题后，本地会话标题更新。
+- [ ] 会话历史面板标题为“ChatGPT 同步会话”，并显示“尚未同步 / 等待同步 / 正在同步 /
+      已同步 / 同步异常”之一。
+- [ ] 后端提供 `titleSource=chatgpt` 时显示“ChatGPT 标题”；提供 `titleSource=local` 时显示
+      “本地标题”；未提供字段时保持兼容推断。
+- [ ] 本地改名不会反向调用 ChatGPT；再次收到当前映射会话的可见远端标题时按产品规则
+      更新本地元数据。
+- [ ] 在一个已映射会话中创建多个回答分支，只同步当前页面可见分支的用户/助手历史。
+- [ ] 切换到另一可见分支后，下一次快照反映新可见分支；Relay 不枚举、合并或缓存所有
+      隐藏分支。
+- [ ] 其他 ChatGPT 标签页、侧栏条目、历史会话和未映射 Project 的标题变化不会进入
+      Ask2GPT。
+
+## 问答与恢复
+
+- [ ] Ask2GPT 中选择的模型、用户消息、流式回答、标题和当前可见历史与映射的 ChatGPT
+      网页会话一致；除工程执行能力外，不建立第二套问答语义或隐藏后端。
+- [ ] 每个本地 `runId` 只产生一条 `conversation.send`；延迟确认、SPA 替换、断线重连、
+      `content.recover` 和历史刷新都不会产生第二条命令或重复用户消息。
+- [ ] 仅让原 composer 或 SPA 替换后的 composer 清空，但不出现本 run 请求生命周期、可见
+      用户消息、Project 会话 URL、生成控件或新 assistant 节点时，发送仍不得被确认。
+- [ ] 无上下文问题在 ChatGPT 页面只出现原始问题。
+- [ ] 回答以 Markdown 流式显示，标题、列表、表格、链接和代码块结构正确。
+- [ ] Stop 只停止当前实例、当前会话、当前 run；Regenerate 只重新生成目标回答。
+- [ ] 在 R1 的 Stop/排队指令仍在 Webview→Host 路上时让 R1 完成并启动 R2；迟到指令携带
+      R1 的 `targetRunId`，不得停止 R2，也不得把追问错挂到 R2。
+- [ ] 生成中输入追问时尾部仍只有一个主按钮：默认 Queue；将
+      `ask2gpt.followUpQueueMode` 设为 `interrupt` 后显示“停止后发送”。后者先持久化一条
+      追问，再停止精确 run，并仅在对应 stopped 终态落盘和 ACK 后晋升一次。
+- [ ] 丢弃 Webview 的 `sendResult`，但正常投递包含 queue item 或同一 `clientRequestId` user
+      message 的权威状态；15 秒后草稿不回弹，再次输入不会重复上一条。
+- [ ] 一个冷标签页正在加载时，其他会话仍能发送，已运行会话仍能 Stop。
+- [ ] 生成中 Reload VS Code，原 `runId` 的流式回答或终态能够恢复。
+- [ ] 生成中 Reload Chrome Relay，任务被重新接管或明确 fail closed，不永久占用并发槽。
+- [ ] 最大化/退出全屏 VS Code，并反复显示、隐藏 Primary/Secondary Sidebar；回答继续传输，
+      恢复可见后显示最新快照。
+- [ ] VS Code 完全遮挡 Chrome 一段时间，回答继续更新，或在页面恢复后通过当前映射标签页
+      补齐。
+- [ ] 连接中断时问题草稿和附件保持；无法确认是否已发送时不自动重复问题。
+- [ ] 屏蔽或丢失 MAIN-world 的响应生命周期事件后，Relay 只在原 owned 标签页和原 run 上通过
+      `content.recover` / 可见 DOM 快照恢复；不得重新发送 `conversation.send`、填写输入框或
+      重放问题。
+- [ ] 10 分钟显示慢速提示；30 分钟结束本地 run，但保留远端 URL 和标签页。
+
+## 上下文与只读边界
+
+- [ ] 在文件、未保存文本或远程编辑器中选中内容后，Ask2GPT 只在黄色灯泡的 Quick Fix
+      列表中贡献一个“问 Ask2GPT（使用当前选区）”；不贡献编辑器标题栏按钮、右键项、CodeLens、行内提示、
+      选区命令面板入口或扩展快捷键；清空选区后入口消失。
+- [ ] 点击该 Quick Fix 后，Ask2GPT 被打开并聚焦；动作携带的文档版本和精确
+      选区显示在 Composer 上方的独立上下文卡片中，问题输入框保持为空且不会自动发送。
+- [ ] 上下文卡片显示代码摘要、文件名和行号，可展开预览并可在发送前移除；操作不修改编辑器内容。
+- [ ] 新建会话或首次进入待发送草稿时保持空白；即使活动编辑器有选区，也不得自动附加选区
+      或当前文件。
+- [ ] 用户通过黄色灯泡 Quick Fix 或输入框 `+` 显式添加的上下文立即可见，显示文件名、语言、行号、
+      字符数、未保存状态和“内联到问题 / 作为代码文件发送”方式；发送前可以预览和移除。
+- [ ] 移除上下文后，本草稿保持无上下文；编辑器焦点、选区、光标或文档变化不得偷偷恢复附件。
+- [ ] 用户可以在当前选区和当前文件之间切换；切换主上下文槽是替换而非叠加，明确选择的其他
+      文本文件仍作为额外附件保留。
+- [ ] 待发送上下文按会话草稿独立保存。切换会话再返回后恢复原附件和移除状态，任何上下文
+      都不得跨会话串入。
+- [ ] 没有活动文本编辑器，或显式选择的是敏感、二进制、超限内容时，附加操作给出简短原因，
+      但普通无上下文问答仍可发送。
+- [ ] 选区为空或活动编辑器不是 `file`、`untitled`、`vscode-remote` scheme 时，不显示 Ask2GPT 选区按钮；旧引用或失效文档版本必须明确拒绝，不得隐式回退到
+      当前文件或读取另一个编辑器。
+- [ ] Composer 左下角 `+` 在无附件和已有附件时都存在。
+- [ ] 通过黄色灯泡 Quick Fix 添加的当前选区、输入框 `+` 添加的当前文件和明确选择的多个文本
+      文件可追加到同一个 Context Bundle。
+- [ ] 取消文件选择不改变已有附件；重复快照去重；每项可独立移除。
+- [ ] 发送前的上下文审阅显示完整附件详情；已发送消息默认只显示紧凑文件名卡片，展开后才显示
+      行号、字符数、未保存状态和“内联到问题 / 作为代码文件发送”方式，超过两项时以 `+N` 收起。
+- [ ] 工作区内文件显示相对路径；工作区外文件不泄露父目录。
+- [ ] 单段不超过 6,000 字符且内联合计不超过 12,000 字符时，ChatGPT 输入框中的 Context
+      Bundle 与审阅预览一致。
+- [ ] 超过内联阈值的大型上下文不出现在输入框，页面显示同名代码文件附件；附件内容与发送时快照
+      完全一致，过程中不创建工作区文件或临时文件。
+- [ ] 文件上传未完成、被 ChatGPT 拒绝或无法确认附件卡片时返回
+      `CHATGPT_ATTACHMENT_FAILED`，问题不发送且本地草稿和上下文保留。
+- [ ] 最终 Prompt 不包含本地 URI、目录清单、未选择文件、隐藏系统策略或本地完整历史。
+- [ ] 附件审阅浮层具有高度上限和独立滚动，不推挤消息或遮挡“回到底部”。
+- [ ] 发送时原子锁定当前可见上下文；等待模型或远端会话准备期间不能出现“界面已移除、实际
+      仍发送旧快照”的竞态。
+- [ ] 发送成功后当前 Context Bundle 进入已发送消息，输入区附件全部清空且不会自动重新挂回；
+      发送失败时问题草稿、附件、默认/手动来源及移除状态完整恢复。
+- [ ] 显式读取只限黄色灯泡 Quick Fix 中唯一的“问 Ask2GPT（使用当前选区）”动作，以及用户从
+      `+` 选择的当前文件；无选区时不显示该动作，也不扫描、搜索、读取或上传工作区其他内容。
+- [ ] 敏感文件、二进制、单项超过 40,000 字符、超过 8 项、总内容超过 60,000 字符、问题
+      超过 20,000 字符或最终 Prompt 超过 100,000 字符时明确拒绝且不静默截断。
+- [ ] “帮我修改并运行测试”“解释如何修改这个算法”等普通编码请求都走同一条 Relay 发送链路，
+      不再被本地关键词或意图分类器拦截。
+- [ ] Relay 只传递聊天与用户显式附加的代码上下文；本地扩展不会自行执行修改、运行、提交、推送
+      或部署操作。
+
+## Cookie、网站存储与权限
+
+- [ ] Chrome manifest 只申请 `tabs`、`storage`、`alarms`、必需的 `debugger` 与 `scripting`；
+      `scripting` 仅用于已验证 owned 标签页的内容运行时恢复和受限 MAIN-world 动作；不申请
+      `cookies`、`history`、`downloads`、`nativeMessaging`、文件 URL 或剪贴板权限。
+- [ ] Content Script 和 Service Worker 不读取 ChatGPT Cookie、网站 `localStorage`、
+      `sessionStorage`、IndexedDB、密码或账号资料；模型目录请求所需短生命周期访问令牌只在
+      标签页内使用，不进入 Relay 消息、日志、诊断或存储。
+- [ ] `chrome.storage` 只保存扩展自己的最小 tab/run 映射和恢复状态；记录中没有问题、回答、
+      代码、Cookie 或网站 storage 内容。
+- [ ] DevTools 中观察普通聊天和 Project 聊天，确认模型目录只请求
+      `https://chatgpt.com/backend-api/models`，MAIN-world 桥接器只改写下一次页面自身的
+      `/backend-api/conversation` 模型字段，不自行发送额外对话请求。
+- [ ] 对每个待发送 run，MAIN-world 桥接器只关联下一次 ChatGPT 页面自身的会话请求，并报告
+      生命周期及当前 assistant 快照；不会关联其他 run，也不读取请求正文。
+- [ ] 增强后台通道只匹配 owned 标签页中本 run 的 `text/event-stream` 响应；遇到
+      `stream_handoff` 时只消费其中声明的 `conversation-turn-*` WebSocket topic，忽略共享连接
+      上的其他 topic，只转发经过大小和归属校验的 assistant Markdown；不记录原始 SSE/WS
+      字节、Cookie、恢复令牌或网站 storage。
+
+## 会话存储与 UI
+
+- [ ] 重启 VS Code 后本地完整历史恢复，扩展私有存储中看不到问题或代码明文。
+- [ ] SecretStorage 只用于本地会话加密主密钥，不存在 Chrome 配对密钥用途。
+- [ ] 新建空会话的初始页直接显示最近三条已有会话、相对时间与“查看全部”，点击可切换；
+      没有历史时显示安静的空状态，不出现大段宣传内容。
+- [ ] 无论会话是否完成预热、Chrome 是否已连接，模型菜单都立即显示“智能、极速、中、高、极高、
+      Pro”六个网页挡位并默认选中“极速”；打开菜单不触发目录请求，也不显示加载状态。
+- [ ] 选择挡位后 VS Code 标签在当前点击内立即变化，不显示“准备模型”或同步状态，也不操作
+      ChatGPT 页面；用户可以继续输入，不需要等待。
+- [ ] 活动会话空闲时即预热账户模型目录和两次一致的完整历史指纹；健康预热后的发送只增加一次
+      新历史检查，并与 debugger 附加并行。冷启动或历史变化时回退到两次稳定检查；切换失败时
+      问题不得提交，成功时 ChatGPT 收到的模型与前端所选挡位一致。
+- [ ] 人为阻塞首个回答后的 `chrome.storage.session.set`，首个非空快照仍先到达 VS Code；解除
+      阻塞后恢复提示完成持久化，Relay 重启仍可只读恢复且不会重复发送。
+- [ ] 发送前模型意图与问题属于同一请求；一次性意图只影响下一次 ChatGPT 页面请求，无法确认
+      时不发送问题，前端保留用户选择以便处理账户权限或网页异常后重试。
+- [ ] 深色、浅色、高对比度及 240px、320px、400px 窄侧栏可用。
+- [ ] 正常状态不显示连接设施；失败行、上下文菜单、附件摘要和浮层不越界。
+- [ ] 菜单、浮层、附件和生成状态使用克制短动画，不产生布局跳动或闪屏。
+- [ ] 流式 Markdown 替换快照时不重播入场动画、不抢走滚动位置。
+- [ ] 长历史和大附件下持续生成时，Webview 只接收当前回答轻量更新，输入和滚动保持响应。
+- [ ] `prefers-reduced-motion` 下关闭非必要动画和顺滑滚动，状态文本与键盘操作正常。
+- [ ] 键盘可打开上下文菜单、逐项浏览、预览、移除和关闭，焦点回到原触发按钮。
+- [ ] `composerEnterBehavior=enter` 时 Enter 发送；`cmdIfMultiline` 时单行 Enter 发送、多行需
+      Ctrl/Cmd+Enter；`cmdAlways` 时仅 Ctrl/Cmd+Enter 发送。Shift+Enter、Alt+Enter 与中文输入法
+      组词期间 Enter 不误发；运行中始终以 Ctrl/Cmd+Shift+Enter 只反转本次 Queue/停止后发送
+      行为，Ctrl/Cmd+Enter 仍严格服从已配置的发送规则。
+- [ ] 回答中的 `javascript:`、原始 HTML 和远端图片不会执行或自动加载。
+
+## 真实登录态 smoke
+
+- [ ] 运行：
+
+  ```powershell
+  pnpm smoke:live -- --host-count 3 --connection-timeout-ms 180000 --generation-timeout-ms 180000
+  ```
+
+- [ ] 首轮三个 Host 真正并发，且每个 run 只观察到一条 `conversation.send`；主 Host 的第二轮
+      能从同一远端会话验证完整历史。
+- [ ] 对持续超过 5 秒的活动 run，约每 5 秒只出现一次合法 `relay.status.request`；它没有
+      `conversationId` 或 `runId`，不填写 composer、不发送问题，并在 run 终止或清理开始后停止。
+- [ ] smoke 只把同一 `conversationId + runId` 的 `generation.complete` 或 `relay.error` 当作
+      终态；只读 `conversation.snapshot` 不能结束 run 或触发重发。
+- [ ] 生成终态先持久进入 Relay outbox；Host 加密落盘回答后才 ACK。屏蔽首个终态帧或 ACK 后，
+      同一 `eventId` 可幂等重放，且旧会话快照不能结束当前 run。
+- [ ] 成功输出只包含版本、端口、计数、耗时和布尔结果。构造失败后检查每个 run 的诊断只含
+      smoke 生成的 `runId`、阶段、`generation.snapshot` / `generation.complete` /
+      `relay.error` 计数，以及最新快照的 `messageCount`、`tailRoles`、`complete`。
+- [ ] smoke 输出和错误诊断都不包含问题、回答、代码、标题、远端 URL、`conversationId`、
+      `instanceId`、附件内容或账号信息。
+- [ ] 分别验证成功、Relay 错误和超时路径：smoke 都自动关闭自己创建的测试标签页；清理时
+      socket 断开会有界重连。无法关闭任一测试标签页时命令以非零结果明确失败，但远端网站
+      会话仍保留。
+
+## protocol v15 本机冒充风险确认
+
+- [ ] 安装文档和诊断说明明确：连接只监听 `127.0.0.1`，但 v15 没有验证码、HMAC 或共享
+      密钥，不能认证对端本机进程。
+- [ ] 团队确认 MVP 接受“本机恶意进程可能占用端口或冒充对端”的风险，不把 loopback
+      等同于安全身份认证。
+- [ ] 协议版本、固定扩展 ID、Origin、subprotocol、schema、方向、帧上限、envelope ID 和
+      `instanceId` 校验仍启用，并明确这些措施不能抵御拥有本机执行权限的攻击者。
+- [ ] 需要抵御本机恶意进程的部署不使用本 MVP；后续方案应评估 Native Messaging 或带
+      操作系统 ACL 的本机 IPC。

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+out/
+coverage/
+*.vsix
+*.zip
+.DS_Store
+*.log
+.vscode-test/
+.smoke/

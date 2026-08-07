@@ -1,0 +1,209 @@
+{
+  "name": "ask2gpt",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "FeyZha",
+  "displayName": "Ask2GPT",
+  "description": "Codex-style coding assistant for VS Code.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FeyZha/ask2gpt.git"
+  },
+  "homepage": "https://github.com/FeyZha/ask2gpt#readme",
+  "bugs": {
+    "url": "https://github.com/FeyZha/ask2gpt/issues"
+  },
+  "type": "module",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "keywords": [
+    "question",
+    "answer",
+    "ask2gpt",
+    "chatgpt",
+    "chrome relay",
+    "code explanation"
+  ],
+  "activationEvents": [
+    "*",
+    "onStartupFinished",
+    "onView:ask2gpt.sidebar",
+    "onCommand:ask2gpt.open",
+    "onCommand:ask2gpt.newConversation",
+    "onCommand:ask2gpt.attachSelection",
+    "onCommand:ask2gpt.attachCurrentFile",
+    "onCommand:ask2gpt.attachFiles",
+    "onCommand:ask2gpt.retryConnection"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./dist/extension.cjs",
+  "files": [
+    "dist",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.txt",
+    "resources",
+    "package.json",
+    "README.md"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Ask2GPT",
+      "properties": {
+        "ask2gpt.followUpQueueMode": {
+          "type": "string",
+          "default": "queue",
+          "enum": [
+            "queue",
+            "interrupt"
+          ],
+          "enumDescriptions": [
+            "Wait for the current answer to finish, then send the follow-up message.",
+            "Stop the current answer, then send the follow-up message."
+          ],
+          "description": "Controls what happens when you send a follow-up while an answer is in progress. Ctrl+Shift+Enter (Windows/Linux) or Cmd+Shift+Enter (macOS) uses the opposite behavior for one submission."
+        },
+        "ask2gpt.composerEnterBehavior": {
+          "type": "string",
+          "default": "enter",
+          "enum": [
+            "enter",
+            "cmdIfMultiline",
+            "cmdAlways"
+          ],
+          "enumDescriptions": [
+            "Enter sends the message; Shift+Enter inserts a new line.",
+            "Enter sends a single-line draft; once the draft has multiple lines, Ctrl+Enter (Windows/Linux) or Cmd+Enter (macOS) sends it.",
+            "Ctrl+Enter (Windows/Linux) or Cmd+Enter (macOS) always sends; Enter inserts a new line."
+          ],
+          "description": "Controls whether Enter or Ctrl+Enter (Windows/Linux) / Cmd+Enter (macOS) submits a message; the running-answer inverse shortcut remains Ctrl/Cmd+Shift+Enter."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "ask2gpt.open",
+        "title": "打开问答窗口 / Open Q&A",
+        "category": "Ask2GPT",
+        "icon": {
+          "light": "resources/icon-light.svg",
+          "dark": "resources/icon-dark.svg"
+        }
+      },
+      {
+        "command": "ask2gpt.newConversation",
+        "title": "New Conversation",
+        "category": "Ask2GPT",
+        "icon": "$(plus)"
+      },
+      {
+        "command": "ask2gpt.attachSelection",
+        "title": "问 Ask2GPT（使用当前选区） / Ask About Selection",
+        "category": "Ask2GPT"
+      },
+      {
+        "command": "ask2gpt.attachCurrentFile",
+        "title": "Attach Current File",
+        "category": "Ask2GPT"
+      },
+      {
+        "command": "ask2gpt.attachFiles",
+        "title": "Attach Files…",
+        "category": "Ask2GPT"
+      },
+      {
+        "command": "ask2gpt.copyDiagnostics",
+        "title": "Copy Diagnostics",
+        "category": "Ask2GPT"
+      },
+      {
+        "command": "ask2gpt.retryConnection",
+        "title": "检查连接 / Check Connection",
+        "category": "Ask2GPT"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ask2gptContainer",
+          "title": "Ask2GPT",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ask2gptContainer": [
+        {
+          "id": "ask2gpt.sidebar",
+          "type": "webview",
+          "name": "Ask2GPT",
+          "contextualTitle": "Ask2GPT",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ask2gpt.open"
+        },
+        {
+          "command": "ask2gpt.newConversation"
+        },
+        {
+          "command": "ask2gpt.attachCurrentFile"
+        },
+        {
+          "command": "ask2gpt.attachFiles"
+        },
+        {
+          "command": "ask2gpt.copyDiagnostics"
+        },
+        {
+          "command": "ask2gpt.retryConnection"
+        },
+        {
+          "command": "ask2gpt.attachSelection",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs && vite build",
+    "check": "tsc --noEmit",
+    "dev": "node esbuild.mjs --watch",
+    "package": "node ../../scripts/package-vscode.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ask2gpt/protocol": "workspace:*",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "ws": "^8.21.2"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@types/vscode": "1.96.0",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^6.0.5",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
+    "jsdom": "^29.1.1",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  }
+}

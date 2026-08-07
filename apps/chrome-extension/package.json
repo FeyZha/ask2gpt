@@ -1,0 +1,23 @@
+{
+  "name": "@ask2gpt/chrome",
+  "version": "0.0.1",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "dev": "vite build --watch",
+    "package": "vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ask2gpt/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.37",
+    "jsdom": "^29.1.1",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  }
+}
