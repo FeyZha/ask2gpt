@@ -1,7 +1,8 @@
 # Ask2GPT security model
 
-Ask2GPT provides a Codex-style coding chat in VS Code while routing model interaction through
-the user's signed-in ChatGPT page. The local extension remains capability-limited:
+Ask2GPT provides focused code Q&A in VS Code while routing model interaction through the user's
+signed-in ChatGPT page. It does not start a Codex/Coding Agent task. The local extension remains
+capability-limited:
 
 - The VS Code extension has no shell, terminal, Git, test runner, patch, or workspace write path;
   coding requests are sent to ChatGPT instead of being blocked by a local intent classifier.
@@ -39,17 +40,21 @@ the user's signed-in ChatGPT page. The local extension remains capability-limite
   transcript baseline, runtime revision and unique marker must all match before execution.
 - In enhanced mode, the same debugger session activates only the owned renderer lifecycle and emulates
   page focus immediately before submission; it does not focus the OS window. A guarded MAIN-world
-  transaction validates the uniquely marked page-owned send button once. A regular page clicks that
-  button in the same transaction; a Relay parking window receives one CDP left-pointer press/release at the
-  validated hit point. If enhanced reception is disabled, a short-lived debugger session performs only
-  that pointer action, enables no Network domain, and detaches immediately.
+  transaction validates the uniquely marked page-owned send button, its visible geometry and an
+  unobscured interior hit point across four stable samples. The Service Worker then sends exactly one
+  CDP left-pointer press/release at that validated point. Page-script clicks, form submission and
+  keyboard injection are never used for sending. If enhanced reception is disabled, a short-lived
+  debugger session performs only that pointer action, enables no Network domain, and detaches immediately.
   The request must match the exact tab, trusted Project URL, run ID, durable pre-dispatch transcript
   baseline, and content-runtime revision; the marker carries only the run ID, must resolve to one
-  connected enabled button, and is removed immediately. An ambiguous activation is never retried.
-- If the exact owned tab is inactive, it is moved into a desktop-layout (at most 980×760)
-  `focused=false` temporary window for the run and returned to its original window at terminal. This
-  supplies real document visibility without selecting the tab in, restoring, or focusing the user's
-  current Chrome window.
+  connected enabled button, and is removed immediately. From `mousePressed` onward, an ambiguous
+  outcome is handled only by read-only inspection/recovery and is never retried.
+- Before the non-idempotent send boundary, inactive or minimized owned tabs may receive a reversible
+  visibility prewarm. The actual pointer action is allowed only after the exact tab has returned to its
+  home window and is Chrome's active tab there. A minimized home window is temporarily restored at
+  validated off-screen bounds without focusing it, then returned to its original bounds/minimized
+  state after the terminal event. Read-only history prewarming may use a non-focused temporary window,
+  but no send action is permitted from that window.
 - Model discovery calls only ChatGPT's same-origin `/backend-api/models` with the current page session.
   A short-lived access token may be read from page bootstrap data for that request, but it is never
   sent to the Relay or VS Code, persisted, cached, logged, or included in diagnostics.

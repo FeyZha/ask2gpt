@@ -381,8 +381,8 @@ const PARKED_WINDOW_HEIGHT = 760;
 const PARKED_WINDOW_MAX_POSITION_ADJUSTMENT = 256;
 const DISPATCH_INTENT_PREWARM_HOLD_MS = 10_000;
 const DISPATCH_INTENT_PREWARM_POLL_MS = 50;
-// Retained only by the inactive rollback implementation below; the live path
-// creates a separate one-pixel-overlap window from the user's saved bounds.
+// A minimized home window is restored only at these safe off-screen bounds,
+// without taking OS focus, then returned to its original bounds and state.
 const PARKED_WINDOW_BOUNDS = { height: 100, left: -16_000, top: -16_000, width: 100 } as const;
 const PARKED_WINDOW_SAFE_EDGE = -8_000;
 const MAIN_WORLD_SEND_ATTRIBUTE = "data-ask2gpt-main-world-send";
@@ -560,7 +560,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
-  if (!consumeExpectedTabActivation(windowId, tabId)) {
+  const homeWindowId = parkingWindowOwners.get(windowId) ?? windowId;
+  const retainedLease = windowVisibilityLeaseStates.get(homeWindowId)?.stack.at(-1);
+  if (!consumeExpectedTabActivation(windowId, tabId) && retainedLease?.tabId !== tabId) {
     markWindowUserIntervened(windowId, tabId);
   }
   void ready
@@ -1112,6 +1114,31 @@ async function wakeEnhancedBackgroundPage(
     // not expose focus emulation, so retain the active page and continue probing.
     capture.lastStage = "dispatch-focus-emulation-unavailable";
     capture.lastError = enhancedDebuggerErrorMessage(error);
+  }
+
+  try {
+    const targetInfoResponse: unknown = await debuggerApi.sendCommand(
+      { tabId },
+      "Target.getTargetInfo",
+    );
+    const targetInfo = isRecord(targetInfoResponse) ? targetInfoResponse.targetInfo : undefined;
+    const targetId = isRecord(targetInfo) ? targetInfo.targetId : undefined;
+    if (typeof targetId !== "string" || targetId.length === 0) {
+      throw new Error("Missing owned page target id.");
+    }
+    await debuggerApi.sendCommand({ tabId }, "Target.activateTarget", { targetId });
+    capture.lastStage = "dispatch-target-active";
+
+    // Focus emulation can report a visible document while ChatGPT still leaves
+    // its composer non-interactive. Promote the already-owned tab at the page
+    // target level before readiness probes; this activates no other tab and does
+    // not request operating-system window focus.
+    await debuggerApi.sendCommand({ tabId }, "Page.bringToFront");
+    capture.lastStage = "dispatch-page-front";
+  } catch (error) {
+    capture.lastStage = "dispatch-page-front-failed";
+    capture.lastError = enhancedDebuggerErrorMessage(error);
+    return false;
   }
   return true;
 }
@@ -2479,10 +2506,12 @@ async function handleOpen(connection: RelayConnection, envelope: RelayEnvelope) 
       // Capture this before the initial snapshot read. A slow, not-yet-loaded
       // tab must not turn an old idle prewarm into a surprise parking-window
       // migration if the user minimizes Chrome several seconds later.
-      const prewarmVisibility =
-        payload.dispatchIntent || (payload.transcriptProof && record.remoteUrl)
-          ? await readTabDispatchVisibility(tabId)
-          : { inactive: false, minimized: false, parked: false };
+      // History refreshes need the same visibility truth as dispatch prewarm:
+      // a normal-window but inactive ChatGPT tab can answer messages while its
+      // entire transcript remains virtualized. Reading two local Chrome
+      // records here is cheap and prevents an empty snapshot from becoming the
+      // only result returned to the Host.
+      const prewarmVisibility = await readTabDispatchVisibility(tabId);
       if (payload.transcriptProof) {
         prewarmConversationTranscriptProof(record, payload.transcriptProof);
       }
@@ -2823,8 +2852,8 @@ async function handleSend(connection: RelayConnection, envelope: RelayEnvelope) 
           }
           const finalDispatchPage = await assertPreDispatchPage(key, run, tabId);
           // The content transaction still owns prompt validation and the exact
-          // send control. The worker uses the already-approved debugger channel
-          // only for one focus-emulated pointer actuation after those checks.
+          // send control. The worker has already made the exact owned page
+          // visible; the page's MAIN world remains the only activation path.
           const contentSendCommand = {
             type: "content.send",
             conversationId,
@@ -4821,6 +4850,39 @@ function cachedConversationTranscriptFingerprint(record: TabRecord, remoteUrl: s
   );
 }
 
+async function isStrictCachedTranscriptSuffix(
+  record: TabRecord,
+  snapshot: VisibleConversationSnapshot,
+) {
+  const cached = cachedConversationTranscriptFingerprint(record, snapshot.remoteUrl);
+  if (
+    !cached ||
+    snapshot.messages.length === 0 ||
+    snapshot.messages.length >= cached.messageCount
+  ) {
+    return false;
+  }
+  const offset = cached.messageCount - snapshot.messages.length;
+  for (let index = 0; index < snapshot.messages.length; index += 1) {
+    const message = snapshot.messages[index]!;
+    const expected = cached.messageHashes[offset + index];
+    if (!expected || expected.role !== message.role) return false;
+    const actualSha256 = await sha256Hex(JSON.stringify([message.role, message.markdown]));
+    if (expected.sha256 === actualSha256) continue;
+    const rawRenderEquivalent =
+      message.role === "assistant"
+        ? rawAssistantMarkdownForEscapedIntrawordUnderscores(message.markdown)
+        : undefined;
+    if (
+      !rawRenderEquivalent ||
+      expected.sha256 !== (await sha256Hex(JSON.stringify([message.role, rawRenderEquivalent])))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function rememberConversationTranscriptFingerprint(
   record: TabRecord,
   snapshot: VisibleConversationSnapshot,
@@ -4908,7 +4970,7 @@ async function prewarmConversationDispatchState(
     await prepareDispatchTranscriptBaseline(key, tabId);
   };
 
-  if (holdForDispatchIntent && (visibility.minimized || visibility.parked)) {
+  if (holdForDispatchIntent && (visibility.inactive || visibility.minimized || visibility.parked)) {
     const requestedDeadline = Date.now() + DISPATCH_INTENT_PREWARM_HOLD_MS;
     dispatchIntentPrewarmDeadlines.set(
       key,
@@ -4920,7 +4982,7 @@ async function prewarmConversationDispatchState(
       return;
     }
 
-    const task = withTransientConversationTabActivation(
+    const task = withConversationTabActiveInHomeWindow(
       key,
       tabId,
       async () => {
@@ -4955,14 +5017,14 @@ async function prewarmConversationDispatchState(
   if (holdForDispatchIntent) {
     // A normal-window renderer needs no prewarm visibility lease. Refreshing
     // its exact transcript and composer state while the user types still
-    // removes that work from the eventual send path; the send phase parks it
-    // if it is no longer the active tab.
+    // removes that work from the eventual send path; the send phase selects it
+    // in the same non-focused Chrome window if it is no longer active.
     await prepare(true);
     return;
   }
 
-  if (visibility.minimized || visibility.parked) {
-    await withTransientConversationTabActivation(
+  if (visibility.inactive || visibility.minimized || visibility.parked) {
+    await withConversationTabActiveInHomeWindow(
       key,
       tabId,
       async () => await prepare(true),
@@ -5200,7 +5262,12 @@ function prepareRelayReload() {
 function scheduleRelayRuntimeReload() {
   if (relayRuntimeReloadScheduled) return;
   relayRuntimeReloadScheduled = true;
-  setTimeout(() => chrome.runtime.reload(), 0);
+  // Capture this worker's runtime object. Test harnesses replace the global
+  // `chrome` between workers, and a queued callback must never reload a later
+  // worker. In production the capture is equivalent and makes ownership of
+  // the one scheduled reload explicit.
+  const runtime = chrome.runtime;
+  setTimeout(() => runtime.reload(), 0);
 }
 
 async function performRelayReloadPreparation() {
@@ -6943,7 +7010,9 @@ async function handleContentMainWorldSendRequest(
       candidate.runId === request.runId &&
       candidate.tabId === senderTabId,
   );
-  if (matches.length !== 1) return { ok: false, dispatched: false };
+  if (matches.length !== 1) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-match" };
+  }
 
   const [key, run] = matches[0]!;
   const record = conversationTabs.get(key);
@@ -6954,40 +7023,70 @@ async function handleContentMainWorldSendRequest(
   const scripting = (
     chrome as typeof chrome & { scripting?: Pick<typeof chrome.scripting, "executeScript"> }
   ).scripting;
-  if (
-    !record ||
-    record.tabId !== senderTabId ||
-    activeRuns.get(key) !== run ||
-    run.phase !== "dispatching" ||
-    run.tabId !== senderTabId ||
-    !tab?.url ||
-    !isChatGptPageUrl(tab.url) ||
-    !senderRemoteUrl ||
-    senderRemoteUrl !== tabRemoteUrl ||
-    !projectUrlMatchesRecord(record, tabRemoteUrl) ||
-    !baseline ||
-    baseline.runId !== run.runId ||
-    baseline.tabId !== senderTabId ||
-    !scripting
-  ) {
-    return { ok: false, dispatched: false };
+  if (!record) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-record" };
+  }
+  if (record.tabId !== senderTabId || run.tabId !== senderTabId) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-tab" };
+  }
+  if (activeRuns.get(key) !== run || run.phase !== "dispatching") {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-active" };
+  }
+  if (!tab?.url || !isChatGptPageUrl(tab.url)) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-url" };
+  }
+  // `MessageSender.url` identifies the document that received the content
+  // script. ChatGPT changes conversations with History API navigation, so that
+  // value can remain the project root while `tabs.get().url` already contains
+  // the current conversation. Require both URLs to remain inside the exact
+  // bound project; strict string equality would reject every later turn.
+  if (!senderRemoteUrl || !projectUrlMatchesRecord(record, senderRemoteUrl)) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-sender" };
+  }
+  if (!projectUrlMatchesRecord(record, tabRemoteUrl)) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-project" };
+  }
+  if (!baseline || baseline.runId !== run.runId || baseline.tabId !== senderTabId) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-baseline" };
+  }
+  if (!scripting) {
+    return { ok: false, dispatched: false, attempted: false, reason: "run-state-scripting" };
+  }
+  if (tab.active !== true) {
+    return { ok: false, dispatched: false, attempted: false, reason: "tab-inactive" };
   }
 
   const chromeWindow = await chrome.windows.get(tab.windowId).catch(() => undefined);
-  if (!chromeWindow) return { ok: false, dispatched: false, attempted: false };
-  // A regular Chrome window, even when another application owns OS focus, can
-  // still accept the page-owned synchronous click. Only a Relay-created
-  // parking window needs trusted input; this keeps the debugger boundary as
-  // narrow as the real ChatGPT failure mode observed in live verification.
-  const requiresTrustedPointer = parkingWindowOwners.has(tab.windowId);
-  const trustedPointer = requiresTrustedPointer
-    ? await prepareTrustedComposerPointer(key, run, senderTabId)
-    : undefined;
-  if (requiresTrustedPointer && !trustedPointer) {
-    return { ok: false, dispatched: false, attempted: false };
+  if (!chromeWindow) {
+    return { ok: false, dispatched: false, attempted: false, reason: "window-missing" };
+  }
+  // Live Chrome verification proves that ChatGPT ignores programmatic and CDP
+  // activation inside a second, non-focused parking window. The dispatch path
+  // must first return to the owned home window and make this exact tab visible.
+  if (parkingWindowOwners.has(tab.windowId)) {
+    return { ok: false, dispatched: false, attempted: false, reason: "temporary-window" };
   }
 
+  // Current ChatGPT builds accept a synthetic page click for a brand-new
+  // conversation but ignore the same activation for a follow-up. Always cross
+  // the final boundary with one trusted pointer click, regardless of whether
+  // Chrome currently owns OS focus.
+  const trustedPointer = await prepareTrustedComposerPointer(key, run, senderTabId);
+  if (!trustedPointer) {
+    return { ok: false, dispatched: false, attempted: false, reason: "debugger-unavailable" };
+  }
+
+  let dispatchStage = "main-world-validation";
+  let pointerPressed = false;
   try {
+    dispatchStage = "page-bring-to-front";
+    if (trustedPointer.capture) trustedPointer.capture.lastStage = "dispatch-page-front";
+    await trustedPointer.debuggerApi.sendCommand({ tabId: senderTabId }, "Page.bringToFront");
+    const frontTab = await chrome.tabs.get(senderTabId).catch(() => undefined);
+    if (frontTab?.active !== true) {
+      return { ok: false, dispatched: false, attempted: false, reason: "tab-not-front" };
+    }
+    dispatchStage = "main-world-validation";
     const results = await promiseWithTimeout(
       scripting.executeScript({
         target: { tabId: senderTabId },
@@ -6999,7 +7098,6 @@ async function handleContentMainWorldSendRequest(
           MAIN_WORLD_SCOPE_ATTRIBUTE,
           MAIN_WORLD_COMPOSER_ATTRIBUTE,
           MAIN_WORLD_SEND_ATTRIBUTE,
-          requiresTrustedPointer,
         ],
       }),
       2_000,
@@ -7007,9 +7105,7 @@ async function handleContentMainWorldSendRequest(
     );
     const result =
       results.length === 1 && results[0]?.frameId === 0 ? results[0].result : undefined;
-    if (result === "clicked") return { ok: true, dispatched: true, attempted: true };
     if (
-      trustedPointer &&
       isRecord(result) &&
       result.status === "pointer-ready" &&
       typeof result.x === "number" &&
@@ -7023,13 +7119,37 @@ async function handleContentMainWorldSendRequest(
         (enhancedDebuggerCaptures.get(senderTabId)?.runId !== run.runId &&
           !trustedPointer.detachAfter)
       ) {
-        return { ok: false, dispatched: false, attempted: false };
+        return { ok: false, dispatched: false, attempted: false, reason: "run-changed" };
       }
+      const activeDispatchTab = await chrome.tabs.get(senderTabId).catch(() => undefined);
+      if (activeDispatchTab?.active !== true) {
+        return {
+          ok: false,
+          dispatched: false,
+          attempted: false,
+          reason: "tab-left-front",
+        };
+      }
+      dispatchStage = "pointer-move";
+      if (trustedPointer.capture) trustedPointer.capture.lastStage = "dispatch-pointer-moved";
+      await trustedPointer.debuggerApi.sendCommand(
+        { tabId: senderTabId },
+        "Input.dispatchMouseEvent",
+        {
+          type: "mouseMoved",
+          x: result.x,
+          y: result.y,
+          button: "none",
+          buttons: 0,
+          pointerType: "mouse",
+        },
+      );
+      dispatchStage = "pointer-press";
+      pointerPressed = true;
       if (trustedPointer.capture) trustedPointer.capture.lastStage = "dispatch-pointer-pressed";
-      // These are the only synthetic pointer events Ask2GPT emits. The MAIN-world
-      // transaction above has already proved a unique, enabled, unobscured
-      // page-owned button at this exact point. From mousePressed onward the
-      // outcome is ambiguous and no code path may retry the action.
+      // MAIN world already proved a unique, enabled and unobscured run-owned
+      // button at this exact point. From mousePressed onward the outcome is
+      // ambiguous and no code path may retry the action.
       await trustedPointer.debuggerApi.sendCommand(
         { tabId: senderTabId },
         "Input.dispatchMouseEvent",
@@ -7043,6 +7163,7 @@ async function handleContentMainWorldSendRequest(
           pointerType: "mouse",
         },
       );
+      dispatchStage = "pointer-release";
       await trustedPointer.debuggerApi.sendCommand(
         { tabId: senderTabId },
         "Input.dispatchMouseEvent",
@@ -7059,7 +7180,19 @@ async function handleContentMainWorldSendRequest(
       if (trustedPointer.capture) trustedPointer.capture.lastStage = "dispatch-pointer-released";
       return { ok: true, dispatched: true, attempted: true };
     }
-    return { ok: false, dispatched: false, attempted: false };
+    return {
+      ok: false,
+      dispatched: false,
+      attempted: false,
+      reason: typeof result === "string" ? result : "pointer-target",
+    };
+  } catch {
+    return {
+      ok: false,
+      dispatched: false,
+      attempted: pointerPressed,
+      reason: dispatchStage,
+    };
   } finally {
     if (trustedPointer?.detachAfter) {
       await trustedPointer.debuggerApi.detach({ tabId: senderTabId }).catch(() => undefined);
@@ -7076,8 +7209,8 @@ async function prepareTrustedComposerPointer(key: string, run: ActiveRunRecord, 
   }
   try {
     // Enhanced reception may be explicitly disabled. A short-lived debugger
-    // session is still required for one trusted pointer in a Relay parking window;
-    // it enables no Network domains and is detached immediately after release.
+    // session performs only this one guarded pointer action and enables no
+    // Network domains before detaching immediately after release.
     await debuggerApi.attach({ tabId }, "1.3");
     return { debuggerApi, detachAfter: true } as const;
   } catch {
@@ -7085,73 +7218,199 @@ async function prepareTrustedComposerPointer(key: string, run: ActiveRunRecord, 
   }
 }
 
-function activateMarkedComposerSendInMainWorld(
+async function activateMarkedComposerSendInMainWorld(
   runId: string,
   scopeAttribute: string,
   composerAttribute: string,
   sendAttribute: string,
-  returnPointerTarget: boolean,
 ) {
-  const scopes = [...document.querySelectorAll<HTMLElement>(`[${scopeAttribute}]`)].filter(
-    (element) => element.getAttribute(scopeAttribute) === runId,
-  );
-  const composers = [...document.querySelectorAll<HTMLElement>(`[${composerAttribute}]`)].filter(
-    (element) => element.getAttribute(composerAttribute) === runId,
-  );
-  const buttons = [...document.querySelectorAll<HTMLButtonElement>(`[${sendAttribute}]`)].filter(
-    (element) => element.getAttribute(sendAttribute) === runId,
-  );
-  if (scopes.length !== 1 || composers.length !== 1 || buttons.length !== 1) {
-    return "marker-count";
-  }
-  const scope = scopes[0]!;
-  const composer = composers[0]!;
-  const button = buttons[0]!;
-  const contentEditable = composer.getAttribute("contenteditable");
-  if (
-    !(scope instanceof HTMLElement) ||
-    !scope.isConnected ||
-    !(composer instanceof HTMLElement) ||
-    !composer.isConnected ||
-    (!(composer instanceof HTMLTextAreaElement) &&
-      !composer.isContentEditable &&
-      contentEditable !== "true" &&
-      contentEditable !== "plaintext-only") ||
-    !(button instanceof HTMLButtonElement) ||
-    !button.isConnected ||
-    button.disabled ||
-    button.getAttribute("aria-disabled") === "true" ||
-    !scope.contains(composer) ||
-    !scope.contains(button) ||
-    (button.form !== null && !button.form.contains(composer))
-  ) {
-    return "invalid-ownership";
-  }
-  const rect = button.getBoundingClientRect();
-  if (
-    !Number.isFinite(rect.left) ||
-    !Number.isFinite(rect.top) ||
-    !Number.isFinite(rect.width) ||
-    !Number.isFinite(rect.height) ||
-    rect.width <= 0 ||
-    rect.height <= 0
-  ) {
-    return "invalid-geometry";
-  }
-  const x = rect.left + rect.width / 2;
-  const y = rect.top + rect.height / 2;
-  if (typeof document.elementFromPoint === "function") {
-    const hit = document.elementFromPoint(x, y);
-    if (!(hit instanceof Element) || (hit !== button && !button.contains(hit))) {
-      return "occluded";
+  const noticeSelector = '[data-testid="modal-conversation-history-rate-limit"]';
+  const isRendered = (element: HTMLElement) => {
+    for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+      if (current.hidden || current.hasAttribute("inert")) return false;
+      const style = getComputedStyle(current);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        style.opacity === "0"
+      ) {
+        return false;
+      }
     }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const dismissLateConversationHistoryNotice = async () => {
+    const notices = [...document.querySelectorAll<HTMLElement>(noticeSelector)].filter(isRendered);
+    if (notices.length === 0) return undefined;
+    if (notices.length !== 1) return "notice-count" as const;
+    const notice = notices[0]!;
+    const buttons = [...notice.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) =>
+        isRendered(button) && !button.disabled && button.getAttribute("aria-disabled") !== "true",
+    );
+    if (buttons.length !== 1) return "notice-controls" as const;
+    // This exact ChatGPT notice can mount after the isolated-world preflight.
+    // Its sole confirmation is safe to acknowledge; no generic dialog or send
+    // control is ever clicked here.
+    buttons[0]!.click();
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline) {
+      if (!notice.isConnected || !isRendered(notice)) return undefined;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    return "notice-open" as const;
+  };
+  const noticeFailure = await dismissLateConversationHistoryNotice();
+  if (noticeFailure) return noticeFailure;
+
+  let lastOcclusionDiagnostic = "unknown";
+  const readTarget = () => {
+    const scopes = [...document.querySelectorAll<HTMLElement>(`[${scopeAttribute}]`)].filter(
+      (element) => element.getAttribute(scopeAttribute) === runId,
+    );
+    const composers = [...document.querySelectorAll<HTMLElement>(`[${composerAttribute}]`)].filter(
+      (element) => element.getAttribute(composerAttribute) === runId,
+    );
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>(`[${sendAttribute}]`)].filter(
+      (element) => element.getAttribute(sendAttribute) === runId,
+    );
+    if (scopes.length !== 1 || composers.length !== 1 || buttons.length !== 1) {
+      return "marker-count" as const;
+    }
+    const scope = scopes[0]!;
+    const composer = composers[0]!;
+    const button = buttons[0]!;
+    const contentEditable = composer.getAttribute("contenteditable");
+    if (
+      !(scope instanceof HTMLElement) ||
+      !scope.isConnected ||
+      !(composer instanceof HTMLElement) ||
+      !composer.isConnected ||
+      (!(composer instanceof HTMLTextAreaElement) &&
+        !composer.isContentEditable &&
+        contentEditable !== "true" &&
+        contentEditable !== "plaintext-only") ||
+      !(button instanceof HTMLButtonElement) ||
+      !button.isConnected ||
+      button.disabled ||
+      button.getAttribute("aria-disabled") === "true" ||
+      !scope.contains(composer) ||
+      !scope.contains(button) ||
+      (button.form !== null && !button.form.contains(composer))
+    ) {
+      return "invalid-ownership" as const;
+    }
+    const rect = button.getBoundingClientRect();
+    if (
+      !Number.isFinite(rect.left) ||
+      !Number.isFinite(rect.top) ||
+      !Number.isFinite(rect.width) ||
+      !Number.isFinite(rect.height) ||
+      rect.width <= 0 ||
+      rect.height <= 0
+    ) {
+      return "invalid-geometry" as const;
+    }
+    let x = rect.left + rect.width / 2;
+    let y = rect.top + rect.height / 2;
+    if (typeof document.elementFromPoint === "function") {
+      const points = [
+        [0.5, 0.5],
+        [0.25, 0.5],
+        [0.75, 0.5],
+        [0.5, 0.25],
+        [0.5, 0.75],
+      ] as const;
+      let safePoint: { x: number; y: number } | undefined;
+      const occluders = new Set<string>();
+      for (const [horizontalRatio, verticalRatio] of points) {
+        const candidateX = rect.left + rect.width * horizontalRatio;
+        const candidateY = rect.top + rect.height * verticalRatio;
+        const hit = document.elementFromPoint(candidateX, candidateY);
+        if (hit instanceof Element && (hit === button || button.contains(hit))) {
+          safePoint = { x: candidateX, y: candidateY };
+          break;
+        }
+        if (!(hit instanceof Element)) {
+          occluders.add("none");
+          continue;
+        }
+        const testId = (hit.getAttribute("data-testid") ?? "")
+          .replace(/[^a-zA-Z0-9_-]/gu, "")
+          .slice(0, 40);
+        const role = (hit.getAttribute("role") ?? "").replace(/[^a-zA-Z0-9_-]/gu, "").slice(0, 24);
+        const className = [...hit.classList]
+          .slice(0, 2)
+          .map((value) => value.replace(/[^a-zA-Z0-9_-]/gu, "").slice(0, 32))
+          .filter(Boolean)
+          .join("-");
+        const style = getComputedStyle(hit);
+        occluders.add(
+          [
+            hit.tagName.toLowerCase(),
+            testId,
+            role,
+            className,
+            style.position.replace(/[^a-zA-Z0-9_-]/gu, "").slice(0, 16),
+            style.pointerEvents.replace(/[^a-zA-Z0-9_-]/gu, "").slice(0, 16),
+          ]
+            .filter(Boolean)
+            .join("-")
+            .slice(0, 48),
+        );
+      }
+      if (!safePoint) {
+        lastOcclusionDiagnostic = [...occluders].slice(0, 3).join("+") || "unknown";
+        return "occluded" as const;
+      }
+      x = safePoint.x;
+      y = safePoint.y;
+    }
+    return { height: rect.height, status: "pointer-sample" as const, width: rect.width, x, y };
+  };
+
+  // ChatGPT animates the follow-up send control into place after the editor
+  // commit. A point that is valid on the first frame can miss a few milliseconds
+  // later. Four matching samples prevent that race without ever actuating the
+  // control during stabilization.
+  const stableSampleCount = 4;
+  const sampleIntervalMs = 75;
+  const deadline = Date.now() + 1_200;
+  let previous: { height: number; width: number; x: number; y: number } | undefined;
+  let matchingSamples = 0;
+  let transientFailure: "invalid-geometry" | "occluded" | undefined;
+  while (Date.now() <= deadline) {
+    const sample = readTarget();
+    if (typeof sample === "string") {
+      if (sample !== "invalid-geometry" && sample !== "occluded") return sample;
+      transientFailure = sample;
+      previous = undefined;
+      matchingSamples = 0;
+      await new Promise<void>((resolve) => setTimeout(resolve, sampleIntervalMs));
+      continue;
+    }
+    transientFailure = undefined;
+    const matchesPrevious =
+      previous !== undefined &&
+      Math.abs(previous.x - sample.x) <= 0.5 &&
+      Math.abs(previous.y - sample.y) <= 0.5 &&
+      Math.abs(previous.width - sample.width) <= 0.5 &&
+      Math.abs(previous.height - sample.height) <= 0.5;
+    matchingSamples = matchesPrevious ? matchingSamples + 1 : 1;
+    previous = sample;
+    if (matchingSamples >= stableSampleCount) {
+      // MAIN world never activates the control itself. The worker uses this
+      // exact validated point for one trusted CDP mouse sequence and never
+      // retries after mousePressed, whose outcome is necessarily ambiguous.
+      return { status: "pointer-ready", x: sample.x, y: sample.y };
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, sampleIntervalMs));
   }
-  if (returnPointerTarget) return { status: "pointer-ready", x, y };
-  // A regular page keeps validation and activation in one synchronous
-  // MAIN-world transaction. A Relay parking window returns the validated hit
-  // point for exactly one trusted CDP pointer action instead. Neither retries.
-  button.click();
-  return "clicked";
+  return transientFailure === "occluded"
+    ? `occluded-${lastOcclusionDiagnostic}`.slice(0, 64)
+    : (transientFailure ?? "unstable-geometry");
 }
 
 async function handleContentRecoveryRequest(
@@ -7180,7 +7439,7 @@ async function handleContentRecoveryRequest(
     !tab?.url ||
     !isChatGptPageUrl(tab.url) ||
     !senderRemoteUrl ||
-    senderRemoteUrl !== tabRemoteUrl ||
+    !projectUrlMatchesRecord(record, senderRemoteUrl) ||
     !projectUrlMatchesRecord(record, tabRemoteUrl)
   ) {
     return { ok: false };
@@ -7223,6 +7482,12 @@ interface ComposerReadinessStatus {
   ready: boolean;
   rawCandidateCount: number;
   readyCandidateCount: number;
+  primaryOwnership?: boolean;
+  primaryVisible?: boolean;
+  primaryVisibilityBlocker?: string;
+  primaryWritable?: boolean;
+  viewportHeight?: number;
+  viewportWidth?: number;
   visibilityState: "visible" | "hidden";
 }
 
@@ -7236,10 +7501,9 @@ async function withComposerReadyForDispatch<T>(
   // A normal-window background tab can keep answering extension messages while
   // its document timers and React submission path are frozen. When the content
   // runtime reports a hidden document (or cannot answer from an inactive tab),
-  // move that exact owned tab into a non-focused parking window for the run.
-  // Enhanced mode also prepares the renderer immediately before the page-owned
-  // send. Neither path focuses the OS window; the later dispatch boundary uses
-  // one guarded trusted pointer only inside the Relay parking window.
+  // select that exact owned tab in its original, non-focused Chrome window.
+  // A minimized window is restored at safe off-screen bounds for the run and
+  // minimized again at terminal cleanup. Neither path focuses the OS window.
   let enhancedWakeAttempt: Promise<boolean> | undefined;
   const prepareEnhancedRenderer = async () => {
     if (!enhancedBackgroundEnabled) return false;
@@ -7248,15 +7512,15 @@ async function withComposerReadyForDispatch<T>(
   };
   const runReadyOperation = async (status: ComposerReadinessStatus, windowMinimized: boolean) => {
     // Keep lifecycle/focus preparation adjacent to the one non-idempotent
-    // MAIN-world activation. The page-owned button remains the only sender.
+    // MAIN-world validation. The page-owned button remains the only target.
     await prepareEnhancedRenderer();
     return await operation(status, windowMinimized);
   };
   await assertPreDispatchPage(key, run, tabId);
   const visibility = await readTabDispatchVisibility(tabId);
   const mapped = conversationTabs.get(key);
-  const runWithVisibleLease = async (useTemporaryParkingWindow: boolean) => {
-    return await withTransientConversationTabActivation(
+  const runWithVisibleLease = async (temporarilyRestoreMinimizedWindow: boolean) => {
+    return await withConversationTabActiveInHomeWindow(
       key,
       tabId,
       async () => {
@@ -7288,21 +7552,32 @@ async function withComposerReadyForDispatch<T>(
         throw relayFailure(
           incompatibleVisibleComposer ? "SELECTOR_INCOMPATIBLE" : "CHATGPT_REMOTE_UNAVAILABLE",
           incompatibleVisibleComposer
-            ? `ChatGPT composer ownership is ambiguous; the question was not sent. raw=${lastStatus!.rawCandidateCount} ready=${lastStatus!.readyCandidateCount} visibility=${lastStatus!.visibilityState}`
+            ? `ChatGPT composer ownership is ambiguous; the question was not sent. ${composerReadinessDiagnostic(lastStatus!)}`
             : "ChatGPT did not expose a ready composer while its background tab was parked; the question was not sent.",
           tabId,
         );
       },
       run,
-      useTemporaryParkingWindow,
+      temporarilyRestoreMinimizedWindow,
     );
   };
-  if (mapped?.tabId === tabId && (visibility.minimized || visibility.parked)) {
+  // Focus emulation can make an inactive renderer report document.visibilityState
+  // as visible. That is sufficient for inspection, but ChatGPT still rejects a
+  // follow-up actuation until this exact tab is selected in its own Chrome
+  // window. Chrome's tab.active flag is authoritative at the send boundary.
+  if (
+    mapped?.tabId === tabId &&
+    (visibility.inactive || visibility.minimized || visibility.parked)
+  ) {
     return await runWithVisibleLease(visibility.minimized);
   }
   let backgroundStatus = await readComposerReadiness(tabId);
   if (backgroundStatus?.ready && backgroundStatus.visibilityState === "visible") {
-    return await runReadyOperation(backgroundStatus, false);
+    // An idle transcript prewarm can have this tab selected while its queued
+    // activation scope is still preparing to restore the user's previous tab.
+    // Enter the same per-window lease queue and re-prove readiness there so
+    // that restoration cannot race the later non-idempotent content.send.
+    return await runWithVisibleLease(false);
   }
   if (
     mapped?.tabId === tabId &&
@@ -7316,7 +7591,7 @@ async function withComposerReadyForDispatch<T>(
     await prepareEnhancedRenderer();
     backgroundStatus = await readComposerReadiness(tabId);
     if (backgroundStatus?.ready && backgroundStatus.visibilityState === "visible") {
-      return await runReadyOperation(backgroundStatus, false);
+      return await runWithVisibleLease(false);
     }
     if (
       mapped?.tabId === tabId &&
@@ -7327,7 +7602,7 @@ async function withComposerReadyForDispatch<T>(
     }
   }
 
-  return await withTransientConversationTabActivation(
+  return await withConversationTabActiveInHomeWindow(
     key,
     tabId,
     async () => {
@@ -7360,7 +7635,7 @@ async function withComposerReadyForDispatch<T>(
       throw relayFailure(
         incompatibleVisibleComposer ? "SELECTOR_INCOMPATIBLE" : "CHATGPT_REMOTE_UNAVAILABLE",
         incompatibleVisibleComposer
-          ? `ChatGPT composer ownership is ambiguous; the question was not sent. raw=${lastStatus!.rawCandidateCount} ready=${lastStatus!.readyCandidateCount} visibility=${lastStatus!.visibilityState}`
+          ? `ChatGPT composer ownership is ambiguous; the question was not sent. ${composerReadinessDiagnostic(lastStatus!)}`
           : message,
         tabId,
       );
@@ -7412,13 +7687,60 @@ async function readComposerReadiness(tabId: number): Promise<ComposerReadinessSt
   ) {
     return undefined;
   }
-  return { ready: response.ready, rawCandidateCount, readyCandidateCount, visibilityState };
+  const viewportHeight = parseComposerViewportDimension(response.viewportHeight);
+  const viewportWidth = parseComposerViewportDimension(response.viewportWidth);
+  return {
+    ready: response.ready,
+    rawCandidateCount,
+    readyCandidateCount,
+    ...(typeof response.primaryOwnership === "boolean"
+      ? { primaryOwnership: response.primaryOwnership }
+      : {}),
+    ...(typeof response.primaryVisible === "boolean"
+      ? { primaryVisible: response.primaryVisible }
+      : {}),
+    ...(typeof response.primaryVisibilityBlocker === "string" &&
+    /^(?:aria-hidden|display|geometry|hidden|inert|missing|none|opacity|outside|pointer|visibility)$/u.test(
+      response.primaryVisibilityBlocker,
+    )
+      ? { primaryVisibilityBlocker: response.primaryVisibilityBlocker }
+      : {}),
+    ...(typeof response.primaryWritable === "boolean"
+      ? { primaryWritable: response.primaryWritable }
+      : {}),
+    ...(viewportHeight === undefined ? {} : { viewportHeight }),
+    ...(viewportWidth === undefined ? {} : { viewportWidth }),
+    visibilityState,
+  };
 }
 
 function parseComposerCandidateCount(value: unknown) {
   return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 32
     ? Number(value)
     : undefined;
+}
+
+function parseComposerViewportDimension(value: unknown) {
+  return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 20_000
+    ? Number(value)
+    : undefined;
+}
+
+function composerReadinessDiagnostic(status: ComposerReadinessStatus) {
+  const primary =
+    status.primaryWritable === undefined ||
+    status.primaryOwnership === undefined ||
+    status.primaryVisible === undefined
+      ? ""
+      : ` primary=w${Number(status.primaryWritable)}o${Number(status.primaryOwnership)}v${Number(status.primaryVisible)}`;
+  const viewport =
+    status.viewportWidth === undefined || status.viewportHeight === undefined
+      ? ""
+      : ` viewport=${status.viewportWidth}x${status.viewportHeight}`;
+  const blocker = status.primaryVisibilityBlocker
+    ? ` blocker=${status.primaryVisibilityBlocker}`
+    : "";
+  return `raw=${status.rawCandidateCount} ready=${status.readyCandidateCount} visibility=${status.visibilityState}${primary}${blocker}${viewport}`;
 }
 
 async function withTransientConversationTabActivation<T>(
@@ -7854,12 +8176,13 @@ async function closeTemporaryParkingWindow(windowId: number) {
   await chrome.windows.remove(windowId).catch(() => undefined);
 }
 
-async function _withTransientConversationTabActivationLegacy<T>(
+async function withConversationTabActiveInHomeWindow<T>(
   key: string,
   tabId: number,
   operation: () => Promise<T>,
   retainedRun?: ActiveRunRecord,
   temporarilyRestoreMinimizedWindow = false,
+  handoffToStartedRun = false,
 ): Promise<T> {
   const tab = await promiseWithTimeout(
     chrome.tabs.get(tabId),
@@ -7926,16 +8249,25 @@ async function _withTransientConversationTabActivationLegacy<T>(
     }
     const ownedActivationEpoch = windowActivationEpoch(windowId);
     let keepTargetActive = false;
+    const runForVisibilityHandoff = () => {
+      if (retainedRun) return retainedRun;
+      if (!handoffToStartedRun) return undefined;
+      const startedRun = activeRuns.get(key);
+      return startedRun && (startedRun.tabId === undefined || startedRun.tabId === tabId)
+        ? startedRun
+        : undefined;
+    };
     try {
       const result = await operation();
+      const visibilityRun = runForVisibilityHandoff();
       if (
-        retainedRun &&
-        ((isRecord(result) && result.ok === true) || result === true) &&
-        activeRuns.get(key) === retainedRun
+        visibilityRun &&
+        (handoffToStartedRun || (isRecord(result) && result.ok === true) || result === true) &&
+        activeRuns.get(key) === visibilityRun
       ) {
         keepTargetActive = await retainRunVisibilityLease(
           key,
-          retainedRun,
+          visibilityRun,
           tabId,
           windowId,
           previousActiveTabId,
@@ -7951,10 +8283,11 @@ async function _withTransientConversationTabActivationLegacy<T>(
       // For content.send, the response port may time out after actuation; the
       // caller persists the at-most-once recovery barrier and never replays it.
       // Pre-dispatch failures immediately release this lease through failRun.
-      if (retainedRun && activeRuns.get(key) === retainedRun) {
+      const visibilityRun = runForVisibilityHandoff();
+      if (visibilityRun && activeRuns.get(key) === visibilityRun) {
         keepTargetActive = await retainRunVisibilityLease(
           key,
-          retainedRun,
+          visibilityRun,
           tabId,
           windowId,
           previousActiveTabId,
@@ -7995,7 +8328,7 @@ async function _withTransientConversationTabActivationLegacy<T>(
           currentActive[0]?.id === tabId &&
           targetTab?.windowId === windowId &&
           previousTab?.windowId === windowId &&
-          (!temporarilyRestoreMinimizedWindow || currentWindow?.focused === false)
+          (!wasMinimized || currentWindow?.focused === false)
         ) {
           await updateTabWithInternalActivation(
             windowId,
@@ -8205,7 +8538,12 @@ async function retainRunVisibilityLease(
   }
 
   let state = windowVisibilityLeaseStates.get(windowId);
-  if (!state) {
+  if (!state || state.stack.length === 0) {
+    // A completed idle prewarm can briefly leave a stackless visibility state
+    // while Chrome reports a user tab activation. The first real run must take
+    // a fresh baseline from the tab that is active now; otherwise the stale
+    // `userIntervened` bit would suppress terminal restoration after Relay
+    // selects its owned tab.
     state = {
       baselineTabId: previousActiveTabId,
       homeInitiallyFocused: false,
@@ -8462,7 +8800,7 @@ async function releaseRunVisibilityLease(key: string, runId: string) {
       }
       if (state.userIntervened) {
         await restoreTemporaryParkingWindowForUser(lease.windowId, state, lease).catch(() =>
-          recordBackgroundFailure("Failed to restore the temporary Relay window for the user."),
+          recordBackgroundFailure("Failed to restore the Relay window for the user."),
         );
       } else {
         await returnTabFromTemporaryParkingWindow(
@@ -8509,11 +8847,7 @@ async function releaseRunVisibilityLease(key: string, runId: string) {
     ).catch(() => []);
     if (currentActive[0]?.id !== lease.tabId && currentActive[0]?.id !== restoreTabId) {
       state.userIntervened = true;
-    } else if (
-      restoreTabId !== undefined &&
-      currentActive[0]?.id !== restoreTabId &&
-      (nextLease !== undefined || chromeWindow?.state !== "minimized")
-    ) {
+    } else if (restoreTabId !== undefined && currentActive[0]?.id !== restoreTabId) {
       const restoreTab = await chrome.tabs.get(restoreTabId).catch(() => undefined);
       if (restoreTab?.windowId === lease.windowId) {
         await updateTabWithInternalActivation(
@@ -8798,6 +9132,11 @@ async function syncConversationSnapshotFromTabUnlocked(sync: ConversationSnapsho
     const candidate = parseVisibleConversationSnapshot(response);
     if (!candidate) continue;
     if (!projectUrlMatchesRecord(record, candidate.remoteUrl)) continue;
+    // ChatGPT can report response actions for the latest turn while older
+    // turns remain virtualized. A rendered strict suffix that matches the
+    // content-free, Host-prewarmed fingerprint is current and useful, but it
+    // is never an authoritative full-history replacement.
+    const strictCachedSuffix = await isStrictCachedTranscriptSuffix(record, candidate);
     const activeRun = activeRuns.get(key);
     const completedInitialAdoption = completedInitialAdoptions.get(key);
     const completedInitialAdoptionMatches = Boolean(
@@ -8844,10 +9183,11 @@ async function syncConversationSnapshotFromTabUnlocked(sync: ConversationSnapsho
       latestMessage?.role === "assistant" &&
       latestMessage.markdown === requiredTerminal.markdown;
     const publishedComplete =
-      candidate.complete ||
-      completedHistoryMatches ||
-      completedPromotionMatches ||
-      terminalHistoryAttested;
+      !strictCachedSuffix &&
+      (candidate.complete ||
+        completedHistoryMatches ||
+        completedPromotionMatches ||
+        terminalHistoryAttested);
     if (requiredTerminal && !terminalHistoryAttested) continue;
 
     const terminalHistoryBarrier = terminalHistoryBarriers.get(key);
@@ -8855,7 +9195,7 @@ async function syncConversationSnapshotFromTabUnlocked(sync: ConversationSnapsho
     if (
       terminalHistoryBarrier &&
       terminalHistoryBarrier.tabId === tabId &&
-      publishedComplete &&
+      (publishedComplete || strictCachedSuffix) &&
       candidate.historyComplete &&
       latestMessage?.role === "assistant"
     ) {
@@ -10329,14 +10669,26 @@ function markWindowUserIntervened(windowId: number, activeTabId?: number) {
   void (
     state.parked
       ? (async () => {
-          if (windowId !== homeWindowId) {
-            await chrome.windows.update(homeWindowId, {
-              drawAttention: false,
-              focused: true,
-              state: "normal",
-            });
+          if (state.parkingWindowId === undefined) {
+            if (state.restoreBounds) {
+              await chrome.windows.update(homeWindowId, {
+                ...state.restoreBounds,
+                drawAttention: false,
+                focused: true,
+              });
+            }
+            state.parked = false;
+            state.restoreMinimized = false;
+          } else {
+            if (windowId !== homeWindowId) {
+              await chrome.windows.update(homeWindowId, {
+                drawAttention: false,
+                focused: true,
+                state: "normal",
+              });
+            }
+            await restoreTemporaryParkingWindowForUser(homeWindowId, state);
           }
-          await restoreTemporaryParkingWindowForUser(homeWindowId, state);
         })().catch(() =>
           recordBackgroundFailure("Failed to restore the temporary Relay window for the user."),
         )

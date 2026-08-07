@@ -2,7 +2,7 @@
   "name": "ask2gpt-workspace",
   "version": "0.0.1",
   "private": true,
-  "description": "Ask2GPT: Codex-style coding chat for VS Code through Chrome Relay.",
+  "description": "Ask project code in VS Code through your signed-in ChatGPT web session.",
   "license": "MIT",
   "repository": {
     "type": "git",

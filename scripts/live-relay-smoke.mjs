@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +46,7 @@ const verifyAttachment = process.argv.includes("--verify-attachment");
 const includeModelCatalog = process.argv.includes("--include-model-catalog");
 const includeRelayErrorMessages = process.argv.includes("--include-relay-error-messages");
 const skipModelCatalog = process.argv.includes("--skip-model-catalog");
+const requestedModelId = stringArgument("--model-id");
 const resumeRequested = process.argv.includes("--resume-remote-url");
 const resumeRemoteUrl = stringArgument("--resume-remote-url");
 const startedAt = Date.now();
@@ -62,6 +63,9 @@ async function main() {
   try {
     hostCount = boundedIntegerArgument("--host-count", 1, 1, 3);
     assertResumeConfiguration(resumeRemoteUrl, hostCount, verifyAttachment, resumeRequested);
+    if (requestedModelId && skipModelCatalog) {
+      throw new SmokeFailure("model_id_requires_catalog");
+    }
 
     currentStage = "bind_loopback_ports";
     for (let index = 0; index < hostCount; index += 1) {
@@ -704,7 +708,12 @@ class LiveHost {
     return response.payload?.selected;
   }
 
-  async waitForCompleteHistory(minimumMessages, preferredRemoteUrl, evidenceRunId) {
+  async waitForCompleteHistory(
+    minimumMessages,
+    preferredRemoteUrl,
+    evidenceRunId,
+    expectedLocalMessages,
+  ) {
     const scopedEvidenceRunId =
       typeof evidenceRunId === "string" && this.runDiagnostics.has(evidenceRunId)
         ? evidenceRunId
@@ -719,7 +728,11 @@ class LiveHost {
       const deadline = Date.now() + generationTimeoutMs;
       let latestSnapshot;
       while (Date.now() < deadline) {
-        const buffered = this.consumeBufferedHistory(minimumMessages, scopedEvidenceRunId);
+        const buffered = this.consumeBufferedHistory(
+          minimumMessages,
+          scopedEvidenceRunId,
+          expectedLocalMessages,
+        );
         if (buffered.match) return buffered.match;
         latestSnapshot = buffered.latest ?? latestSnapshot;
 
@@ -731,9 +744,10 @@ class LiveHost {
         const refreshRemoteUrl = isConversationUrl(this.latestRemoteUrl)
           ? this.latestRemoteUrl
           : remoteUrl;
+        const transcriptProof = buildSmokeTranscriptProof(refreshRemoteUrl, expectedLocalMessages);
         this.send(
           "conversation.open",
-          { remoteUrl: refreshRemoteUrl },
+          { remoteUrl: refreshRemoteUrl, ...(transcriptProof ? { transcriptProof } : {}) },
           { conversationId: this.conversationId },
         );
         const remaining = deadline - Date.now();
@@ -758,9 +772,14 @@ class LiveHost {
           );
         }
         latestSnapshot = observed;
-        if (isCompleteHistorySnapshot(observed, this.conversationId, minimumMessages)) {
-          return observed;
-        }
+        const reconciled = reconcileSmokeHistorySnapshot(
+          observed,
+          this.conversationId,
+          minimumMessages,
+          expectedLocalMessages,
+          this,
+        );
+        if (reconciled) return reconciled;
         await delay(Math.min(250, Math.max(0, deadline - Date.now())));
       }
       throw this.failure(
@@ -772,7 +791,7 @@ class LiveHost {
     }
   }
 
-  consumeBufferedHistory(minimumMessages, evidenceRunId) {
+  consumeBufferedHistory(minimumMessages, evidenceRunId, expectedLocalMessages) {
     let match;
     let latest;
     const retained = [];
@@ -783,9 +802,14 @@ class LiveHost {
       ) {
         latest = envelope;
         if (evidenceRunId) this.recordRunSnapshot(evidenceRunId, envelope.payload);
-        if (isCompleteHistorySnapshot(envelope, this.conversationId, minimumMessages)) {
-          match = envelope;
-        }
+        const reconciled = reconcileSmokeHistorySnapshot(
+          envelope,
+          this.conversationId,
+          minimumMessages,
+          expectedLocalMessages,
+          this,
+        );
+        if (reconciled) match = reconciled;
       } else {
         retained.push(envelope);
       }
@@ -1205,9 +1229,13 @@ async function verifyPrimaryHost(host) {
         ...(description ? { description } : {}),
         selected,
       }));
-      const selectedModel =
-        catalog?.options?.find((option) => option.id === catalog.currentModelId) ??
-        catalog?.options?.find((option) => option.selected);
+      const selectedModel = requestedModelId
+        ? catalog?.options?.find((option) => option.id === requestedModelId)
+        : (catalog?.options?.find((option) => option.id === catalog.currentModelId) ??
+          catalog?.options?.find((option) => option.selected));
+      if (requestedModelId && !selectedModel) {
+        throw host.failure("requested_model_missing", requestedModelId);
+      }
       if (!selectedModel?.id) throw host.failure("model_catalog_missing_selection");
       const confirmedModel = await host.selectModel(selectedModel.id);
       if (confirmedModel?.id !== selectedModel.id) {
@@ -1218,10 +1246,12 @@ async function verifyPrimaryHost(host) {
 
     host.stage = "first_generation";
     const firstRun = await host.runQuestion(ONLY_OK_PROMPT, undefined, selectedModelId);
+    const firstExpectedHistory = terminalBackedSmokeHistory([], ONLY_OK_PROMPT, firstRun);
     const firstHistory = await host.waitForCompleteHistory(
       2,
       firstRun.payload?.remoteUrl,
       firstRun.runId,
+      firstExpectedHistory,
     );
     assertExactAnswer(firstRun.payload?.markdown, "OK", host);
     assertHistoryTail(firstHistory.payload.messages, [ONLY_OK_PROMPT], host);
@@ -1243,10 +1273,16 @@ async function verifyPrimaryHost(host) {
       followupRemoteUrl,
       selectedModelId,
     );
+    const secondExpectedHistory = terminalBackedSmokeHistory(
+      firstHistory.payload.messages,
+      FOLLOWUP_OK_PROMPT,
+      secondRun,
+    );
     const secondHistory = await host.waitForCompleteHistory(
       4,
       secondRun.payload?.remoteUrl,
       secondRun.runId,
+      secondExpectedHistory,
     );
     assertExactAnswer(secondRun.payload?.markdown, "OK", host);
     assertHistoryTail(secondHistory.payload.messages, [ONLY_OK_PROMPT, FOLLOWUP_OK_PROMPT], host);
@@ -1307,6 +1343,7 @@ export async function verifyResumedPrimaryHost(host, remoteUrl) {
       4,
       followupRun.payload?.remoteUrl,
       followupRun.runId,
+      terminalBackedSmokeHistory(initialHistory.payload.messages, FOLLOWUP_OK_PROMPT, followupRun),
     );
     assertExactAnswer(followupRun.payload?.markdown, "OK", host);
     assertExactOkHistory(finalHistory.payload.messages, [ONLY_OK_PROMPT, FOLLOWUP_OK_PROMPT], host);
@@ -1334,7 +1371,12 @@ async function verifySecondaryHost(host) {
   try {
     host.stage = "parallel_generation";
     const run = await host.runQuestion(ONLY_OK_PROMPT);
-    const history = await host.waitForCompleteHistory(2, run.payload?.remoteUrl, run.runId);
+    const history = await host.waitForCompleteHistory(
+      2,
+      run.payload?.remoteUrl,
+      run.runId,
+      terminalBackedSmokeHistory([], ONLY_OK_PROMPT, run),
+    );
     assertExactAnswer(run.payload?.markdown, "OK", host);
     assertHistoryTail(history.payload.messages, [ONLY_OK_PROMPT], host);
     return {
@@ -1406,6 +1448,116 @@ function isCompleteHistorySnapshot(envelope, conversationId, minimumMessages) {
     Array.isArray(envelope.payload?.messages) &&
     envelope.payload.messages.length >= minimumMessages
   );
+}
+
+function terminalBackedSmokeHistory(previousMessages, prompt, terminalEnvelope) {
+  const markdown = terminalEnvelope?.payload?.markdown;
+  return [
+    ...(Array.isArray(previousMessages) ? previousMessages : []),
+    { role: "user", markdown: prompt },
+    { role: "assistant", markdown: typeof markdown === "string" ? markdown : "" },
+  ];
+}
+
+function buildSmokeTranscriptProof(remoteUrl, messages) {
+  if (
+    !isConversationUrl(remoteUrl) ||
+    !Array.isArray(messages) ||
+    messages.length === 0 ||
+    messages.length > 200 ||
+    messages.some(
+      (message) =>
+        !message ||
+        (message.role !== "user" && message.role !== "assistant") ||
+        typeof message.markdown !== "string",
+    )
+  ) {
+    return undefined;
+  }
+  const messageHashes = messages.map((message) => ({
+    role: message.role,
+    sha256: smokeSha256(JSON.stringify([message.role, message.markdown])),
+  }));
+  return {
+    remoteUrl,
+    messageCount: messageHashes.length,
+    messageHashes,
+    transcriptChainSha256: smokeSha256(
+      JSON.stringify(messageHashes.map((message) => [message.role, message.sha256])),
+    ),
+  };
+}
+
+export function reconcileSmokeHistorySnapshot(
+  envelope,
+  conversationId,
+  minimumMessages,
+  expectedLocalMessages,
+  host,
+) {
+  if (isCompleteHistorySnapshot(envelope, conversationId, minimumMessages)) return envelope;
+  if (
+    envelope.type !== "conversation.snapshot" ||
+    envelope.conversationId !== conversationId ||
+    !isConversationUrl(envelope.payload?.remoteUrl) ||
+    !Array.isArray(envelope.payload?.messages) ||
+    !Array.isArray(expectedLocalMessages) ||
+    expectedLocalMessages.length < minimumMessages ||
+    !buildSmokeTranscriptProof(envelope.payload.remoteUrl, expectedLocalMessages)
+  ) {
+    return undefined;
+  }
+  const visibleMessages = envelope.payload.messages;
+  if (visibleMessages.length === 0) {
+    if (envelope.payload.complete === true) {
+      throw host.failure("empty_history_marked_complete");
+    }
+  } else if (!isExactSmokeHistorySuffix(expectedLocalMessages, visibleMessages)) {
+    return undefined;
+  }
+  if (envelope.payload.complete === true && visibleMessages.length < expectedLocalMessages.length) {
+    throw host.failure(
+      "partial_history_marked_complete",
+      summarizeHistoryForSmoke(visibleMessages),
+    );
+  }
+  return {
+    ...envelope,
+    payload: {
+      ...envelope.payload,
+      messages: expectedLocalMessages.map((message) => ({ ...message })),
+      complete: true,
+      reconciledFromPartial: true,
+    },
+  };
+}
+
+function isExactSmokeHistorySuffix(expectedMessages, visibleMessages) {
+  if (visibleMessages.length === 0 || visibleMessages.length > expectedMessages.length) {
+    return false;
+  }
+  const offset = expectedMessages.length - visibleMessages.length;
+  return visibleMessages.every((visible, index) => {
+    const expected = expectedMessages[offset + index];
+    if (
+      !expected ||
+      visible?.role !== expected.role ||
+      typeof visible?.markdown !== "string" ||
+      typeof expected.markdown !== "string"
+    ) {
+      return false;
+    }
+    const actual = visible.markdown.replace(/\r\n?/gu, "\n");
+    const wanted = expected.markdown.replace(/\r\n?/gu, "\n");
+    return (
+      actual === wanted ||
+      (!wanted.includes("\u00a0") && actual.replace(/\u00a0/gu, " ") === wanted)
+    );
+  });
+}
+
+function smokeSha256(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 export function assertHistoryTail(messages, expectedPrompts, host) {

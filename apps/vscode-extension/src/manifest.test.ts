@@ -28,7 +28,9 @@ describe("VS Code discoverability manifest", () => {
   it("runs in the local UI host and exposes stable ways to open Ask2GPT", () => {
     expect(manifest.version).toBe(rootManifest.version);
     expect(manifest.publisher).toBe("FeyZha");
-    expect(manifest.description).toBe("Codex-style coding assistant for VS Code.");
+    expect(manifest.description).toBe(
+      "Ask project code through your signed-in ChatGPT web session.",
+    );
     expect(manifest.extensionKind).toEqual(["ui"]);
     expect(manifest.activationEvents).toEqual(
       expect.arrayContaining([

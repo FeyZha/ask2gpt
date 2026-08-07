@@ -1,28 +1,58 @@
 # Ask2GPT
 
-在 VS Code 中使用已登录的 ChatGPT 网页会话进行编程问答。Ask2GPT 由一个 VS Code 扩展和一个
-Chrome Relay 伴生扩展组成，通过本机 loopback WebSocket 自动连接，不需要 OpenAI API Key、
-配对码或每个窗口单独配置。
+> 把轻量的项目代码问答留在 VS Code，把 coding Agent 留给真正需要执行和改代码的任务。
 
-> Ask2GPT 是独立的开源项目，与 OpenAI 无隶属或官方合作关系。它不复制 Codex 的私有代码、
-> CSS、Logo 或品牌资产。
+[![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](./LICENSE)
+[![CI](https://github.com/FeyZha/ask2gpt/actions/workflows/ci.yml/badge.svg)](https://github.com/FeyZha/ask2gpt/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/FeyZha/ask2gpt?display_name=tag)](https://github.com/FeyZha/ask2gpt/releases/latest)
 
-- 当前版本：`0.0.1`
-- Relay 协议：`v15`
-- 内容运行时：`34`
+Ask2GPT 是一个只做编程问答的 VS Code 侧栏。它把你主动选择的代码和问题，经本机 Chrome
+Relay 发送到已经登录的 ChatGPT 网页会话，再把回答流式显示回 VS Code。
 
-## 使用要求
+- 不需要 OpenAI API Key；
+- 不启动或调用 Codex/Coding Agent，因此不会占用这类 Agent 的任务额度；
+- 不扫描项目，不执行 Shell、Git 或测试，也不写入工作区；
+- 最终用户不需要 Node.js、pnpm 或命令行配置。
 
-- VS Code 1.96 或更高版本
-- Google Chrome 116 或更高版本
-- 可正常登录 `https://chatgpt.com/` 的 ChatGPT 账号
+问题会受到你的 ChatGPT 账号套餐、网页端用量限制和网络状态约束。Ask2GPT 不是“无限额度”工具，
+也不能替代会修改文件、运行命令和完成工程任务的 coding Agent。
+
+> Ask2GPT 是独立开源项目，与 OpenAI 无隶属或官方合作关系，不包含 Codex 的私有代码、界面资源
+> 或品牌资产。
+
+## 看看它如何工作
+
+[![Ask2GPT 纯合成演示](./assets/demo/ask2gpt-demo.gif)](./assets/demo/ask2gpt-demo.mp4)
+
+[播放 960×720 MP4](./assets/demo/ask2gpt-demo.mp4) ·
+[查看静态海报](./assets/demo/ask2gpt-demo.png)
+
+演示中的代码、问题和回答全部来自仓库内的合成样例
+[`examples/ask2gpt-tour`](./examples/ask2gpt-tour)，不包含真实账号、私人项目或真实聊天数据。
+
+## 什么时候用 Ask2GPT
+
+适合把这些“先问清楚”的工作交给 Ask2GPT：
+
+- “这段实现的数据流和时间复杂度是什么？”
+- “这个缓存为什么可能返回旧结果？”
+- “比较两种数据结构的取舍，暂时不要改代码。”
+- “基于这几个显式附加的文件，给出测试方案。”
+- 在同一个远端会话里继续追问、澄清和比较方案。
+
+如果任务需要搜索整个仓库、编辑文件、运行终端、验证构建或提交 Git，请继续使用 coding Agent。
+Ask2GPT 的定位是低摩擦代码理解和方案讨论，而不是另一个自动执行代理。
+
+## 安装：无需源码环境
+
+要求：
+
+- VS Code 1.96+
+- Google Chrome 116+
+- 能正常登录 `https://chatgpt.com/` 的 ChatGPT 账号
 - 一个名称精确为 `Ask2GPT` 的 ChatGPT Project
 
-最终用户不需要安装 Node.js、pnpm，也不需要 OpenAI API Key。
-
-## 从 GitHub Release 安装
-
-每个正式 Release 应同时包含以下两个同版本文件：
+从 [最新 GitHub Release](https://github.com/FeyZha/ask2gpt/releases/latest) 下载同一版本的三个文件：
 
 - `ask2gpt-<version>.vsix`
 - `ask2gpt-relay-<version>.zip`
@@ -32,105 +62,130 @@ Chrome Relay 伴生扩展组成，通过本机 loopback WebSocket 自动连接�
 
 ### 1. 安装 VS Code 扩展
 
-1. 下载 Release 中的 VSIX。
-2. 在 VS Code 中运行 `Extensions: Install from VSIX...`。
-3. 选择下载的 VSIX，并按提示重新加载 VS Code。
-4. 点击 Activity Bar 中的 Ask2GPT 图标，或在命令面板运行
+1. 在 VS Code 命令面板运行 `Extensions: Install from VSIX...`。
+2. 选择下载的 `ask2gpt-<version>.vsix`。
+3. 按提示重新加载 VS Code。
+4. 点击 Activity Bar 的 Ask2GPT 图标，或运行
    `Ask2GPT: 打开问答窗口 / Open Q&A`。
 
 ### 2. 安装 Chrome Relay
 
-1. 解压 Release 中的 Relay ZIP 到一个固定目录；升级时完整替换该目录。
-2. 打开 `chrome://extensions` 并启用“开发者模式”。
+1. 把 `ask2gpt-relay-<version>.zip` 解压到固定目录。
+2. 打开 `chrome://extensions`，启用“开发者模式”。
 3. 点击“加载已解压的扩展程序”，选择刚解压的目录。
-4. 将 Ask2GPT Relay 固定到 Chrome 工具栏，便于查看状态或重新加载。
+4. 建议把 Ask2GPT Relay 固定到 Chrome 工具栏，便于查看连接状态。
 
-不要直接加载 ZIP，也不要同时保留多个不同版本的 Relay 目录。
+升级时完整替换解压目录并在扩展管理页点击“重新加载”；不要直接加载 ZIP，也不要同时保留多个
+Relay 版本。
 
-### 3. 首次连接
+### 3. 第一次提问
 
-1. 在 Chrome 中登录 ChatGPT。
-2. 打开或创建名称精确为 `Ask2GPT` 的 Project。
-3. 回到 VS Code 的 Ask2GPT 并发送问题。
+1. 在 Chrome 登录 ChatGPT。
+2. 创建或打开名称精确为 `Ask2GPT` 的 Project。
+3. 回到 VS Code 的 Ask2GPT 侧栏发送问题。
 
-Relay 会自动发现并保存该 Project。只有自动识别失败时，才需要在 Relay 弹窗中点击
-“绑定当前 Project”。Project 绑定由 Chrome 扩展保存，多个 VS Code 窗口共享；每个窗口仍拥有
-独立端口、会话分区、标签页映射和 `instanceId`。
+Relay 会自动发现并保存这个 Project。若自动识别失败，可打开 Relay 弹窗并点击“绑定当前
+Project”。本机多个 VS Code 窗口共享 Project 绑定，但端口、会话、标签页映射和运行状态彼此隔离。
 
-## 当前功能
+## 三分钟体验教程
 
-- 独立问答侧栏与多轮对话；
-- 新建、切换、重命名、归档、撤销归档和恢复本地会话；
-- ChatGPT 会话标题与当前可见分支历史同步；
-- 智能、极速、中、高、极高和 Pro 等可用模型/推理档位同步；
-- Markdown、GFM 表格、代码高亮和流式回答；
+仓库提供了一个完全离线的 TypeScript 小项目。它只处理内存中的虚构反馈，不访问网络、文件系统或
+环境变量。
+
+1. 在 VS Code 打开
+   [`examples/ask2gpt-tour/insight-board.ts`](./examples/ask2gpt-tour/insight-board.ts)。
+2. 选中 `InsightBoard.summarize()`（约第 68–101 行）。
+3. 点击黄色灯泡，选择“问 Ask2GPT（使用当前选区）”。
+4. 在发送前检查侧栏里的文件名、行号、字符数和代码预览。
+5. 发送：
+
+   > 请用简单语言解释这段代码的数据流，并分析时间复杂度。只分析，不修改代码。
+
+6. 在同一会话继续问：
+
+   > `replace()` 和重复标签会怎样影响结果？请按优先级解释。
+
+7. 点击 Composer 的 `+`，显式附加当前文件，再问：
+
+   > 从数据所有权和缓存一致性两个角度比较三种修复方案。
+
+更多可复制的问题和预期体验见
+[`examples/ask2gpt-tour/README.md`](./examples/ask2gpt-tour/README.md)。Ask2GPT 不会修改这个样例。
+
+## 已实现功能
+
+- 独立问答侧栏、Markdown/GFM、代码高亮和流式回答；
+- 新建、切换、重命名、归档、撤销归档和本地恢复会话；
+- ChatGPT 标题及当前可见分支历史同步；
+- 自动同步账号当前可用的模型和推理档位；
 - 停止、重新生成、排队追问或停止后发送；
 - 通过灯泡 Quick Fix 显式附加当前选区；
 - 通过 Composer 的 `+` 显式附加当前文件或多个文本文件；
-- 发送前上下文预览、逐项移除、敏感文件和大小限制；
-- 多 VS Code 窗口独立路由与重启恢复；
+- 发送前预览和逐项移除上下文，并拒绝敏感文件、二进制和超限内容；
+- 多 VS Code 窗口独立路由、重启恢复和终态去重；
 - AES-256-GCM 加密的扩展私有会话存储；
 - Chrome 最小化时的增强后台流式接收。
 
-Ask2GPT 不会在本地执行 Shell、Git、测试或任务，不搜索工作区，也不写入用户工作区。所有问题
-都通过同一 Relay 路径发送到用户可见的 ChatGPT 页面。
+当前发布元数据：
 
-## 上下文与数据边界
+- 当前版本：`0.0.1`
+- Relay 协议：`v15`
+- 内容运行时：`50`
+
+## 数据与安全边界
 
 Ask2GPT 只读取用户明确选择的内容：
 
 - 当前选区；
-- 当前编辑器的内存文本；
-- 用户在系统文件选择器中确认的文本/代码文件。
+- 当前编辑器内存中的文本；
+- 用户在系统文件选择器中确认的文本或代码文件。
 
-它不会扫描或推断工作区中的其他文件。`.env*`、私钥、证书、keystore、常见凭据文件、二进制
-文件以及超过限制的内容会被拒绝。短上下文以可见文本发送；较大的文本上下文通过 ChatGPT
-页面的文件控件附加，发送前必须确认附件已经出现在页面中。
+它不会枚举、搜索或推断工作区中的其他文件。`.env*`、私钥、证书、keystore、常见凭据文件、
+二进制文件和超过大小限制的内容会被拒绝。问题、代码上下文和回答会经过本机 loopback，并按用户
+操作发送到 ChatGPT；Cookie、访问令牌和网页存储不会发送给 VS Code，也不会写入诊断日志。
 
-## Chrome 权限
+VS Code 与 Relay 使用 `127.0.0.1:32171–32180` 上的 protocol v15 WebSocket。连接会校验固定扩展
+身份、Origin、产品/协议版本、消息方向、schema、大小和目标窗口。loopback 没有 TLS 或对本机进程的
+密码学认证，因此适用于用户信任本机进程的个人开发环境，不适合需要抵御本机恶意进程的高安全环境。
 
-Relay 当前申请：
+Chrome Relay 申请 `tabs`、`storage`、`alarms`、`debugger`、`scripting`，以及
+`https://chatgpt.com/*`、`http://127.0.0.1/*` 的主机权限。它不申请 cookies、history、downloads、
+nativeMessaging、剪贴板或文件 URL 权限。权限用途和完整威胁模型见
+[`SECURITY.md`](./SECURITY.md)。
 
-```text
-tabs
-storage
-alarms
-debugger
-scripting
-https://chatgpt.com/*
-http://127.0.0.1/*
-```
+## 常见问题
 
-- `debugger` 仅连接 Ask2GPT 拥有的 ChatGPT 标签页；默认增强模式会在页面按钮激活前保持该
-  renderer 为 active 并模拟页面焦点（不会聚焦操作系统窗口），同时用于最小化窗口下继续接收本轮
-  SSE/声明的 WebSocket topic。Relay 临时停放窗口只在 MAIN-world 严格验证后的按钮命中点派发一次左键
-  按下/释放；关闭增强接收时使用不启用 Network 域的短时会话并立即断开。结束、停止或失败后断开。
-- `scripting` 用于在已验证的 Ask2GPT 标签页中恢复内容脚本，以及在严格校验后执行一次受限的
-  MAIN-world 页面操作。
-- `storage` 只保存 Relay 自身的 Project 绑定、路由和恢复状态。
-- `tabs` 用于管理 Ask2GPT 自己创建或已经明确映射的 ChatGPT 标签页；发送时若 exact owned 标签页
-  位于后台，会暂时移入 `focused=false`、最大 980×760 的桌面布局临时窗口，并在终态后原位恢复，
-  不切换用户当前标签页；窗口移动后需通过两次间隔 350 ms 的 composer 就绪探测才会发送。
+**VS Code 显示 Relay 未连接**
 
-扩展不申请 `cookies`、`history`、`downloads`、`nativeMessaging`、剪贴板或文件 URL 权限。
-它不把 Cookie、访问令牌、网页存储、问题正文或回答正文写入日志。
+确认 Chrome Relay 已启用且版本与 VSIX 一致，然后重新加载 VS Code。Relay 会自动探测
+32171–32180，无需配对码。
 
-## 安全模型
+**找不到 ChatGPT Project**
 
-VS Code 与 Chrome 使用 `127.0.0.1:32171–32180` 上的 protocol v15 WebSocket 连接。连接会校验
-固定 Chrome 扩展 ID、Origin、协议版本、产品版本、消息 schema、方向、大小和目标窗口身份。
+确认已登录 ChatGPT，Project 名称精确为 `Ask2GPT`。打开该 Project 后，可在 Relay 弹窗手动绑定。
 
-这个 loopback 传输没有 TLS 或对端密码学认证。本机恶意进程仍可能抢占端口或冒充一端，进而
-看到准备发送的问题/显式附件，或诱导 Relay 操作当前 ChatGPT 页面。因此当前版本适用于用户
-信任本机进程的个人开发环境，不适用于需要抵御本机恶意进程的高安全环境。完整说明见
-[SECURITY.md](./SECURITY.md)。
+**升级后仍显示旧版本或旧运行时**
+
+完整替换 Relay 解压目录，在 `chrome://extensions` 重新加载扩展，并重新加载 VS Code。不要让两个
+Relay 版本同时启用。
+
+**ChatGPT 要求登录、验证码或提示频率限制**
+
+请在 Chrome 中人工完成登录或验证，并等待网页端限制解除。Ask2GPT 不绕过 CAPTCHA、账号限制或
+ChatGPT 的安全提示，也不会在发送结果不确定时自动重发问题。
+
+## 已知限制
+
+- ChatGPT 页面结构、模型目录或会话协议变化后，可能需要更新兼容层；
+- 使用量、可用模型、生成速度和频率限制由 ChatGPT 账号与网页端决定；
+- 不支持图片、二进制、Deep Research、Web Search 或 Apps；
+- 只同步已映射会话的当前可见分支，不扫描全部 ChatGPT 历史或不可见分支；
+- GitHub Release 安装 Chrome Relay 仍需开发者模式；自动更新需要后续发布到扩展商店；
+- 不执行代码、不修改文件，也不提供 Agent 工具调用。
 
 ## 从源码构建
 
-开发要求：
-
-- Node.js 22.13+ 或 24+（推荐当前 Node 24 LTS）
-- pnpm 11.20.0（根 `package.json` 已通过 Corepack 固定版本）
+开发要求：Node.js 22.13+ 或 24+，以及通过 Corepack 固定的 pnpm 11.20.0。
 
 ```powershell
 corepack enable
@@ -140,50 +195,25 @@ pnpm verify
 pnpm package
 ```
 
-`pnpm verify` 会运行格式、类型、ESLint、架构边界、源码隔离、第三方许可证、单元/集成、
-Webview 预览契约、smoke harness 和构建检查。`pnpm package` 会从当前版本号生成并复核 VSIX
-与 Relay ZIP，包括 MIT 许可证和第三方依赖声明；生成物被 `.gitignore` 排除，只应作为 GitHub
-Release/CI artifact 发布。
+`pnpm verify` 会检查格式、类型、ESLint、架构边界、源码隔离、第三方许可证、单元/集成测试、
+Webview 预览、smoke harness 和生产构建。`pnpm package` 会生成并复核 VSIX、Relay ZIP、MIT
+许可证及第三方声明；生成包被 Git 忽略，只由 GitHub Release/CI 发布。
 
-真实登录态 smoke 会创建 ChatGPT 会话并操作 Relay，仅在明确准备好测试账号和 Chrome 环境时运行：
+真实登录态 smoke 会创建合成 ChatGPT 会话，只应在已准备测试账号和 Chrome 环境时运行：
 
 ```powershell
-pnpm smoke:live -- --host-count 3 --connection-timeout-ms 180000 --generation-timeout-ms 180000
+pnpm smoke:live -- --host-count 1 --model-id mode-fast --connection-timeout-ms 90000 --generation-timeout-ms 180000
 ```
 
-详细开发流程见 [CONTRIBUTING.md](./CONTRIBUTING.md)，人工发布验收见
-[MANUAL_QA.md](./MANUAL_QA.md)。
+## 项目文档
 
-## 发布
-
-1. 同步根、VS Code、Chrome、协议包和 Chrome manifest 的 SemVer。
-2. 更新 [CHANGELOG.md](./CHANGELOG.md)。
-3. 执行 `pnpm audit:dependencies`、`pnpm verify` 与 `pnpm package`。
-4. 提交并推送代码。
-5. 创建并推送与版本一致的 tag，例如 `v0.0.1`。
-
-`.github/workflows/release.yml` 会从干净 checkout 重新验证、打包、生成 SHA-256 校验和并创建
-GitHub Release。tag 与 `package.json` 版本不一致时发布会失败。
-
-## 已知限制
-
-- ChatGPT 页面结构、未公开模型目录或会话请求结构变化后，可能需要更新兼容层；
-- 登录、CAPTCHA 和人工验证必须由用户在 Chrome 中处理；
-- 不支持二进制、图片、Deep Research、Web Search 或 Apps；
-- 不扫描 ChatGPT 全部历史或不可见分支；
-- GitHub Release 安装仍需要 Chrome 开发者模式，真正的一键自动更新需要后续发布到 VS Code
-  Marketplace 与 Chrome Web Store；
-- protocol v15 的零配置 loopback 不能防止本机恶意进程冒充。
-
-## 文档
-
-- [ARCHITECTURE.md](./ARCHITECTURE.md)：组件、协议、状态机和恢复边界
-- [SECURITY.md](./SECURITY.md)：权限、数据处理和威胁模型
-- [MANUAL_QA.md](./MANUAL_QA.md)：发布前人工验收
-- [CHANGELOG.md](./CHANGELOG.md)：版本变更
-- [CONTRIBUTING.md](./CONTRIBUTING.md)：开发与贡献流程
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md)：组件、协议、状态机和恢复边界
+- [`SECURITY.md`](./SECURITY.md)：权限、数据处理和威胁模型
+- [`MANUAL_QA.md`](./MANUAL_QA.md)：发布前人工验收
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md)：开发、测试和贡献流程
+- [`CHANGELOG.md`](./CHANGELOG.md)：版本变更
 
 ## License
 
-[MIT](./LICENSE)。随成品分发的依赖许可证和版权声明见
-[THIRD_PARTY_NOTICES.txt](./THIRD_PARTY_NOTICES.txt)。
+[MIT](./LICENSE)。随安装包分发的第三方许可证与版权声明见
+[`THIRD_PARTY_NOTICES.txt`](./THIRD_PARTY_NOTICES.txt)。

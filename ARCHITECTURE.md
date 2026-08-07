@@ -150,23 +150,19 @@ closed，不会自动重放问题或切换到其他后端。
    这些命令不聚焦操作系统窗口。调试通道同时读取本轮 SSE。
    Content Script 完成输入、唯一按钮、Project、run 和发送前历史基线校验后，为 owned scope、composer
    与发送按钮添加当前 `runId` 标记；Service Worker 通过受限的 `chrome.scripting.executeScript`
-   在页面 MAIN world 复核三者唯一且同 scope，并验证按钮启用、可见几何及命中点未遮挡。页面所在
-   普通窗口中，在同一同步事务中执行恰好一次按钮 `click()`；Relay 临时停放窗口中返回已验证命中点，
-   通过同一个 debugger 会话只派发一次 CDP 左键按下/释放。关闭“增强后台接收”时仅为该动作建立
-   短时 debugger 会话，不启用 Network 域并在释放后立即断开。若 exact owned 标签页在发送前处于后台（无论原窗口正常还是最小化），
-   Service Worker 只用 `windows.create({ type: "normal", focused: false, tabId })` 把它移入
-   不超过 980×760 的桌面布局临时窗口。该尺寸避免 ChatGPT 的紧凑响应式布局卸载 transcript；窗口
-   沿用原窗口已验证的屏幕内坐标，并通过 `focused:false` 保持在用户前台应用之后；Relay 等待其中的
-   composer 连续两次稳定可见（两次探测间隔 350 ms）后才发送，避免窗口移动后 React 的提交处理器
-   尚未重新挂载时过早激活按钮。该稳定窗完全位于写入问题和发送动作之前，不会形成重试或重复提交路径。
-   Chrome 禁止标签页移入或移出 `type=popup` 窗口，因此该临时窗口必须
-   保持 `type=normal`。标签页与临时窗口保持到回答终态，随后标签页移回原窗口、恢复此前 active
-   标签页并关闭临时窗口。用户若主动聚焦临时窗口，则立即把标签页移回按原尺寸显示的正常 Chrome
-   窗口，终态不再
-   替用户最小化；原窗口若已最小化则始终保持最小化和原边界。可见性租约与可选 debugger 捕获解耦；
-   关闭“增强后台接收”也使用同一临时窗口路径。
-   前台与临时窗口共用
-   同一 MAIN-world 发送路径，也不重试含糊的提交；若 1.5 秒内没有请求生命周期、当前用户消息或
+   在页面 MAIN world 复核三者唯一且同 scope，并在 1.2 秒内取得四次稳定的按钮几何/命中样本；
+   按钮必须启用、可见，且中心或四个象限内至少一个内部点始终未被遮挡。验证只返回命中点，不调用
+   页面脚本 `click()`、表单提交或键盘事件。Service Worker 再通过同一个 debugger 会话执行
+   `Page.bringToFront`，复核 exact tab 仍为 home window 的 active tab，并仅派发一次 CDP 左键
+   move/press/release。关闭“增强后台接收”时仅为这次指针动作建立短时 debugger 会话，不启用
+   Network 域并在释放后立即断开。从 `mousePressed` 开始结果即视为不确定且不可重试，只能进入只读恢复。
+   若 exact owned 标签页在发送前处于后台，Service Worker 会在不聚焦 Chrome 窗口的情况下短暂选择
+   该标签页，并要求间隔 350 ms 的两次 composer 稳定就绪证明。最小化的 home window 会先移动到
+   经过边界校验的屏幕外坐标并临时恢复为 normal，使 React 与页面提交处理器真正运行；终态后恢复
+   原边界、原 active 标签页和最小化状态。只读历史预热可以把标签页放入最大 980×760、
+   `focused=false` 的临时窗口，但非幂等发送边界明确拒绝临时窗口，必须先回到 home window。
+   用户在租约期间主动切换标签页、聚焦窗口或改变窗口状态时，恢复逻辑保留用户的新选择。
+   前台、后台和最小化场景共用同一 MAIN-world 验证与 trusted-pointer 路径；若 1.5 秒内没有请求生命周期、当前用户消息或
    composer 变化，并且原草稿仍完整，则立即准确报告“未发送”，
    而不是继续等待完整的十秒确认窗口。若 SSE 返回 `stream_handoff`，捕获保持到对应
    `conversation-turn-*` WebSocket

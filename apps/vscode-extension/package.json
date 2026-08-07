@@ -4,7 +4,7 @@
   "private": true,
   "publisher": "FeyZha",
   "displayName": "Ask2GPT",
-  "description": "Codex-style coding assistant for VS Code.",
+  "description": "Ask project code through your signed-in ChatGPT web session.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -23,12 +23,12 @@
     "Chat"
   ],
   "keywords": [
-    "question",
-    "answer",
+    "code explanation",
+    "code review",
     "ask2gpt",
     "chatgpt",
     "chrome relay",
-    "code explanation"
+    "project context"
   ],
   "activationEvents": [
     "*",

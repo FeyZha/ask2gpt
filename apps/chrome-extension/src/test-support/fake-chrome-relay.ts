@@ -250,6 +250,7 @@ export class FakeChromeRelayHarness {
   private nextTabId = 41;
   private nextWindowId = 2;
   private primaryContentTabId?: number;
+  private runtimeSenderUrlOverride?: string;
 
   installGlobals() {
     FakeChromeRelayHarness.suspendActive();
@@ -365,6 +366,10 @@ export class FakeChromeRelayHarness {
     tab.url = url;
     tab.status = "complete";
     this.timeline.push(`tab-state:${tabId}:${url}`);
+  }
+
+  setRuntimeSenderUrlOverride(url: string | undefined) {
+    this.runtimeSenderUrlOverride = url;
   }
 
   setTabFrozen(tabId: number, frozen: boolean) {
@@ -609,7 +614,7 @@ export class FakeChromeRelayHarness {
         const sender: chrome.runtime.MessageSender = {
           id: CHROME_EXTENSION_ID,
           frameId: 0,
-          url: tab.url,
+          url: this.runtimeSenderUrlOverride ?? tab.url,
           tab: this.cloneTab(tab),
         };
         return await invokeRuntimeListeners(
@@ -741,6 +746,9 @@ export class FakeChromeRelayHarness {
         if (this.debuggerCommandHandler) {
           const customResponse = await this.debuggerCommandHandler(target, method, commandParams);
           if (customResponse !== undefined) return customResponse;
+        }
+        if (method === "Target.getTargetInfo") {
+          return { targetInfo: { targetId: `tab-${target.tabId}` } };
         }
         if (
           method === "Input.dispatchMouseEvent" &&

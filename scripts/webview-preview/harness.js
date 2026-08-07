@@ -43,7 +43,7 @@
     });
   }
 
-  function startGeneration(question = "请演示长 Markdown 回答的流式渲染。") {
+  function startGeneration(question = "重复标签和 `replace()` 会怎样影响结果？请按优先级解释。") {
     stopStreamTimer();
     const conversation = activeConversation();
     if (!conversation) return;
@@ -78,12 +78,12 @@
   function streamLongMarkdown(question) {
     startGeneration(question);
     const chunks = [
-      "## Relay 流式验证\n\n",
-      "每个更新都携带稳定的 `conversationId`、`runId` 和 `messageId`。\n\n",
-      "```ts\nfunction routeFrame(frame: RelayFrame) {\n",
-      "  return sessions.get(frame.conversationId);\n}\n```\n\n",
-      "- 紧凑增量帧只更新当前回答\n- 完整状态负责终态与回滚\n",
-      "\n这样切换标签页或恢复 Webview 时，不会重复发送问题，也不会错配会话。",
+      "## 建议先处理这两个问题\n\n",
+      "1. **`replace()` 不会让缓存失效**：反馈数量没有变化，旧的 `insights` 会被直接返回。\n\n",
+      "```ts\nreplace(item: Feedback): boolean {\n",
+      "  // 替换成功后应清空缓存，或改用递增 revision。\n}\n```\n\n",
+      "2. **重复标签会重复计数**：同一条反馈里的 `['体验', '体验']` 会贡献两次 mentions。\n",
+      "\n优先修缓存一致性，因为它会让调用方在数据已经更新后仍看到旧结论；标签去重则取决于产品语义。",
     ];
     let markdown = "";
     streamStep = 0;
@@ -94,7 +94,7 @@
         streamStep += 1;
         if (streamStep >= chunks.length) completeGeneration();
       },
-      parameters.get("slow") === "1" ? 5_000 : 220,
+      parameters.get("slow") === "1" ? 5_000 : parameters.get("demo") === "1" ? 650 : 220,
     );
   }
 
@@ -250,7 +250,7 @@
       currentModelId: conversation.selectedModelId ?? "mode-smart",
     };
     if (conversationId === "preview-secondary") {
-      emitNotice("info", "已切换到独立预览会话；上下文不会跨会话保留。");
+      emitNotice("info", "已切换到独立示例会话；上下文不会跨会话保留。");
     }
     emitState();
   }
@@ -355,6 +355,6 @@
   });
 
   if (parameters.get("scenario") === "sequence") {
-    window.setTimeout(() => streamLongMarkdown(), 350);
+    window.setTimeout(() => streamLongMarkdown(), parameters.get("demo") === "1" ? 850 : 350);
   }
 })();

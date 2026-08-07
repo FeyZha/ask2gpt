@@ -16,9 +16,68 @@ import {
   assertResumeConfiguration,
   classifyRelayErrorReason,
   parseComposerErrorDiagnostic,
+  reconcileSmokeHistorySnapshot,
   shouldVerifyPrimaryFollowup,
   verifyResumedPrimaryHost,
 } from "./live-relay-smoke.mjs";
+
+test("history reconciliation preserves terminal-backed local messages for safe partial renders", () => {
+  const host = new LiveHost(0);
+  host.stage = "followup_generation";
+  const expected = [
+    { role: "user", markdown: "First" },
+    { role: "assistant", markdown: "OK" },
+    { role: "user", markdown: "Second" },
+    { role: "assistant", markdown: "OK" },
+  ];
+  const envelope = (messages, complete = false) => ({
+    type: "conversation.snapshot",
+    conversationId: "conversation-a",
+    payload: {
+      remoteUrl: "https://chatgpt.com/g/ask2gpt/c/remote-a",
+      messages,
+      complete,
+    },
+  });
+
+  const empty = reconcileSmokeHistorySnapshot(envelope([]), "conversation-a", 4, expected, host);
+  assert.equal(empty?.payload.reconciledFromPartial, true);
+  assert.deepEqual(empty?.payload.messages, expected);
+
+  const suffix = reconcileSmokeHistorySnapshot(
+    envelope(expected.slice(-2)),
+    "conversation-a",
+    4,
+    expected,
+    host,
+  );
+  assert.deepEqual(suffix?.payload.messages, expected);
+
+  assert.equal(
+    reconcileSmokeHistorySnapshot(
+      envelope([
+        { role: "user", markdown: "Unrelated" },
+        { role: "assistant", markdown: "Answer" },
+      ]),
+      "conversation-a",
+      4,
+      expected,
+      host,
+    ),
+    undefined,
+  );
+  assert.throws(
+    () =>
+      reconcileSmokeHistorySnapshot(
+        envelope(expected.slice(-2), true),
+        "conversation-a",
+        4,
+        expected,
+        host,
+      ),
+    (error) => error?.code === "partial_history_marked_complete",
+  );
+});
 
 test("live smoke rejects a stale content runtime before opening conversations", () => {
   const current = new LiveHost(0);

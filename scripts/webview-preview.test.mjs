@@ -19,6 +19,9 @@ test("preview state satisfies the current AppState invariants", () => {
   const state = validatePreviewState(createPreviewState());
   assert.equal(state.activeConversationId, "preview-main");
   assert.equal(state.backend.connection.phase, "ready");
+  assert.equal(state.backend.connection.protocolVersion, 15);
+  assert.equal(state.backend.selectorVersion, 50);
+  assert.equal(state.backend.project.name, "ask2gpt-tour");
   assert.equal(state.modelPicker.conversationId, state.activeConversationId);
   assert.deepEqual(state.composerPreferences, {
     followUpQueueMode: "queue",
@@ -26,6 +29,7 @@ test("preview state satisfies the current AppState invariants", () => {
   });
   assert.equal(state.contextLocked, false);
   assert.equal(state.pendingContexts.length, 2);
+  assert.ok(state.pendingContexts.every((context) => context.fileName === "insight-board.ts"));
   assert.deepEqual(state.automaticContextIds, []);
 });
 

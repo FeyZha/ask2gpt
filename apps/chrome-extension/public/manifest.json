@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Ask2GPT Relay",
   "version": "0.0.1",
-  "description": "The local Chrome relay for Ask2GPT's Codex-style VS Code chat.",
+  "description": "Local relay between Ask2GPT for VS Code and your signed-in ChatGPT web session.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7s8WLRhM/2e33HoSVSzEguHhMUWAS4I+ndZmnChv6HA/B7Mkofw15Tku2yX4JVBgPgN5u74Kk5GZbzCB5PEQcAKTvatNlREYONFHEUbShHzEYsz4xl2AkZDD7pVV/3LeMQtR++G4O8/znVKO0V60rLYL5rXM6kIo5Ip+GUrWaYZjENljOAsW1Ntu0ok98TjVNNesWsBOO1Ct0kZbVGs+Bty/wZGTDr/IyOfF8Z6WDUVduIfdzwWLJ8135ITyXonqdBZONb5tt4MMDxdg//erj+qNxRTr3kUyAJSx38CZ112z/fiGo0J1j9cKqbaTIbJfR8oj04k7/iAE8UCcpVqgxwIDAQAB",
   "permissions": ["tabs", "storage", "alarms", "debugger", "scripting"],

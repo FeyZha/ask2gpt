@@ -109,7 +109,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         harness.timeline.filter(
           (entry) => entry === `tabs.sendMessage:response:${tab.id}:content.inspectConversation`,
         ).length >=
-        inspectionsBefore + 3,
+        inspectionsBefore + 4,
       5_000,
     ).catch(() => {
       throw new Error(
@@ -122,7 +122,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       harness.timeline.filter(
         (entry) => entry === `tabs.sendMessage:request:${tab.id}:content.inspectConversation`,
       ).length - inspectionsBefore,
-    ).toBe(3);
+    ).toBe(4);
   }, 12_000);
 
   it("streams a minimized-window run through the default debugger capture", async () => {
@@ -200,12 +200,15 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       harness.timeline.includes(`debugger.command-target:${tab.id}:root:Target.setAutoAttach`),
     );
     const debuggerAttachIndex = harness.timeline.indexOf(`debugger.attach:${tab.id}`);
-    const parkingWindowIndex = harness.timeline.findIndex((entry) =>
-      entry.startsWith("window-created:"),
+    const offscreenRestoreIndex = harness.timeline.indexOf(
+      `window-updated:${homeWindowId}:state:normal`,
     );
     expect(debuggerAttachIndex).toBeGreaterThanOrEqual(0);
-    expect(parkingWindowIndex).toBeGreaterThanOrEqual(0);
-    expect(debuggerAttachIndex).toBeLessThan(parkingWindowIndex);
+    expect(offscreenRestoreIndex).toBeGreaterThanOrEqual(0);
+    // The home window must reach its validated off-screen normal state before
+    // the debugger prepares the exact renderer; no capture may wake a still
+    // visibly positioned minimized window.
+    expect(offscreenRestoreIndex).toBeLessThan(debuggerAttachIndex);
     expect(
       harness.timeline.includes(
         `debugger.command-target:${tab.id}:root:Emulation.setFocusEmulationEnabled`,
@@ -394,16 +397,20 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       ),
     ).toBe(true);
     expect(harness.timeline.some((entry) => entry.includes("focused:true"))).toBe(false);
-    expect(
-      harness.timeline.some(
-        (entry) =>
-          entry.startsWith("window-created:") &&
-          entry.includes(`:tab:${tab.id}:bounds:100,100,980,760:focused:false`),
-      ),
-    ).toBe(true);
-    await waitUntil(() => harness.timeline.some((entry) => entry.startsWith("window-removed:")));
-    expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:state:normal`);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect(harness.timeline).toContain(
+      `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
+    );
+    await waitUntil(() =>
+      harness.timeline.includes(`window-updated:${homeWindowId}:state:minimized`),
+    );
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
+    expect(harness.windowBounds(homeWindowId)).toEqual({
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
+    });
   }, 15_000);
 
   it("prepares the owned renderer before one guarded composer activation while visible and minimized", async () => {
@@ -415,16 +422,18 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     });
     requireElement<HTMLButtonElement>('[data-testid="send-button"]').type = "submit";
     const contentSendMessages: Array<Record<string, unknown>> = [];
-    let parkedComposerStatusMessages = 0;
+    let offscreenComposerStatusMessages = 0;
     harness.beforeTabMessage = (_tabId, message) => {
       if (isMessageType(message, "content.send")) {
         contentSendMessages.push(structuredClone(message as Record<string, unknown>));
       }
       if (
         isMessageType(message, "content.composerStatus") &&
-        harness.tabsById.get(tab.id)?.windowId !== homeWindowId
+        harness.tabsById.get(tab.id)?.windowId === homeWindowId &&
+        harness.tabsById.get(tab.id)?.active === true &&
+        harness.windowBounds(homeWindowId).left <= -8_000
       ) {
-        parkedComposerStatusMessages += 1;
+        offscreenComposerStatusMessages += 1;
       }
     };
     await harness.importContentScript(tab.id, async () => await import("./content-script"));
@@ -437,6 +446,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
     expect(page.sendClicks()).toBe(1);
 
+    // Chrome keeps MessageSender.url at the document's original project URL
+    // across ChatGPT's History API navigation to the canonical conversation.
+    harness.setRuntimeSenderUrlOverride(PROJECT_ROOT);
     harness.setWindowFocused(homeWindowId, false);
     harness.setWindowState(homeWindowId, "minimized");
     const minimizedTimelineStart = harness.timeline.length;
@@ -452,7 +464,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(page.formSubmits()).toBe(2);
     expect(page.submittedPrompts()).toEqual(["Explain the relay race.", "Explain the relay race."]);
     expect(contentSendMessages).toHaveLength(2);
-    expect(parkedComposerStatusMessages).toBeGreaterThanOrEqual(2);
+    expect(offscreenComposerStatusMessages).toBeGreaterThanOrEqual(2);
     expect(contentSendMessages[0]).not.toHaveProperty("debuggerDispatch");
     expect(contentSendMessages[1]).not.toHaveProperty("debuggerDispatch");
     expect(
@@ -464,6 +476,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(
       harness.timeline.filter((entry) => entry.includes("Input.dispatchKeyEvent")),
     ).toHaveLength(0);
+    expect(
+      harness.timeline.filter((entry) => entry.includes("Input.dispatchMouseEvent")),
+    ).toHaveLength(12);
     const atomicActivationEntries = harness.timeline
       .map((entry, index) => ({ entry, index }))
       .filter(
@@ -510,23 +525,22 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       minimizedTimeline.filter(
         (entry) => entry === `debugger.command-target:${tab.id}:root:Input.dispatchMouseEvent`,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(3);
     expect(minimizedTimeline.some((entry) => entry.includes("focused:true"))).toBe(false);
-    expect(
-      minimizedTimeline.some(
-        (entry) =>
-          entry.startsWith("window-created:") &&
-          entry.includes(`:tab:${tab.id}:bounds:100,100,980,760:focused:false`),
-      ),
-    ).toBe(true);
-    expect(minimizedTimeline).not.toContain(`window-updated:${homeWindowId}:state:normal`);
+    expect(minimizedTimeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect(minimizedTimeline).toContain(
+      `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
+    );
+    expect(minimizedTimeline).toContain(`window-updated:${homeWindowId}:state:normal`);
     expect(
       minimizedTimeline.filter(
         (entry) =>
           entry === `scripting.executeScript:${tab.id}:MAIN:activateMarkedComposerSendInMainWorld`,
       ),
     ).toHaveLength(1);
-    await waitUntil(() => harness.timeline.some((entry) => entry.startsWith("window-removed:")));
+    await waitUntil(() =>
+      harness.timeline.includes(`window-updated:${homeWindowId}:state:minimized`),
+    );
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
     expect(harness.windowBounds(homeWindowId)).toEqual({
       height: 900,
@@ -655,12 +669,30 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(harness.timeline.some((entry) => entry.startsWith("debugger.attach:"))).toBe(false);
   });
 
-  it("uses one atomic MAIN-world activation when enhanced reception is disabled", async () => {
+  it("uses one trusted pointer after atomic MAIN-world validation when enhanced reception is disabled", async () => {
     const { harness, socket, tab } = await startHarness({
-      debuggerPermission: false,
+      debuggerPermission: true,
       enhancedBackgroundReception: false,
     });
+    const homeWindowId = tab.windowId;
     const page = installChatGptComposerFixture(harness, tab.id, { autoCanonicalize: false });
+    const composerForm = requireElement<HTMLFormElement>("form");
+    composerForm.setAttribute("aria-hidden", "true");
+    const fallbackTextarea = document.createElement("textarea");
+    fallbackTextarea.style.display = "none";
+    composerForm.append(fallbackTextarea);
+    await chrome.tabs.create({
+      active: true,
+      url: "https://example.com/user-work",
+      windowId: homeWindowId,
+    });
+    harness.setWindowFocused(homeWindowId, true);
+    let targetActiveDuringMainWorldValidation = false;
+    harness.scriptInjectionHandler = async (tabId, _files, world) => {
+      if (tabId === tab.id && world === "MAIN") {
+        targetActiveDuringMainWorldValidation = harness.tabsById.get(tab.id)?.active === true;
+      }
+    };
     await harness.importContentScript(tab.id, async () => await import("./content-script"));
 
     socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
@@ -671,6 +703,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
 
     expect(page.sendClicks()).toBe(1);
+    expect(targetActiveDuringMainWorldValidation).toBe(true);
     expect(
       harness.timeline.filter(
         (entry) =>
@@ -700,19 +733,126 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     ).toHaveLength(0);
     expect(
       harness.timeline.filter(
+        (entry) => entry === `debugger.command-target:${tab.id}:root:Input.dispatchMouseEvent`,
+      ),
+    ).toHaveLength(3);
+    expect(
+      harness.timeline.filter(
         (entry) => entry === `debugger.command-target:${tab.id}:root:Network.enable`,
       ),
     ).toHaveLength(0);
     expect(harness.timeline.filter((entry) => entry === `debugger.attach:${tab.id}`)).toHaveLength(
-      0,
+      1,
     );
     expect(harness.timeline.filter((entry) => entry === `debugger.detach:${tab.id}`)).toHaveLength(
-      0,
+      1,
     );
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
-  });
+  }, 12_000);
 
-  it("uses one short-lived trusted pointer in a parking window when enhanced reception is disabled", async () => {
+  it("dismisses the exact ChatGPT conversation-history notice before one guarded send", async () => {
+    const { harness, socket, tab } = await startHarness({ debuggerPermission: true });
+    const page = installChatGptComposerFixture(harness, tab.id, { autoCanonicalize: false });
+    const modal = document.createElement("div");
+    modal.dataset.testid = "modal-conversation-history-rate-limit";
+    modal.style.display = "none";
+    const confirmation = document.createElement("button");
+    confirmation.type = "button";
+    confirmation.textContent = "Confirm";
+    let confirmationClicks = 0;
+    confirmation.addEventListener("click", () => {
+      confirmationClicks += 1;
+      modal.remove();
+    });
+    modal.append(confirmation);
+    document.body.append(modal);
+    requireElement<HTMLElement>("#prompt-textarea").addEventListener("input", () => {
+      modal.style.display = "block";
+    });
+    await harness.importContentScript(tab.id, async () => await import("./content-script"));
+
+    socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+    await harness.waitForEnvelope(
+      socket,
+      (envelope) => envelope.type === "generation.complete" && envelope.runId === FIRST_RUN_ID,
+      8_000,
+    );
+
+    expect(confirmationClicks).toBe(1);
+    expect(modal.isConnected).toBe(false);
+    expect(page.sendClicks()).toBe(1);
+    expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
+  }, 12_000);
+
+  it("fails closed when the ChatGPT conversation-history notice has ambiguous controls", async () => {
+    const { harness, socket, tab } = await startHarness({ debuggerPermission: true });
+    const page = installChatGptComposerFixture(harness, tab.id, { autoCanonicalize: false });
+    const modal = document.createElement("div");
+    modal.dataset.testid = "modal-conversation-history-rate-limit";
+    let modalClicks = 0;
+    for (let index = 0; index < 2; index += 1) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = `Choice ${index + 1}`;
+      button.addEventListener("click", () => {
+        modalClicks += 1;
+      });
+      modal.append(button);
+    }
+    document.body.append(modal);
+    await harness.importContentScript(tab.id, async () => await import("./content-script"));
+
+    socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+    const error = await harness.waitForEnvelope(
+      socket,
+      (envelope) => envelope.type === "relay.error" && envelope.runId === FIRST_RUN_ID,
+      8_000,
+    );
+
+    expect(error.payload).toMatchObject({ code: "CHATGPT_REMOTE_UNAVAILABLE" });
+    expect(modalClicks).toBe(0);
+    expect(page.sendClicks()).toBe(0);
+  }, 12_000);
+
+  it("dismisses a conversation-history notice mounted at the final MAIN-world boundary", async () => {
+    const { harness, socket, tab } = await startHarness({ debuggerPermission: true });
+    const page = installChatGptComposerFixture(harness, tab.id, { autoCanonicalize: false });
+    let confirmationClicks = 0;
+    harness.scriptInjectionHandler = async (_tabId, _files, world) => {
+      if (
+        world !== "MAIN" ||
+        !document.querySelector("[data-ask2gpt-main-world-send]") ||
+        document.querySelector('[data-testid="modal-conversation-history-rate-limit"]')
+      ) {
+        return;
+      }
+      const modal = document.createElement("div");
+      modal.dataset.testid = "modal-conversation-history-rate-limit";
+      const confirmation = document.createElement("button");
+      confirmation.type = "button";
+      confirmation.textContent = "Confirm";
+      confirmation.addEventListener("click", () => {
+        confirmationClicks += 1;
+        modal.remove();
+      });
+      modal.append(confirmation);
+      document.body.append(modal);
+    };
+    await harness.importContentScript(tab.id, async () => await import("./content-script"));
+
+    socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+    await harness.waitForEnvelope(
+      socket,
+      (envelope) => envelope.type === "generation.complete" && envelope.runId === FIRST_RUN_ID,
+      8_000,
+    );
+
+    expect(confirmationClicks).toBe(1);
+    expect(page.sendClicks()).toBe(1);
+    expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
+  }, 12_000);
+
+  it("uses one trusted pointer in the off-screen home window when enhanced reception is disabled", async () => {
     const { harness, socket, tab } = await startHarness({
       debuggerPermission: true,
       enhancedBackgroundReception: false,
@@ -733,9 +873,14 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(page.sendClicks()).toBe(1);
     expect(
       harness.timeline.filter(
+        (entry) => entry === `debugger.command-target:${tab.id}:root:Input.dispatchKeyEvent`,
+      ),
+    ).toHaveLength(0);
+    expect(
+      harness.timeline.filter(
         (entry) => entry === `debugger.command-target:${tab.id}:root:Input.dispatchMouseEvent`,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(3);
     expect(
       harness.timeline.filter(
         (entry) => entry === `debugger.command-target:${tab.id}:root:Network.enable`,
@@ -746,19 +891,37 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         (entry) => entry === `debugger.command-target:${tab.id}:root:Page.setWebLifecycleState`,
       ),
     ).toHaveLength(0);
+    expect(
+      harness.timeline.filter(
+        (entry) =>
+          entry === `debugger.command-target:${tab.id}:root:Emulation.setFocusEmulationEnabled`,
+      ),
+    ).toHaveLength(0);
     expect(harness.timeline.filter((entry) => entry === `debugger.attach:${tab.id}`)).toHaveLength(
       1,
     );
     expect(harness.timeline.filter((entry) => entry === `debugger.detach:${tab.id}`)).toHaveLength(
       1,
     );
-    await waitUntil(() => harness.timeline.some((entry) => entry.startsWith("window-removed:")));
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect(harness.timeline).toContain(
+      `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
+    );
+    expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
+    expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:minimized`);
+    expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
+    expect(harness.windowBounds(homeWindowId)).toEqual({
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
+    });
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 15_000);
 
   it("fails before atomic activation when the marked button has invalid geometry", async () => {
     const { harness, socket, tab } = await startHarness({
-      debuggerPermission: false,
+      debuggerPermission: true,
       enhancedBackgroundReception: false,
     });
     const page = installChatGptComposerFixture(harness, tab.id, { autoCanonicalize: false });
@@ -793,13 +956,16 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       harness.timeline.filter((entry) => entry.includes("Input.dispatchKeyEvent")),
     ).toHaveLength(0);
     expect(harness.timeline.filter((entry) => entry === `debugger.attach:${tab.id}`)).toHaveLength(
-      0,
+      1,
+    );
+    expect(harness.timeline.filter((entry) => entry === `debugger.detach:${tab.id}`)).toHaveLength(
+      1,
     );
   });
 
   it("fails before atomic activation when the marked button is occluded", async () => {
     const { harness, socket, tab } = await startHarness({
-      debuggerPermission: false,
+      debuggerPermission: true,
       enhancedBackgroundReception: false,
     });
     const page = installChatGptComposerFixture(harness, tab.id, { autoCanonicalize: false });
@@ -823,7 +989,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       harness.timeline.filter((entry) => entry.includes("Input.dispatchKeyEvent")),
     ).toHaveLength(0);
     expect(harness.timeline.filter((entry) => entry === `debugger.attach:${tab.id}`)).toHaveLength(
-      0,
+      1,
+    );
+    expect(harness.timeline.filter((entry) => entry === `debugger.detach:${tab.id}`)).toHaveLength(
+      1,
     );
   });
 
@@ -2180,7 +2349,22 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       ],
       runVisibilityLeases: {
         version: 4,
-        windows: [],
+        windows: [
+          expect.objectContaining({
+            windowId: tab.windowId,
+            baselineTabId: baselineTab.id,
+            parked: false,
+            restoreMinimized: false,
+            userIntervened: false,
+            stack: [
+              expect.objectContaining({
+                runId: FIRST_RUN_ID,
+                tabId: tab.id,
+                windowId: tab.windowId,
+              }),
+            ],
+          }),
+        ],
       },
     });
     expect(socket.readyState).toBe(FakeRelayWebSocket.CLOSED);
@@ -7537,7 +7721,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
   }, 5_000);
 
-  it("parks an unhydrated owned tab before the first send", async () => {
+  it("transiently selects an unhydrated owned tab and restores the focused user tab", async () => {
     const { harness, socket, tab } = await startHarness();
     const homeWindowId = tab.windowId;
     const previousTab = await chrome.tabs.create({
@@ -7582,20 +7766,11 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
 
     expect(sendCalls).toBe(1);
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
-    expect(harness.tabsById.get(tab.id)?.active).toBe(true);
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(true);
-    expect(
-      harness.timeline.some(
-        (entry) =>
-          entry.startsWith("window-created:") &&
-          entry.includes(`:tab:${tab.id}:bounds:100,100,980,760:focused:false`),
-      ),
-    ).toBe(true);
-    expect(
-      harness.timeline.some((entry) => entry.startsWith(`window-updated:${homeWindowId}:`)),
-    ).toBe(false);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:focused:true`);
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 8_000);
 
@@ -7664,10 +7839,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         )?.some((run) => run.runId === FIRST_RUN_ID && run.phase === "active") === true,
       5_000,
     );
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
     expect(harness.tabsById.get(tab.id)?.active).toBe(true);
-    expect(harness.tabsById.get(previousTabId)?.active).toBe(true);
+    expect(harness.tabsById.get(previousTabId)?.active).toBe(false);
 
     harness.setPrimaryDocumentUrl(REMOTE_A);
     harness.setTabUrl(tab.id, REMOTE_A);
@@ -7682,7 +7856,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         remoteUrl: REMOTE_A,
       }),
     ).resolves.toEqual({ ok: true });
-    await waitUntil(() => harness.timeline.includes(`window-removed:${parkingWindowId}`));
+    await waitUntil(() => harness.tabsById.get(previousTabId)?.active === true);
 
     const terminalInspectIndex = harness.timeline.findIndex(
       (entry, index) =>
@@ -7772,20 +7946,16 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       5_000,
     );
 
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
-    expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
-    expect((await chrome.windows.get(parkingWindowId!)).state).toBe("normal");
-    expect(harness.windowBounds(parkingWindowId!)).toEqual({
-      height: 760,
-      left: 100,
-      top: 100,
-      width: 980,
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
+    expect(harness.windowBounds(homeWindowId)).toEqual({
+      height: 100,
+      left: -16_000,
+      top: -16_000,
+      width: 100,
     });
-    expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:state:normal`);
-    expect(harness.timeline).toContain(
-      `window-created:${parkingWindowId}:tab:${tab.id}:bounds:100,100,980,760:focused:false`,
-    );
+    expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
 
     harness.setPrimaryDocumentUrl(REMOTE_A);
     harness.setTabUrl(tab.id, REMOTE_A);
@@ -7799,7 +7969,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         remoteUrl: REMOTE_A,
       }),
     ).resolves.toEqual({ ok: true });
-    await waitUntil(() => harness.timeline.includes(`window-removed:${parkingWindowId}`));
+    await waitUntil(() =>
+      harness.timeline.includes(`window-updated:${homeWindowId}:state:minimized`),
+    );
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
     expect(harness.windowBounds(homeWindowId)).toEqual({
       height: 900,
@@ -7809,12 +7981,12 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     });
     expect(harness.tabsById.get(previousTabId)?.active).toBe(true);
     expect(harness.tabsById.get(tab.id)?.active).toBe(false);
-    expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:state:normal`);
+    expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
     expect(sendCalls).toBe(1);
-    // The final content.send path still revalidates the controlled editor and
-    // owned button. A freshly parked renderer must prove the exact ready
-    // composer twice across the bounded stability window before dispatch.
-    expect(composerStatusChecks).toBe(2);
+    // One hidden probe chooses the visibility path. A freshly restored renderer
+    // then proves the exact ready composer twice across the bounded stability
+    // window before dispatch.
+    expect(composerStatusChecks).toBe(3);
     expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:focused:true`);
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 10_000);
@@ -7900,8 +8072,8 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
     expect(sendCalls).toBe(1);
     expect(harness.tabsById.get(previousTabId)?.active).toBe(true);
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.active).toBe(false);
 
     harness.setWindowFocused(homeWindowId, false);
     harness.setWindowState(homeWindowId, "minimized");
@@ -7926,8 +8098,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     });
     expect(recoverCalls).toBeGreaterThanOrEqual(1);
     expect(sendCalls).toBe(1);
-    await waitUntil(() => harness.timeline.includes(`window-removed:${parkingWindowId}`));
-    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    await waitUntil(() => harness.tabsById.get(previousTabId)?.active === true);
     expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     expect(harness.tabsById.get(previousTabId)?.active).toBe(true);
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
@@ -8046,10 +8217,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(harness.tabsById.get(tab.id)?.active).toBe(true);
     expect((await chrome.windows.get(tab.windowId)).state).toBe("normal");
     expect(harness.windowBounds(tab.windowId)).toEqual({
-      height: 760,
-      left: 100,
-      top: 100,
-      width: 980,
+      height: 100,
+      left: -16_000,
+      top: -16_000,
+      width: 100,
     });
 
     harness.setWindowFocused(tab.windowId, true);
@@ -8331,7 +8502,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(sendCalls).toBe(0);
   }, 8_000);
 
-  it("parks a responsive background tab without activating the user's Chrome window", async () => {
+  it("selects a responsive background tab without activating the user's Chrome window", async () => {
     const { harness, socket, tab } = await startHarness();
     const homeWindowId = tab.windowId;
     const userTab = await chrome.tabs.create({
@@ -8348,7 +8519,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       }
       if (isMessageType(message, "content.composerStatus")) {
         const currentTab = harness.tabsById.get(tab.id);
-        const visible = currentTab?.active === true && currentTab.windowId !== homeWindowId;
+        const visible = currentTab?.active === true && currentTab.windowId === homeWindowId;
         return {
           ok: true,
           ready: visible,
@@ -8376,8 +8547,8 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         )?.some((run) => run.runId === FIRST_RUN_ID && run.phase === "active") === true,
       5_000,
     );
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.active).toBe(true);
 
     await expect(
       chrome.runtime.sendMessage({
@@ -8394,26 +8565,18 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
           (run) => run.runId === FIRST_RUN_ID,
         ),
     );
-    await waitUntil(() => harness.timeline.includes(`window-removed:${parkingWindowId}`));
+    await waitUntil(() => harness.tabsById.get(userTab.id!)?.active === true);
 
     const sendTimeline = harness.timeline.slice(sendTimelineStart);
     expect(sendCalls).toBe(1);
     expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     expect(harness.tabsById.get(userTab.id)?.active).toBe(true);
-    expect(
-      sendTimeline.some(
-        (entry) =>
-          entry.startsWith("window-created:") &&
-          entry.includes(`:tab:${tab.id}:bounds:100,100,980,760:focused:false`),
-      ),
-    ).toBe(true);
-    expect(sendTimeline.some((entry) => entry.startsWith(`window-updated:${homeWindowId}:`))).toBe(
-      false,
-    );
+    expect(sendTimeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect(sendTimeline).not.toContain(`window-updated:${homeWindowId}:focused:true`);
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 8_000);
 
-  it("moves an unresponsive minimized tab through one temporary normal window without restoring its window", async () => {
+  it("restores an unresponsive minimized home window only at safe off-screen bounds", async () => {
     const { harness, socket, tab } = await startHarness();
     const homeWindowId = tab.windowId;
     const userTab = await chrome.tabs.create({
@@ -8432,12 +8595,16 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       if (isMessageType(message, "content.composerStatus")) {
         const ready = harness.tabsById.get(tab.id)?.active === true;
         const currentWindowId = harness.tabsById.get(tab.id)?.windowId;
+        const currentWindowState = harness.timeline
+          .filter((entry) => entry.startsWith(`window-updated:${currentWindowId}:state:`))
+          .at(-1);
+        const visible = currentWindowState?.endsWith(":normal") === true;
         return {
           ok: true,
-          ready,
+          ready: ready && visible,
           rawCandidateCount: ready ? 1 : 0,
-          readyCandidateCount: ready ? 1 : 0,
-          visibilityState: currentWindowId === homeWindowId ? "hidden" : "visible",
+          readyCandidateCount: ready && visible ? 1 : 0,
+          visibilityState: visible ? "visible" : "hidden",
           selectorVersion: CONTENT_RUNTIME_REVISION,
         };
       }
@@ -8459,8 +8626,13 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         )?.some((run) => run.runId === FIRST_RUN_ID && run.phase === "active") === true,
       5_000,
     );
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    expect(harness.windowBounds(homeWindowId)).toEqual({
+      height: 100,
+      left: -16_000,
+      top: -16_000,
+      width: 100,
+    });
     await expect(
       chrome.runtime.sendMessage({
         type: "content.event",
@@ -8476,21 +8648,19 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
           (run) => run.runId === FIRST_RUN_ID,
         ),
     );
-    await waitUntil(() => harness.timeline.includes(`window-removed:${parkingWindowId}`));
+    await waitUntil(() =>
+      harness.timeline.includes(`window-updated:${homeWindowId}:state:minimized`),
+    );
+    await waitUntil(() => harness.tabsById.get(userTab.id!)?.active === true);
 
     const sendTimeline = harness.timeline.slice(sendTimelineStart);
     expect(sendCalls).toBe(1);
-    expect(
-      sendTimeline.filter(
-        (entry) => entry.startsWith("window-created:") && entry.includes(`:tab:${tab.id}:`),
-      ),
-    ).toHaveLength(1);
+    expect(sendTimeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
     expect(sendTimeline.filter((entry) => entry === `tab-active:${userTab.id}:true`)).toHaveLength(
       1,
     );
-    expect(sendTimeline.some((entry) => entry.startsWith(`window-updated:${homeWindowId}:`))).toBe(
-      false,
-    );
+    expect(sendTimeline).toContain(`window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`);
+    expect(sendTimeline).toContain(`window-updated:${homeWindowId}:state:normal`);
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 8_000);
@@ -8568,7 +8738,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
 
     expect(sendCounts.get(firstTab.id)).toBe(1);
     expect(sendCounts.get(secondTab.id)).toBe(1);
-    expect(harness.tabsById.get(firstTab.id)?.active).toBe(true);
+    expect(
+      [firstTab.id, secondTab.id].filter((tabId) => harness.tabsById.get(tabId)?.active === true),
+    ).toHaveLength(1);
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(false);
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
     expect(runErrors(harness, socket, SECOND_RUN_ID)).toHaveLength(0);
@@ -8799,6 +8971,8 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         expect(errors).toHaveLength(1);
         expect((errors[0]!.payload as { code?: string }).code).toBe("CHATGPT_REMOTE_UNAVAILABLE");
       });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(harness.tabsById.get(previousTab.id!)?.active).toBe(true));
     } finally {
       vi.useRealTimers();
     }
@@ -8807,8 +8981,8 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
     expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(true);
-    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(true);
-    expect(harness.timeline.some((entry) => entry.startsWith("window-removed:"))).toBe(true);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-removed:"))).toBe(false);
     expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:focused:true`);
   }, 8_000);
 
@@ -9896,7 +10070,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
 
     expect(error.payload).toMatchObject({ code: "SELECTOR_INCOMPATIBLE" });
     expect((error.payload as { message?: string }).message).toMatch(
-      /raw=2 ready=0 visibility=visible$/u,
+      /raw=2 ready=0 visibility=visible/u,
     );
     expect(page.sendClicks()).toBe(0);
     expect(page.formSubmits()).toBe(0);
@@ -10412,9 +10586,11 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     socket.deliverFromHost(sendEnvelope("run-prewarmed-dispatch-baseline"));
     await waitUntil(() => sendCount === 1);
 
+    // The idle prewarm already captured two equal candidates. The run must
+    // inspect exactly once more and match that prepared baseline before send.
     expect(
       harness.timeline.filter((entry) => entry === inspectionEntry).length - inspectionsBeforeSend,
-    ).toBe(2);
+    ).toBe(1);
     expect(runErrors(harness, socket, "run-prewarmed-dispatch-baseline")).toHaveLength(0);
   });
 
@@ -11358,13 +11534,17 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(timeline.filter((entry) => entry === `tabs.reload:${decoy.id}`)).toHaveLength(0);
     expect(timeline).toContain(`scripting.executeScript:${tab.id}:MAIN:page-model-bridge.js`);
     expect(timeline).toContain(`scripting.executeScript:${tab.id}:ISOLATED:content-script.js`);
-    expect(timeline.some((entry) => entry.includes("state:normal"))).toBe(false);
+    expect(timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
     expect(timeline.some((entry) => entry.includes("focused:true"))).toBe(false);
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
-    expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
-    expect((await chrome.windows.get(parkingWindowId!)).state).toBe("normal");
-    expect((await chrome.windows.get(parkingWindowId!)).type).toBe("normal");
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
+    expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
+    expect((await chrome.windows.get(homeWindowId)).type).toBe("normal");
+    expect(harness.windowBounds(homeWindowId)).toEqual({
+      height: 100,
+      left: -16_000,
+      top: -16_000,
+      width: 100,
+    });
     expect(mappedSendCount).toBe(1);
     expect(
       timeline.filter((entry) => entry === `tabs.sendMessage:request:${tab.id}:content.send`),
@@ -11633,7 +11813,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     await waitUntil(
       () =>
         visibleInspectionCount >= 3 &&
-        harness.timeline.some((entry) => entry.startsWith("window-removed:")),
+        harness.timeline.includes(`window-updated:${homeWindowId}:state:minimized`),
       8_000,
     );
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
@@ -11662,11 +11842,182 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
 
     expect(sendCount).toBe(1);
     expect(runErrors(harness, socket, runId)).toHaveLength(0);
-    expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
+    expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
+    expect(harness.windowBounds(homeWindowId)).toEqual({
+      height: 100,
+      left: -16_000,
+      top: -16_000,
+      width: 100,
+    });
+    expect(harness.tabsById.get(mappedTab.id)?.active).toBe(true);
+    expect(harness.tabsById.get(decoyTab.id)?.active).toBe(false);
     expect(harness.timeline.some((entry) => entry.includes("focused:true"))).toBe(false);
   }, 15_000);
 
-  it("keeps a dispatch-intent window parked and hands it directly to the later send", async () => {
+  it("refreshes history from an inactive normal-window tab before restoring the user's tab", async () => {
+    vi.resetModules();
+    const harness = new FakeChromeRelayHarness();
+    harness.installGlobals();
+    seedProjectBinding(harness);
+    const mappedTab = await chrome.tabs.create({ url: REMOTE_A, active: false });
+    const decoyTab = await chrome.tabs.create({
+      url: "https://example.test/history-foreground",
+      active: true,
+    });
+    if (mappedTab.id === undefined || decoyTab.id === undefined) {
+      throw new Error("Fake Chrome did not create the inactive-history tabs.");
+    }
+    const mappedTabId = mappedTab.id;
+    const decoyTabId = decoyTab.id;
+    harness.seedSessionValue("conversationTabsV2", [
+      {
+        owned: true,
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        tabId: mappedTabId,
+        remoteUrl: REMOTE_A,
+        projectScope: PROJECT_SCOPE,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    const messages = [
+      { role: "user" as const, markdown: "First turn" },
+      { role: "assistant" as const, markdown: "First answer" },
+    ];
+    harness.installTabMessageResponder(mappedTabId, async (message) => {
+      const visible = (await chrome.tabs.get(mappedTabId)).active === true;
+      if (isMessageType(message, "content.ping")) {
+        return { ok: true, pageUrl: REMOTE_A, selectorVersion: CONTENT_RUNTIME_REVISION };
+      }
+      if (isMessageType(message, "content.inspectConversation")) {
+        return {
+          ok: true,
+          remoteUrl: REMOTE_A,
+          complete: visible,
+          historyComplete: visible,
+          messages: visible ? messages : [],
+          observedAt: new Date().toISOString(),
+          selectorVersion: CONTENT_RUNTIME_REVISION,
+        };
+      }
+      return { ok: false };
+    });
+
+    await harness.importServiceWorker(async () => await import("./service-worker"));
+    const socket = await harness.waitForSocket();
+    await connectFakeVsCodeHost(harness, socket);
+    socket.deliverFromHost(
+      makeEnvelope({
+        type: "conversation.open",
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        payload: { active: false, remoteUrl: REMOTE_A },
+      }),
+    );
+    const snapshot = await harness.waitForEnvelope(
+      socket,
+      (envelope) =>
+        envelope.type === "conversation.snapshot" &&
+        Array.isArray((envelope.payload as { messages?: unknown[] }).messages) &&
+        (envelope.payload as { messages: unknown[] }).messages.length === messages.length,
+      8_000,
+    );
+    await waitUntil(() => harness.tabsById.get(decoyTabId)?.active === true, 5_000);
+
+    expect(snapshot.payload).toMatchObject({ complete: true, messages });
+    expect(harness.tabsById.get(mappedTabId)?.active).toBe(false);
+    expect(harness.tabsById.get(decoyTabId)?.active).toBe(true);
+    expect(harness.timeline.some((entry) => entry.includes("focused:true"))).toBe(false);
+  }, 12_000);
+
+  it("publishes an attested rendered suffix as partial instead of truncating local history", async () => {
+    vi.resetModules();
+    const harness = new FakeChromeRelayHarness();
+    harness.installGlobals();
+    seedProjectBinding(harness);
+    const mappedTab = await chrome.tabs.create({ url: REMOTE_A, active: true });
+    if (mappedTab.id === undefined) throw new Error("Fake Chrome did not create the suffix tab.");
+    const messages = [
+      { role: "user" as const, markdown: "First turn" },
+      { role: "assistant" as const, markdown: "First answer" },
+      { role: "user" as const, markdown: "Second turn" },
+      { role: "assistant" as const, markdown: "Second answer" },
+    ];
+    const messageHashes = await Promise.all(
+      messages.map(async (message) => ({
+        role: message.role,
+        sha256: await sha256FixtureHex(JSON.stringify([message.role, message.markdown])),
+      })),
+    );
+    const transcriptProof = {
+      remoteUrl: REMOTE_A,
+      messageCount: messageHashes.length,
+      messageHashes,
+      transcriptChainSha256: await sha256FixtureHex(
+        JSON.stringify(messageHashes.map((message) => [message.role, message.sha256])),
+      ),
+    };
+    harness.seedSessionValue("conversationTabsV2", [
+      {
+        owned: true,
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        tabId: mappedTab.id,
+        remoteUrl: REMOTE_A,
+        projectScope: PROJECT_SCOPE,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    harness.installTabMessageResponder(mappedTab.id, (message) => {
+      if (isMessageType(message, "content.ping")) {
+        return { ok: true, pageUrl: REMOTE_A, selectorVersion: CONTENT_RUNTIME_REVISION };
+      }
+      if (isMessageType(message, "content.inspectConversation")) {
+        return {
+          ok: true,
+          remoteUrl: REMOTE_A,
+          complete: true,
+          historyComplete: true,
+          messages: messages.slice(-2),
+          observedAt: new Date().toISOString(),
+          selectorVersion: CONTENT_RUNTIME_REVISION,
+        };
+      }
+      return { ok: false };
+    });
+
+    await harness.importServiceWorker(async () => await import("./service-worker"));
+    const socket = await harness.waitForSocket();
+    await connectFakeVsCodeHost(harness, socket);
+    socket.deliverFromHost(
+      makeEnvelope({
+        type: "conversation.open",
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        payload: { active: false, remoteUrl: REMOTE_A, transcriptProof },
+      }),
+    );
+    const snapshot = await harness.waitForEnvelope(
+      socket,
+      (envelope) => envelope.type === "conversation.snapshot",
+      8_000,
+    );
+
+    expect(snapshot.payload).toMatchObject({
+      complete: false,
+      messages: messages.slice(-2),
+    });
+    await waitUntil(
+      () =>
+        (
+          harness.localValue("conversationTranscriptFingerprintsV1") as
+            { entries?: Array<{ messageCount?: number }> } | undefined
+        )?.entries?.[0]?.messageCount === messages.length,
+      5_000,
+    );
+  }, 12_000);
+
+  it("keeps a dispatch-intent home window off-screen and hands it directly to the later send", async () => {
     vi.resetModules();
     const harness = new FakeChromeRelayHarness();
     harness.installGlobals();
@@ -11776,13 +12127,14 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     await waitUntil(
       () =>
         visibleInspectionBlocked &&
-        harness.timeline.some((entry) => entry.startsWith("window-created:")),
+        harness.timeline.includes(`window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`),
       5_000,
     );
 
     releaseVisibleInspection?.();
     await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(harness.timeline.some((entry) => entry.startsWith("window-removed:"))).toBe(false);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
+    expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
 
     const runId = "run-after-dispatch-intent-prewarm";
     socket.deliverFromHost(
@@ -11812,13 +12164,11 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       `tabs.sendMessage:request:${mappedTab.id}:content.send`,
     );
     expect(sendIndex).toBeGreaterThanOrEqual(0);
-    expect(
-      harness.timeline.slice(0, sendIndex).some((entry) => entry.startsWith("window-removed:")),
-    ).toBe(false);
-    expect(harness.timeline.filter((entry) => entry.startsWith("window-created:"))).toHaveLength(1);
-    expect(harness.tabsById.get(mappedTab.id)?.windowId).not.toBe(homeWindowId);
-    expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
-    expect(harness.tabsById.get(decoyTab.id)?.active).toBe(true);
+    expect(harness.timeline.filter((entry) => entry.startsWith("window-created:"))).toHaveLength(0);
+    expect(harness.tabsById.get(mappedTab.id)?.windowId).toBe(homeWindowId);
+    expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
+    expect(harness.tabsById.get(mappedTab.id)?.active).toBe(true);
+    expect(harness.tabsById.get(decoyTab.id)?.active).toBe(false);
     expect(runErrors(harness, socket, runId)).toHaveLength(0);
   }, 15_000);
 
@@ -12164,6 +12514,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     await harness.importContentScript(tab.id, async () => undefined);
     await harness.importServiceWorker(async () => await import("./service-worker"));
 
+    // MessageSender.url remains the document's original project URL after
+    // ChatGPT moves the tab to a conversation with History API navigation.
+    // Read-only recovery must accept that exact-project document identity too.
+    harness.setRuntimeSenderUrlOverride(PROJECT_ROOT);
     const exactResponse: unknown = await chrome.runtime.sendMessage({
       type: "content.recovery.request",
       conversationId: CONVERSATION_ID,
@@ -13045,6 +13399,20 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
           selectorVersion: CONTENT_RUNTIME_REVISION,
         };
       }
+      if (isMessageType(message, "content.inspectConversation")) {
+        return {
+          ok: true,
+          remoteUrl: REMOTE_A,
+          complete: true,
+          historyComplete: true,
+          messages: [
+            { role: "user", markdown: "Explain the relay race." },
+            { role: "assistant", markdown: "Stopped after background recovery" },
+          ],
+          observedAt: new Date().toISOString(),
+          selectorVersion: CONTENT_RUNTIME_REVISION,
+        };
+      }
       return { ok: false };
     });
 
@@ -13061,10 +13429,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         )?.some((run) => run.runId === runId && run.phase === "active") === true,
     );
 
-    const parkingWindowId = harness.tabsById.get(tab.id)?.windowId;
-    expect(parkingWindowId).not.toBe(homeWindowId);
+    expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(true);
-    expect(harness.tabsById.get(tab.id)?.active).toBe(true);
+    expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     harness.setTabFrozen(tab.id, true);
     await waitUntil(() => harness.tabsById.get(tab.id)?.frozen === false, 5_000);
     await waitUntil(() => recoverCount >= 1, 5_000);
@@ -13072,7 +13439,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(sendCount).toBe(1);
     expect(recoverCount).toBeGreaterThanOrEqual(1);
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(true);
-    expect(harness.tabsById.get(tab.id)?.active).toBe(true);
+    expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     expect(harness.timeline.some((entry) => entry === `tab-active:${tab.id}:true`)).toBe(true);
 
     harness.setTabDiscarded(tab.id, true);
@@ -13080,7 +13447,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     await waitUntil(() => recoverCount >= 2, 5_000);
     expect(sendCount).toBe(1);
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(true);
-    expect(harness.tabsById.get(tab.id)?.active).toBe(true);
+    expect(harness.tabsById.get(tab.id)?.active).toBe(false);
     expect(runErrors(harness, socket, runId)).toHaveLength(0);
 
     await harness.importContentScript(tab.id, async () => undefined);
@@ -13101,7 +13468,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         harness.tabsById.get(tab.id)?.active === false,
     );
     expect(harness.tabsById.get(previousTab.id)?.active).toBe(true);
-    expect(harness.timeline).toContain(`window-removed:${parkingWindowId}`);
+    expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
   }, 10_000);
 
   it("completes a fast answer when stop was missed and response actions require hover", async () => {
@@ -14333,7 +14700,9 @@ async function startHarness(
   makeElementsVisibleToTheContentScript();
   const harness = new FakeChromeRelayHarness();
   harness.installGlobals();
-  if (options.debuggerPermission) harness.setDebuggerPermission(true);
+  // The production manifest grants `debugger` at install time. Individual
+  // permission-failure tests use a directly configured harness instead.
+  if (options.debuggerPermission !== false) harness.setDebuggerPermission(true);
   if (options.enhancedBackgroundReception !== undefined) {
     harness.seedLocalValue("enhancedBackgroundReceptionV1", options.enhancedBackgroundReception);
   }

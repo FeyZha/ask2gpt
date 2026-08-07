@@ -1,49 +1,47 @@
-# Ask2GPT
+# Ask2GPT for VS Code
 
-Codex-style coding chat for VS Code, backed by your signed-in ChatGPT session through Chrome Relay.
+Ask project-code questions in VS Code through your signed-in ChatGPT web session. Ask2GPT does not
+start a Codex/Coding Agent task, use an OpenAI API key, run shell commands, or modify your workspace.
+ChatGPT account and web usage limits still apply.
 
-> Codex-like chat in VS Code, routed through Chrome Relay.
+## Required companion
 
-Ask2GPT keeps explanations, analysis, and discussion inside VS Code, relayed through the companion **Ask2GPT Relay** Chrome extension.
-
-Protocol v15 discovers the companion automatically over loopback, with no pairing
-code or per-window setup. Multiple VS Code windows connect independently and keep
-their conversation routing isolated by instance ID.
-
-Ask2GPT does not use the OpenAI API or directly execute shell commands, Git, tests, patches, or workspace writes. Every valid prompt follows the same Relay send path. See the repository `README.md` for installation and automatic Chrome Relay connection instructions.
-
-## Required companion setup
-
-Install the matching `ask2gpt-relay-<version>.zip` from the same GitHub Release:
+Install the matching `ask2gpt-relay-<version>.zip` from the same
+[GitHub Release](https://github.com/FeyZha/ask2gpt/releases/latest):
 
 1. Extract the ZIP to a stable directory.
 2. Open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
-3. Select the extracted Relay directory and keep the extension enabled.
-4. Sign in to ChatGPT and open or create a Project named exactly `Ask2GPT`.
+3. Select the extracted directory and keep **Ask2GPT Relay** enabled.
+4. Sign in to ChatGPT and create or open a Project named exactly `Ask2GPT`.
 
-Do not mix VSIX and Relay files from different releases. No OpenAI API key or pairing code is
-required. Chrome 116+ and VS Code 1.96+ are supported.
+Do not mix VSIX and Relay files from different releases. No pairing code, Node.js, pnpm, or OpenAI
+API key is required. Chrome 116+ and VS Code 1.96+ are supported.
 
-## Open Ask2GPT
+## Start asking
 
-After installing the VSIX, reload VS Code, then use any of these entry points:
+- Click the Ask2GPT icon in the Activity Bar, or run
+  `Ask2GPT: 打开问答窗口 / Open Q&A`.
+- Select code and use the yellow-lightbulb action
+  `问 Ask2GPT（使用当前选区） / Ask Ask2GPT about this selection`.
+- Use the Composer `+` button to attach the current file or selected text files.
+- Review every context item before sending; Ask2GPT never scans the workspace for more files.
 
-- Click the Ask2GPT speech-bubble icon in the Activity Bar.
-- Run `Ask2GPT: 打开问答窗口 / Open Q&A` from the Command Palette.
+Ask2GPT supports streaming Markdown, multi-turn conversations, title/history sync, model-option sync,
+stop/regenerate, queued follow-ups, encrypted extension-private history, and isolated routing across
+multiple VS Code windows.
 
-The open command reveals the view and focuses its composer even if the Activity
-Bar icon is hidden or the view has been moved. Drag the view to the Secondary
-Sidebar if you want it beside Codex.
+Ask2GPT is best for explanation, analysis, comparison, and planning. Use a coding Agent when the task
+needs repository search, file edits, terminal commands, tests, or Git operations.
 
-When text is selected, Ask2GPT contributes one
-`Ask Ask2GPT about this selection` action to VS Code's native lightbulb.
-It captures the exact document version and range, attaches the snapshot to the
-current composer, and focuses the chat without sending. No editor-title,
-context-menu, CodeLens, inline-chat, or extension keybinding duplicates it.
-The action is absent when the selection is empty. Ask2GPT adds no
-context-menu item, CodeLens, inline text, Command Palette entry, or default
-keybinding for this selection action.
+## Data boundary
 
-The composer keeps one state-aware action button. Its configured send key is
-Enter or Ctrl/Cmd+Enter; while an answer is running, Ctrl/Cmd+Shift+Enter always
-uses the opposite Queue/stop-then-send behavior for that submission only.
+Only explicitly selected text is relayed to the visible ChatGPT page. Sensitive filenames, binary
+files, and oversized content are rejected. Ask2GPT does not request Chrome cookie, history, download,
+clipboard, native-messaging, or file-URL permissions.
+
+The complete installation guide, synthetic tutorial, demo, limitations, and security model are in the
+[project README](https://github.com/FeyZha/ask2gpt#readme).
+
+## License
+
+[MIT](./LICENSE). Third-party notices are included in `THIRD_PARTY_NOTICES.txt`.

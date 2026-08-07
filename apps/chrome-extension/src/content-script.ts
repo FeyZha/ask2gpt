@@ -176,7 +176,7 @@ type PageErrorCode =
 
 // Keep the page-side runtime identity paired with CONTENT_RUNTIME_REVISION in
 // content-runtime-policy.ts. This entrypoint must remain self-contained.
-export const SELECTOR_VERSION = 34;
+export const SELECTOR_VERSION = 50;
 const REQUIRED_PROJECT_NAME = "Ask2GPT";
 const MODEL_CATALOG_FETCH_TIMEOUT_MS = 12_000;
 const selectors = {
@@ -333,13 +333,25 @@ chrome.runtime.onMessage.addListener(
       return false;
     }
     if (isComposerStatusCommand(message)) {
-      const rawCandidateCount = findRawComposerElements().length;
+      const rawCandidates = findRawComposerElements();
+      const rawCandidateCount = rawCandidates.length;
       const readyCandidateCount = findComposerElements(true).length;
+      const primaryComposer = rawCandidates.find((candidate) => candidate.id === "prompt-textarea");
       sendResponse({
         ok: true,
         ready: readyCandidateCount === 1,
         rawCandidateCount,
         readyCandidateCount,
+        primaryOwnership: primaryComposer
+          ? composerOwnership(primaryComposer) !== undefined
+          : false,
+        primaryVisible: primaryComposer ? isVisible(primaryComposer) : false,
+        primaryVisibilityBlocker: primaryComposer
+          ? (visibilityBlocker(primaryComposer) ?? "none")
+          : "missing",
+        primaryWritable: primaryComposer ? isWritableComposer(primaryComposer) : false,
+        viewportHeight: Math.max(0, Math.min(20_000, Math.round(window.innerHeight))),
+        viewportWidth: Math.max(0, Math.min(20_000, Math.round(window.innerWidth))),
         visibilityState: document.visibilityState === "visible" ? "visible" : "hidden",
         selectorVersion: SELECTOR_VERSION,
       });
@@ -1622,6 +1634,7 @@ async function handleSend(command: ContentCommand) {
   if (activeRun) throw pageError("CHATGPT_SEND_FAILED", "该标签页已有回答正在生成。");
   assertExpectedCommandPage(command);
   assertPageReady();
+  await dismissConversationHistoryRateLimitNotice();
   if (command.modelId) {
     await ensureAvailableModel(command.modelId, command.reasoningEffort, command.modelLabel);
   }
@@ -1655,6 +1668,10 @@ async function handleSend(command: ContentCommand) {
     );
     throw error;
   });
+  // ChatGPT can mount this notice only after the first composer input event.
+  // Recheck at the last reversible boundary, before the run is marked active
+  // and before any send control can be actuated.
+  await dismissConversationHistoryRateLimitNotice();
   let dispatchCommand: ContentCommand;
   try {
     dispatchCommand = await validateDispatchCommandPage(command);
@@ -1690,10 +1707,10 @@ async function handleSend(command: ContentCommand) {
     );
     throw error;
   }
-  // Ask ChatGPT's MAIN world to validate the exact run-marked button. A focused
-  // page activates it in the same synchronous transaction; a Relay parking
-  // window returns its validated hit point for one trusted left-pointer action. There
-  // is no form-submit, keyboard injection, fallback, or retry path.
+  // Ask ChatGPT's MAIN world to validate the exact run-marked button, wait for
+  // its animated geometry to settle, and return the guarded hit point for one
+  // trusted pointer click. There is no page-owned synthetic click, form-submit,
+  // keyboard injection, fallback, or retry path.
   await dispatchSendThroughMainWorld(run, committedComposerScope, committedComposer, sendButton);
   const submissionDeadline = Date.now() + TOTAL_SUBMISSION_CONFIRMATION_MS;
   let submitted = await waitForSubmission(
@@ -1742,6 +1759,39 @@ async function handleSend(command: ContentCommand) {
     selectorVersion: SELECTOR_VERSION,
     ...(submittedPromptMessageSha256 ? { submittedPromptMessageSha256 } : {}),
   };
+}
+
+async function dismissConversationHistoryRateLimitNotice() {
+  const selector = '[data-testid="modal-conversation-history-rate-limit"]';
+  const modals = [...document.querySelectorAll<HTMLElement>(selector)].filter(isVisible);
+  if (modals.length === 0) return;
+  if (modals.length !== 1) {
+    throw pageError(
+      "CHATGPT_REMOTE_UNAVAILABLE",
+      "ChatGPT displayed more than one conversation-history notice; no question was sent.",
+    );
+  }
+  const modal = modals[0]!;
+  const buttons = [...modal.querySelectorAll<HTMLButtonElement>("button")].filter(
+    (button) =>
+      isVisible(button) && !button.disabled && button.getAttribute("aria-disabled") !== "true",
+  );
+  if (buttons.length !== 1) {
+    throw pageError(
+      "CHATGPT_REMOTE_UNAVAILABLE",
+      "ChatGPT's conversation-history notice did not expose one safe confirmation button; no question was sent.",
+    );
+  }
+  buttons[0]!.click();
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (!modal.isConnected || !isVisible(modal)) return;
+    await delay(50);
+  }
+  throw pageError(
+    "CHATGPT_REMOTE_UNAVAILABLE",
+    "ChatGPT's conversation-history notice remained open; no question was sent.",
+  );
 }
 
 function submissionActuationLeftDraftUntouched(run: Run, composer: HTMLElement, prompt: string) {
@@ -1795,9 +1845,13 @@ async function dispatchSendThroughMainWorld(
   }
   if (!isContentRecord(response) || response.ok !== true || response.dispatched !== true) {
     if (isContentRecord(response) && response.attempted === false) {
+      const reason =
+        typeof response.reason === "string" && /^[a-z0-9-]{1,64}$/u.test(response.reason)
+          ? ` reason=${response.reason}`
+          : "";
       throw pageError(
         "CHATGPT_SEND_FAILED",
-        "Chrome 未能完成 ChatGPT 的页面发送激活；问题尚未提交。",
+        `Chrome 未能完成 ChatGPT 的页面发送激活；问题尚未提交。${reason}`,
       );
     }
     throw ambiguousSubmissionError(
@@ -1846,7 +1900,7 @@ function assertConfirmedSubmissionControls(
     composers[0] !== composer ||
     !composer.isConnected ||
     !composerTextMatchesPrompt(composer, prompt) ||
-    !isVisible(sendButton) ||
+    !isComposerActuationVisible(sendButton) ||
     !isEnabledSendButton(sendButton)
   ) {
     throw pageError(
@@ -3047,6 +3101,7 @@ function composerErrorDiagnostic() {
 
 function findComposerElements(visibleOnly: boolean, scope: ParentNode = document) {
   const candidates = new Set<HTMLElement>();
+  const ariaHiddenFallbacks = new Set<HTMLElement>();
   for (const candidate of findRawComposerElements(scope)) {
     if (!isWritableComposer(candidate)) continue;
     const ownership = composerOwnership(candidate);
@@ -3056,10 +3111,16 @@ function findComposerElements(visibleOnly: boolean, scope: ParentNode = document
     // composer in one bounded form is sufficient pre-write proof; submission
     // still requires one exact owned control to appear, become visible and
     // become enabled before anything is clicked.
-    if (visibleOnly && !isVisible(candidate)) continue;
+    if (visibleOnly && !isVisible(candidate)) {
+      if (visibilityBlocker(candidate) === "aria-hidden" && candidate.id === "prompt-textarea") {
+        ariaHiddenFallbacks.add(candidate);
+      }
+      continue;
+    }
     candidates.add(candidate);
   }
-  return [...candidates];
+  if (candidates.size > 0 || !visibleOnly) return [...candidates];
+  return ariaHiddenFallbacks.size === 1 ? [...ariaHiddenFallbacks] : [];
 }
 
 const excludedComposerScopeSelector = [
@@ -3131,7 +3192,7 @@ function uniqueComposerSendControl(
   requireVisible = false,
 ) {
   const ownedSendControls = composerSendControls(candidate, scope, requireSameForm);
-  const visibleSendControls = ownedSendControls.filter(isVisible);
+  const visibleSendControls = ownedSendControls.filter(isComposerActuationVisible);
   if (requireVisible) return visibleSendControls.length === 1 ? visibleSendControls[0] : undefined;
   const sendControls = visibleSendControls.length > 0 ? visibleSendControls : ownedSendControls;
   return sendControls.length === 1 ? sendControls[0] : undefined;
@@ -3196,8 +3257,8 @@ async function waitForOwnedComposerSendButton(composer: HTMLElement, timeoutMs: 
       sendControl &&
       composer.isConnected &&
       isWritableComposer(composer) &&
-      isVisible(composer) &&
-      isVisible(sendControl) &&
+      isComposerActuationVisible(composer) &&
+      isComposerActuationVisible(sendControl) &&
       isEnabledSendButton(sendControl)
     ) {
       return sendControl;
@@ -3239,40 +3300,43 @@ function hasSingleRenderedStopControl() {
   return candidates.length === 1;
 }
 
-function isVisible(element: HTMLElement) {
+function visibilityBlocker(element: HTMLElement) {
   for (let current: HTMLElement | null = element; current; current = current.parentElement) {
-    if (
-      current.hidden ||
-      current.hasAttribute("inert") ||
-      current.getAttribute("aria-hidden") === "true"
-    ) {
-      return false;
-    }
+    if (current.hidden) return "hidden";
+    if (current.hasAttribute("inert")) return "inert";
+    if (current.getAttribute("aria-hidden") === "true") return "aria-hidden";
     const currentStyle = getComputedStyle(current);
-    if (
-      currentStyle.display === "none" ||
-      currentStyle.visibility === "hidden" ||
-      currentStyle.visibility === "collapse" ||
-      // `pointer-events: none` on an HTML ancestor does not necessarily make
-      // a descendant inert: ChatGPT's fixed thread-bottom shell disables
-      // pointer events and its inner composer explicitly restores `auto`.
-      // The candidate's computed value already includes inheritance, so only
-      // reject `none` when it remains effective on the candidate itself.
-      (current === element && currentStyle.pointerEvents === "none") ||
-      currentStyle.opacity === "0"
-    ) {
-      return false;
+    if (currentStyle.display === "none") return "display";
+    if (currentStyle.visibility === "hidden" || currentStyle.visibility === "collapse") {
+      return "visibility";
     }
+    // `pointer-events: none` on an HTML ancestor does not necessarily make a
+    // descendant inert: ChatGPT's fixed thread-bottom shell disables pointer
+    // events and its inner composer explicitly restores `auto`. The candidate's
+    // computed value already includes inheritance, so reject only the candidate.
+    if (current === element && currentStyle.pointerEvents === "none") return "pointer";
+    if (currentStyle.opacity === "0") return "opacity";
   }
   const rect = element.getBoundingClientRect();
-  return (
-    rect.width > 0 &&
-    rect.height > 0 &&
-    rect.right > 0 &&
-    rect.bottom > 0 &&
-    rect.left < window.innerWidth &&
-    rect.top < window.innerHeight
-  );
+  if (rect.width <= 0 || rect.height <= 0) return "geometry";
+  if (
+    rect.right <= 0 ||
+    rect.bottom <= 0 ||
+    rect.left >= window.innerWidth ||
+    rect.top >= window.innerHeight
+  ) {
+    return "outside";
+  }
+  return undefined;
+}
+
+function isVisible(element: HTMLElement) {
+  return visibilityBlocker(element) === undefined;
+}
+
+function isComposerActuationVisible(element: HTMLElement) {
+  const blocker = visibilityBlocker(element);
+  return blocker === undefined || blocker === "aria-hidden";
 }
 
 // Completed-response actions are read-only terminal evidence, not controls

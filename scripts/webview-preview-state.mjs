@@ -4,14 +4,14 @@ function selectionContext() {
   return {
     id: "preview-selection",
     kind: "selection",
-    fileName: "relay-client.ts",
-    uri: "file:///preview/relay-client.ts",
+    fileName: "insight-board.ts",
+    uri: "file:///synthetic/ask2gpt-tour/insight-board.ts",
     language: "typescript",
-    startLine: 42,
-    endLine: 58,
+    startLine: 68,
+    endLine: 101,
     content:
-      "export function routeFrame(frame: RelayFrame) {\n  return sessions.get(frame.conversationId);\n}",
-    charCount: 98,
+      "summarize(limit = 3): Insight[] {\n  if (this.cache?.itemCount === this.feedback.length) {\n    return this.cache.insights;\n  }\n\n  const buckets = new Map<string, Bucket>();\n  // ...\n}",
+    charCount: 181,
     unsaved: false,
   };
 }
@@ -20,13 +20,14 @@ function fileContext() {
   return {
     id: "preview-file",
     kind: "current-file",
-    fileName: "relay-session.ts",
-    uri: "file:///preview/relay-session.ts",
+    fileName: "insight-board.ts",
+    uri: "file:///synthetic/ask2gpt-tour/insight-board.ts",
     language: "typescript",
     startLine: 1,
-    endLine: 84,
-    content: "export class RelaySession {\n  constructor(readonly conversationId: string) {}\n}",
-    charCount: 82,
+    endLine: 119,
+    content:
+      "export class InsightBoard {\n  private readonly feedback: Feedback[] = [];\n  private cache: SummaryCache | undefined;\n  // ...\n}",
+    charCount: 132,
     unsaved: false,
   };
 }
@@ -47,17 +48,17 @@ export function createPreviewState() {
         hasStoredTrust: true,
         hostVersion: "0.0.1",
         relayVersion: "0.0.1",
-        protocolVersion: 13,
+        protocolVersion: 15,
         lastConnectedAt: PREVIEW_TIME,
       },
       port: 32_171,
-      project: { bound: true, name: "gpt_plugin" },
-      selectorVersion: 1,
+      project: { bound: true, name: "ask2gpt-tour" },
+      selectorVersion: 50,
     },
     conversations: [
       {
         id: "preview-main",
-        title: "验证 Relay 流式体验",
+        title: "分析 InsightBoard 缓存",
         remoteUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111",
         selectedModelId: "mode-smart",
         syncStatus: "synced",
@@ -69,7 +70,7 @@ export function createPreviewState() {
           {
             id: "preview-user-existing",
             role: "user",
-            markdown: "说明 Chrome Relay 如何避免把回复写进错误的会话。",
+            markdown: "这段 `summarize` 为什么可能返回过期结果？请只分析，不修改代码。",
             status: "complete",
             createdAt: PREVIEW_TIME,
             contexts: [context],
@@ -78,7 +79,7 @@ export function createPreviewState() {
             id: "preview-assistant-existing",
             role: "assistant",
             markdown:
-              "Relay 以 `conversationId + runId` 绑定每一轮，并在收到终态后确认同一条远端会话。",
+              "缓存只比较 `feedback.length`。`replace()` 改变内容但不改变数量，所以后续 `summarize()` 可能直接返回旧结果。",
             status: "complete",
             createdAt: "2026-07-31T00:02:00.000Z",
           },
@@ -86,7 +87,7 @@ export function createPreviewState() {
       },
       {
         id: "preview-secondary",
-        title: "上下文隔离检查",
+        title: "比较集合设计",
         remoteUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222",
         selectedModelId: "mode-smart",
         syncStatus: "synced",
@@ -98,14 +99,15 @@ export function createPreviewState() {
           {
             id: "preview-secondary-user",
             role: "user",
-            markdown: "这个会话只应显示 relay-session.ts 的上下文。",
+            markdown: "这里使用 `Map<string, Bucket>` 有什么好处？",
             status: "complete",
             createdAt: "2026-07-30T23:00:00.000Z",
           },
           {
             id: "preview-secondary-assistant",
             role: "assistant",
-            markdown: "已隔离：切换回来时，草稿和附件仍按会话分别保存。",
+            markdown:
+              "`Map` 直接表达动态键集合，也避免对象原型键冲突；若主要目标是 JSON 序列化，普通对象会更方便。",
             status: "complete",
             createdAt: "2026-07-30T23:04:00.000Z",
           },
