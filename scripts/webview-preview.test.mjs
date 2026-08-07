@@ -38,18 +38,26 @@ test("preview server injects state and serves the current built webview assets",
   const address = server.address();
   assert.ok(address && typeof address === "object");
   const origin = `http://127.0.0.1:${address.port}`;
-  const [indexResponse, harnessResponse, scriptResponse, styleResponse, healthResponse] =
-    await Promise.all([
-      fetch(`${origin}/`),
-      fetch(`${origin}/preview/harness.js`),
-      fetch(`${origin}/webview/webview.js`),
-      fetch(`${origin}/webview/webview.css`),
-      fetch(`${origin}/health`),
-    ]);
+  const [
+    indexResponse,
+    harnessResponse,
+    scriptResponse,
+    styleResponse,
+    traversalResponse,
+    healthResponse,
+  ] = await Promise.all([
+    fetch(`${origin}/`),
+    fetch(`${origin}/preview/harness.js`),
+    fetch(`${origin}/webview/webview.js`),
+    fetch(`${origin}/webview/webview.css`),
+    fetch(`${origin}/webview/%2e%2e%5cpnpm-lock.yaml`),
+    fetch(`${origin}/health`),
+  ]);
   assert.equal(indexResponse.status, 200);
   assert.equal(harnessResponse.status, 200);
   assert.equal(scriptResponse.status, 200);
   assert.equal(styleResponse.status, 200);
+  assert.equal(traversalResponse.status, 404);
   assert.equal(healthResponse.status, 200);
 
   const [html, harness, script, style, health] = await Promise.all([

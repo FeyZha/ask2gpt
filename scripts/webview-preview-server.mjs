@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { dirname, extname, join, normalize } from "node:path";
+import { dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createPreviewState, validatePreviewState } from "./webview-preview-state.mjs";
@@ -32,10 +32,17 @@ async function renderIndex() {
 }
 
 function safeAssetPath(root, requestPath) {
-  const relativePath = normalize(requestPath).replace(/^([/\\])+/, "");
-  const candidate = join(root, relativePath);
-  const normalizedRoot = `${normalize(root)}\\`;
-  if (!normalize(candidate).startsWith(normalizedRoot)) return undefined;
+  const relativePath = normalize(decodeURIComponent(requestPath)).replace(/^([/\\])+/, "");
+  const candidate = resolve(root, relativePath);
+  const candidateRelativePath = relative(root, candidate);
+  if (
+    candidateRelativePath === "" ||
+    candidateRelativePath === ".." ||
+    candidateRelativePath.startsWith(`..${sep}`) ||
+    isAbsolute(candidateRelativePath)
+  ) {
+    return undefined;
+  }
   return candidate;
 }
 
@@ -82,6 +89,11 @@ export function createPreviewServer() {
       }
       await serveFile(response, path);
     } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        response.end("Not found");
+        return;
+      }
       response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
       response.end(error instanceof Error ? error.message : String(error));
     }
