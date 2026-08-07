@@ -40,10 +40,15 @@ const PROJECT_DIRECTORY_REFRESH_RESULT_EVENT = "ask2gpt:project-directory-refres
 const fixtureTimeouts = new Set<number>();
 
 describe("MV3 relay and ChatGPT content-script integration", () => {
-  afterEach(() => {
+  afterEach(async () => {
     clearFixtureTimeouts();
     window.dispatchEvent(new Event("pagehide"));
     FakeChromeRelayHarness.suspendActive();
+    // Let callbacks released by pagehide/onSuspend observe the old, suspended
+    // harness before the next test installs a new global Chrome API. Without
+    // this turn, a slow CI worker can deliver an old run event into the next
+    // test because the integration fixture intentionally reuses one document.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -10119,6 +10124,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
   }, 8_000);
 
   it("rejects false submission signals without retrying or adopting unrelated turns", async () => {
+    const runId = "run-false-submission-signals";
     const { harness, socket, tab } = await startHarness();
     const page = installChatGptComposerFixture(harness, tab.id, {
       falseSubmissionSignals: true,
@@ -10140,7 +10146,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       },
     );
 
-    socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+    socket.deliverFromHost(sendEnvelope(runId));
     await waitUntil(() => page.sendClicks() === 1, 5_000);
     await waitUntil(
       () =>
@@ -10153,10 +10159,18 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(page.sendClicks()).toBe(1);
     expect(page.formSubmits()).toBe(0);
     expect(contentSendResponse).toMatchObject({ ok: false, ambiguousSubmission: true });
-    expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
+    await waitUntil(
+      () =>
+        (
+          harness.sessionValue("activeRunsV2") as
+            Array<{ phase?: string; runId?: string }> | undefined
+        )?.some((run) => run.runId === runId && run.phase === "active") === true,
+      5_000,
+    );
+    expect(runErrors(harness, socket, runId)).toHaveLength(0);
     expect(
       (harness.sessionValue("activeRunsV2") as Array<{ runId?: string }> | undefined)?.some(
-        (run) => run.runId === FIRST_RUN_ID,
+        (run) => run.runId === runId,
       ),
     ).toBe(true);
     expect(
@@ -10164,7 +10178,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         .outboundEnvelopes(socket)
         .some(
           (envelope) =>
-            envelope.runId === FIRST_RUN_ID &&
+            envelope.runId === runId &&
             ["generation.snapshot", "generation.complete"].includes(envelope.type),
         ),
     ).toBe(false);
