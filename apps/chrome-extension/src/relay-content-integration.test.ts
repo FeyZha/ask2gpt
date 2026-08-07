@@ -908,6 +908,9 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
     );
     expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
+    await waitUntil(() =>
+      harness.timeline.includes(`window-updated:${homeWindowId}:state:minimized`),
+    );
     expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:minimized`);
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
     expect(harness.windowBounds(homeWindowId)).toEqual({
