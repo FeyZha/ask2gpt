@@ -2,6 +2,8 @@ name: Ask2GPT CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
