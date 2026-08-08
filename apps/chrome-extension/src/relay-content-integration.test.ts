@@ -5309,6 +5309,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         (harness.sessionValue("terminalHistoryBarriersV1") as Array<unknown> | undefined)
           ?.length === 0,
     );
+    await waitUntil(() => harness.timeline.includes(`tab-active:${decoy.id}:true`));
     expect(inspectCount).toBeGreaterThan(0);
     expect(harness.timeline).toContain(`tab-active:${tabId}:true`);
     expect(harness.timeline).toContain(`tab-active:${decoy.id}:true`);
