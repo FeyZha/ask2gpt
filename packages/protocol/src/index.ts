@@ -32,8 +32,8 @@ export const MAX_CHAT_FILE_CHARS = 40_000;
 export const MAX_CHAT_FILE_BUNDLE_CHARS = 60_000;
 export const MAX_INLINE_CONTEXT_CHARS = 6_000;
 export const MAX_INLINE_CONTEXT_BUNDLE_CHARS = 12_000;
-// Migration-only compatibility for records written before 0.1.9. New runs use
-// the lifetime of the exact owned-tab run and do not start this short timer.
+// Migration-only compatibility for records written before run-lifetime
+// ownership was persisted. New runs do not start this short timer.
 export const REMOTE_CANONICALIZATION_WINDOW_MS = 30_000;
 export const CHROME_EXTENSION_ID = "jieljndeocnmdlfbmfknfgglfaoneceb";
 
@@ -812,6 +812,17 @@ export interface GenerationRegeneratePayload {
 
 export type ContextKind = "selection" | "current-file" | "file";
 
+/** Versioned, content-free provenance used to relocate a captured source snapshot. */
+export interface SourceAnchorV1 {
+  formatVersion: 1;
+  contentSha256: string;
+  normalizedContentSha256: string;
+  documentVersion: number;
+  beforeLineSha256?: string;
+  afterLineSha256?: string;
+  workspaceRelativePath?: string;
+}
+
 export interface ContextSnapshot {
   id: string;
   kind: ContextKind;
@@ -823,6 +834,7 @@ export interface ContextSnapshot {
   content: string;
   charCount: number;
   unsaved: boolean;
+  sourceAnchor?: SourceAnchorV1;
 }
 
 export type MessageRole = "user" | "assistant" | "local-notice";

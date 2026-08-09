@@ -26,11 +26,14 @@ import {
 } from "@ask2gpt/protocol";
 
 import { parseAnswerSourceReferences } from "../answer-source-reference";
-import {
-  extractAnswerSourceDefinitions,
-  matchKnownAnswerSourceSymbol,
-} from "../answer-source-symbol";
-import type { AppState, ConnectionPhase, GenerationViewUpdate, ModelPickerState } from "../types";
+import { matchKnownAnswerSourceSymbol } from "../answer-source-symbol";
+import type {
+  AppState,
+  ConnectionPhase,
+  GenerationViewUpdate,
+  ModelPickerState,
+  SourceTraceHint,
+} from "../types";
 import {
   ArchiveIcon,
   ChevronIcon,
@@ -310,10 +313,17 @@ export function App() {
   const [contextOpen, setContextOpen] = useState(false);
   const [composerFocusRevision, setComposerFocusRevision] = useState(0);
   const [turnReveal, setTurnReveal] = useState<TurnRevealRequest>();
+  const [consumedTurnRevealRevision, setConsumedTurnRevealRevision] = useState(0);
   const turnRevealRevisionRef = useRef(0);
   const [pendingNewConversationSourceId, setPendingNewConversationSourceId] = useState<string>();
   const pendingNewConversationSourceIdRef = useRef<string | undefined>(undefined);
-  const [notice, setNotice] = useState<{ level: string; message: string }>();
+  const [notice, setNotice] = useState<{
+    level: "info" | "warning" | "error";
+    message: string;
+  }>();
+  const consumeTurnReveal = useCallback((revision: number) => {
+    setConsumedTurnRevealRevision((current) => Math.max(current, revision));
+  }, []);
   const [sendResults, setSendResults] = useState<
     Array<{ accepted: boolean; conversationId: string; requestId: string; revision: number }>
   >([]);
@@ -421,11 +431,14 @@ export function App() {
         setNotice({ level: message.level, message: message.message });
         if (noticeTimerRef.current !== undefined) {
           window.clearTimeout(noticeTimerRef.current);
-        }
-        noticeTimerRef.current = window.setTimeout(() => {
           noticeTimerRef.current = undefined;
-          setNotice(undefined);
-        }, 2600);
+        }
+        if (message.level === "info") {
+          noticeTimerRef.current = window.setTimeout(() => {
+            noticeTimerRef.current = undefined;
+            setNotice(undefined);
+          }, 2600);
+        }
       }
       if (message.type === "focusComposer") {
         setHistoryOpen(false);
@@ -597,8 +610,15 @@ export function App() {
             conversation={renderedActive}
             key={`thread:${renderedActive.id}`}
             locale={appState.locale}
+            onConsumeTurnReveal={consumeTurnReveal}
             scrollMemory={conversationScrollMemoryRef.current}
-            turnReveal={turnReveal?.conversationId === renderedActive.id ? turnReveal : undefined}
+            sourceTraceHints={appState.sourceTraceHints?.[renderedActive.id]}
+            turnReveal={
+              turnReveal?.conversationId === renderedActive.id &&
+              turnReveal.revision > consumedTurnRevealRevision
+                ? turnReveal
+                : undefined
+            }
           />
         )}
       </main>
@@ -639,11 +659,14 @@ export function App() {
 
       {notice && (
         <div
-          aria-live="assertive"
+          aria-live={notice.level === "error" ? "assertive" : "polite"}
           className={`toast toast--${notice.level}`}
           role={notice.level === "error" ? "alert" : "status"}
         >
-          {notice.message}
+          <span>{notice.message}</span>
+          <button aria-label={t.dismissNotice} onClick={() => setNotice(undefined)} type="button">
+            <CloseIcon />
+          </button>
         </div>
       )}
     </div>
@@ -1144,20 +1167,6 @@ const SCROLL_TAIL_THRESHOLD_PX = 24;
 const SCROLL_FOLLOW_FALLBACK_MS = 48;
 const USER_SCROLL_INTENT_TTL_MS = 1_000;
 const USER_MESSAGE_NAVIGATION_MIN_ITEMS = 4;
-const NON_SOURCE_CALL_NAMES = new Set(["catch", "for", "if", "match", "switch", "while", "with"]);
-
-function contextSourceSymbols(content: string) {
-  const symbols = new Set(
-    extractAnswerSourceDefinitions(content).map((definition) => definition.name),
-  );
-  for (const match of content.matchAll(/(?:^|[^\p{L}\p{N}_$])([\p{L}_$][\p{L}\p{N}_$]*)\s*\(/gu)) {
-    const symbol = match[1];
-    if (symbol && !NON_SOURCE_CALL_NAMES.has(symbol)) symbols.add(symbol);
-    if (symbols.size >= 512) break;
-  }
-  return symbols;
-}
-
 function keyboardScrollDirection(
   event: KeyboardEvent,
   scroller: HTMLElement,
@@ -1194,12 +1203,16 @@ function keyboardScrollDirection(
 function MessageList({
   conversation,
   locale,
+  onConsumeTurnReveal,
   scrollMemory,
+  sourceTraceHints,
   turnReveal,
 }: {
   conversation: Conversation;
   locale: AppState["locale"];
+  onConsumeTurnReveal: (revision: number) => void;
   scrollMemory: Map<string, ConversationScrollState>;
+  sourceTraceHints?: Record<string, SourceTraceHint>;
   turnReveal?: TurnRevealRequest;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
@@ -1221,7 +1234,11 @@ function MessageList({
     [visibleMessages],
   );
   const [activeUserMessageId, setActiveUserMessageId] = useState<string>();
-  const [tracedUserMessageId, setTracedUserMessageId] = useState<string>();
+  const [tracedTurn, setTracedTurn] = useState<{
+    messageId: string;
+    contextId?: string;
+    revision: number;
+  }>();
   const visibleMessagesRef = useRef(visibleMessages);
   visibleMessagesRef.current = visibleMessages;
   const lastUserId = useMemo(
@@ -1238,24 +1255,6 @@ function MessageList({
     for (const message of visibleMessages) {
       result.set(message.id, previousUserId);
       if (message.role === "user") previousUserId = message.id;
-    }
-    return result;
-  }, [visibleMessages]);
-  const sourceSymbolKeys = useMemo(() => {
-    const result = new Map<string, string>();
-    let currentSymbols = "";
-    for (const message of visibleMessages) {
-      if (message.role === "user") {
-        const contexts = getMessageContexts(message);
-        if (contexts.length > 0) {
-          const symbols = new Set(
-            contexts.flatMap((context) => [...contextSourceSymbols(context.content)]),
-          );
-          currentSymbols = [...symbols].sort().join("\0");
-        }
-      } else {
-        result.set(message.id, currentSymbols);
-      }
     }
     return result;
   }, [visibleMessages]);
@@ -1384,12 +1383,44 @@ function MessageList({
     if (!turnReveal || turnReveal.conversationId !== conversation.id) return;
     if (!userMessages.some((message) => message.id === turnReveal.messageId)) return;
     jumpToUserMessage(turnReveal.messageId);
-    setTracedUserMessageId(turnReveal.messageId);
-    const timer = window.setTimeout(() => {
-      setTracedUserMessageId((current) => (current === turnReveal.messageId ? undefined : current));
-    }, 2_800);
-    return () => window.clearTimeout(timer);
+    setTracedTurn({
+      messageId: turnReveal.messageId,
+      ...(turnReveal.contextId ? { contextId: turnReveal.contextId } : {}),
+      revision: turnReveal.revision,
+    });
   }, [conversation.id, jumpToUserMessage, turnReveal, userMessages]);
+
+  useEffect(() => {
+    if (!tracedTurn || userMessages.some((message) => message.id === tracedTurn.messageId)) return;
+    onConsumeTurnReveal(tracedTurn.revision);
+    setTracedTurn(undefined);
+  }, [onConsumeTurnReveal, tracedTurn, userMessages]);
+
+  const focusTraceTarget = useCallback((messageId: string, contextId?: string) => {
+    const target = [
+      ...(listRef.current?.querySelectorAll<HTMLElement>("[data-user-message-id]") ?? []),
+    ].find((element) => element.dataset.userMessageId === messageId);
+    if (!target) return;
+    const contextButton = contextId
+      ? [
+          ...target.querySelectorAll<HTMLButtonElement>("[data-context-id] .sent-context__open"),
+        ].find(
+          (button) =>
+            button.closest<HTMLElement>("[data-context-id]")?.dataset.contextId === contextId,
+        )
+      : undefined;
+    const focusTarget = contextButton ?? target;
+    queueMicrotask(() => {
+      if (focusTarget.isConnected) focusTarget.focus({ preventScroll: true });
+    });
+  }, []);
+
+  const clearTrace = useCallback(() => {
+    if (!tracedTurn) return;
+    onConsumeTurnReveal(tracedTurn.revision);
+    setTracedTurn(undefined);
+    focusTraceTarget(tracedTurn.messageId, tracedTurn.contextId);
+  }, [focusTraceTarget, onConsumeTurnReveal, tracedTurn]);
 
   useEffect(() => {
     const handleUserMessageNavigation = (event: KeyboardEvent) => {
@@ -1686,6 +1717,8 @@ function MessageList({
         ref={listRef}
       >
         {visibleMessages.map((message) => {
+          const sourceTraceHint =
+            message.status === "streaming" ? undefined : sourceTraceHints?.[message.id];
           return (
             <MessageCard
               conversationId={conversation.id}
@@ -1696,8 +1729,13 @@ function MessageList({
               reserveTurnViewport={
                 hasTurnRunway && latestAssistantBelongsToTurn && message.id === lastAssistantId
               }
-              sourceSymbolKey={sourceSymbolKeys.get(message.id) ?? ""}
-              traceTarget={message.id === tracedUserMessageId}
+              sourceFileReferenceKey={sourceTraceHint?.fileReferences.join("\0") ?? ""}
+              sourceSymbolKey={sourceTraceHint?.sourceSymbols.join("\0") ?? ""}
+              traceContextId={
+                message.id === tracedTurn?.messageId ? tracedTurn.contextId : undefined
+              }
+              traceTarget={message.id === tracedTurn?.messageId}
+              onClearTrace={clearTrace}
               turnAnchor={message.id === lastUserId}
             />
           );
@@ -1731,8 +1769,11 @@ interface MessageCardProps {
   isLatestAssistant: boolean;
   locale: AppState["locale"];
   message: ConversationMessage;
+  onClearTrace: () => void;
   reserveTurnViewport: boolean;
+  sourceFileReferenceKey: string;
   sourceSymbolKey: string;
+  traceContextId?: string;
   traceTarget: boolean;
   turnAnchor: boolean;
 }
@@ -1790,8 +1831,11 @@ const MessageCard = memo(function MessageCard({
   isLatestAssistant,
   locale,
   message,
+  onClearTrace,
   reserveTurnViewport,
+  sourceFileReferenceKey,
   sourceSymbolKey,
+  traceContextId,
   traceTarget,
   turnAnchor,
 }: MessageCardProps) {
@@ -1809,14 +1853,23 @@ const MessageCard = memo(function MessageCard({
         className={`message message--user ${traceTarget ? "message--trace-target" : ""}`}
         data-turn-anchor={turnAnchor ? "true" : undefined}
         data-user-message-id={message.id}
+        tabIndex={-1}
       >
         {traceTarget && (
-          <span className="message-trace-label" role="status">
-            {t.matchedSelection}
-          </span>
+          <div className="message-trace-label">
+            <span role="status">{t.matchedSelection}</span>
+            <button aria-label={t.clearMatchedSelection} onClick={onClearTrace} type="button">
+              <CloseIcon />
+            </button>
+          </div>
         )}
         {contexts.length > 0 && (
-          <SentContextList contexts={contexts} conversationId={conversationId} locale={locale} />
+          <SentContextList
+            contexts={contexts}
+            conversationId={conversationId}
+            locale={locale}
+            traceContextId={traceContextId}
+          />
         )}
         <div className="user-copy">{message.markdown}</div>
         <div className="message-actions message-actions--user">
@@ -1864,6 +1917,7 @@ const MessageCard = memo(function MessageCard({
             conversationId={conversationId}
             locale={locale}
             messageId={message.id}
+            sourceFileReferenceKey={sourceFileReferenceKey}
             sourceSymbolKey={sourceSymbolKey}
             streaming={message.status === "streaming"}
           />
@@ -1924,8 +1978,11 @@ function areMessageCardsEqual(previous: MessageCardProps, next: MessageCardProps
     previous.conversationId === next.conversationId &&
     previous.isLatestAssistant === next.isLatestAssistant &&
     previous.locale === next.locale &&
+    previous.onClearTrace === next.onClearTrace &&
     previous.reserveTurnViewport === next.reserveTurnViewport &&
+    previous.sourceFileReferenceKey === next.sourceFileReferenceKey &&
     previous.sourceSymbolKey === next.sourceSymbolKey &&
+    previous.traceContextId === next.traceContextId &&
     previous.traceTarget === next.traceTarget &&
     previous.turnAnchor === next.turnAnchor &&
     previous.message.id === next.message.id &&
@@ -2116,6 +2173,7 @@ function MarkdownCodeBlock({
 
 interface MarkdownSourceTrace {
   conversationId: string;
+  fileReferences: ReadonlySet<string>;
   messageId: string;
   sourceSymbols: ReadonlySet<string>;
 }
@@ -2168,15 +2226,15 @@ function createMarkdownComponents(
   return {
     a: ({ children, href }) => {
       const reference = referenceFromSourceHref(href);
-      return reference ? (
+      if (!reference) return <ExternalLink href={href}>{children}</ExternalLink>;
+      if (!trace.fileReferences.has(reference)) return <>{children}</>;
+      return (
         <SourceReferenceButton
           kind="file-line"
           locale={locale}
           reference={reference}
           trace={trace}
         />
-      ) : (
-        <ExternalLink href={href}>{children}</ExternalLink>
       );
     },
     code: ({ children, className }) => {
@@ -2187,7 +2245,7 @@ function createMarkdownComponents(
           (candidate) =>
             candidate.textRange.start === 0 && candidate.textRange.end === value.length,
         );
-        if (fileReference) {
+        if (fileReference && trace.fileReferences.has(fileReference.raw)) {
           return (
             <SourceReferenceButton
               kind="file-line"
@@ -2372,6 +2430,7 @@ const Markdown = memo(function Markdown({
   conversationId,
   locale,
   messageId,
+  sourceFileReferenceKey,
   sourceSymbolKey,
   streaming,
 }: {
@@ -2379,16 +2438,18 @@ const Markdown = memo(function Markdown({
   conversationId: string;
   locale: AppState["locale"];
   messageId: string;
+  sourceFileReferenceKey: string;
   sourceSymbolKey: string;
   streaming: boolean;
 }) {
   const trace = useMemo<MarkdownSourceTrace>(
     () => ({
       conversationId,
+      fileReferences: new Set(sourceFileReferenceKey ? sourceFileReferenceKey.split("\0") : []),
       messageId,
       sourceSymbols: new Set(sourceSymbolKey ? sourceSymbolKey.split("\0") : []),
     }),
-    [conversationId, messageId, sourceSymbolKey],
+    [conversationId, messageId, sourceFileReferenceKey, sourceSymbolKey],
   );
   // Use one stable block tree for both streaming and terminal states. Complete
   // blocks retain their React identity while only the growing tail is parsed;
@@ -2430,23 +2491,42 @@ function SentContextList({
   conversationId,
   contexts,
   locale,
+  traceContextId,
 }: {
   conversationId: string;
   contexts: ContextSnapshot[];
   locale: AppState["locale"];
+  traceContextId?: string;
 }) {
   const t = strings[locale];
   const [showAll, setShowAll] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
   const visibleContexts = showAll ? contexts : contexts.slice(0, 2);
   const hiddenCount = Math.max(0, contexts.length - visibleContexts.length);
+
+  useLayoutEffect(() => {
+    if (!traceContextId) return;
+    const tracedIndex = contexts.findIndex((context) => contextKey(context) === traceContextId);
+    if (tracedIndex < 0) return;
+    if (tracedIndex >= 2 && !showAll) {
+      setShowAll(true);
+      return;
+    }
+    const target = [
+      ...(listRef.current?.querySelectorAll<HTMLElement>("[data-context-id]") ?? []),
+    ].find((element) => element.dataset.contextId === traceContextId);
+    target?.scrollIntoView({ behavior: "auto", block: "nearest", inline: "nearest" });
+  }, [contexts, showAll, traceContextId]);
+
   return (
-    <div aria-label={t.sentContexts} className="sent-context-list" role="group">
+    <div aria-label={t.sentContexts} className="sent-context-list" ref={listRef} role="group">
       {visibleContexts.map((context) => (
         <ContextBadge
           context={context}
           conversationId={conversationId}
           key={contextKey(context)}
           locale={locale}
+          traceTarget={contextKey(context) === traceContextId}
         />
       ))}
       {contexts.length > 2 && (
@@ -2468,18 +2548,24 @@ function ContextBadge({
   context,
   conversationId,
   locale,
+  traceTarget,
 }: {
   context: ContextSnapshot;
   conversationId: string;
   locale: AppState["locale"];
+  traceTarget: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const t = strings[locale];
   const previewId = useId();
   return (
-    <div className="sent-context">
+    <div
+      className={`sent-context ${traceTarget ? "sent-context--trace-target" : ""}`}
+      data-context-id={contextKey(context)}
+    >
       <div className="sent-context__header">
         <button
+          aria-current={traceTarget ? "location" : undefined}
           aria-label={`${t.openContext}: ${context.fileName}, L${context.startLine}–${context.endLine}`}
           className="sent-context__open"
           onClick={() =>
@@ -2496,6 +2582,7 @@ function ContextBadge({
           <small className="sent-context__line-range">
             L{context.startLine}–{context.endLine}
           </small>
+          {traceTarget && <small className="sent-context__trace-label">{t.matchedContext}</small>}
         </button>
         <button
           aria-controls={previewId}
@@ -4624,6 +4711,9 @@ const strings = {
     openChatGpt: "打开浏览器会话",
     yourQuestion: "你的问题",
     matchedSelection: "匹配此选区",
+    matchedContext: "关联",
+    clearMatchedSelection: "清除选区关联提示",
+    dismissNotice: "关闭提示",
     answer: "回答",
     regenerate: "重新生成",
     retry: "重试",
@@ -4817,6 +4907,9 @@ const strings = {
     openChatGpt: "Open browser chat",
     yourQuestion: "Your question",
     matchedSelection: "Matched selection",
+    matchedContext: "Linked",
+    clearMatchedSelection: "Clear selection match",
+    dismissNotice: "Dismiss notice",
     answer: "Answer",
     regenerate: "Regenerate",
     retry: "Retry",

@@ -18,8 +18,12 @@ export type ConversationTraceContentMatch =
 export type ConversationTraceMatchKind =
   "exact" | "content-and-range" | "content" | "range-overlap";
 
+export type ConversationTraceConfidence = "exact" | "content-backed";
+
 /** A sent user turn whose durable context snapshot relates to an editor selection. */
 export interface ConversationTraceMatch {
+  confidence: ConversationTraceConfidence;
+  directNavigation: true;
   score: number;
   matchKind: ConversationTraceMatchKind;
   contentMatch: ConversationTraceContentMatch;
@@ -46,7 +50,10 @@ export interface ConversationTraceMatch {
  *
  * The search deliberately sees only `conversation.messages`: pending composer
  * contexts and queued follow-ups are not durable sent turns. A URI match is
- * mandatory, then literal content and line overlap contribute to relevance.
+ * mandatory, then unique literal content and line overlap contribute to relevance.
+ * Range-only candidates are deliberately excluded: the current command
+ * navigates a sole result directly, so every result returned here must have
+ * content evidence.
  * Results are relevance-first and newest-first within equal relevance, with
  * stable ID tie-breakers so AppState ordering cannot change the result.
  */
@@ -68,7 +75,7 @@ export function findConversationTraceMatches(
 
         const overlap = lineRangeOverlap(selectedRange, context);
         const contentMatch = classifyContentMatch(context.content, selectedContent);
-        if (!overlap && contentMatch === "none") continue;
+        if (contentMatch === "none") continue;
 
         const exactRange =
           context.startLine === selectedRange.startLine &&
@@ -82,6 +89,8 @@ export function findConversationTraceMatches(
         );
 
         matches.push({
+          confidence: exactRange && contentMatch === "exact" ? "exact" : "content-backed",
+          directNavigation: true,
           score,
           matchKind: classifyMatchKind(contentMatch, Boolean(overlap), exactRange),
           contentMatch,
@@ -158,11 +167,17 @@ function classifyContentMatch(
   selectedContent: string,
 ): ConversationTraceContentMatch {
   if (contextContent === selectedContent) return "exact";
-  if (contextContent.includes(selectedContent)) return "context-contains-selection";
-  if (contextContent.length > 0 && selectedContent.includes(contextContent)) {
+  if (occursExactlyOnce(contextContent, selectedContent)) return "context-contains-selection";
+  if (occursExactlyOnce(selectedContent, contextContent)) {
     return "selection-contains-context";
   }
   return "none";
+}
+
+function occursExactlyOnce(container: string, candidate: string) {
+  if (candidate.length === 0) return false;
+  const first = container.indexOf(candidate);
+  return first >= 0 && container.indexOf(candidate, first + 1) < 0;
 }
 
 function traceScore(

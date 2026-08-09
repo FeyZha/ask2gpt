@@ -1,4 +1,4 @@
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import {
   copyFile,
   mkdir,
@@ -188,6 +188,16 @@ describe("ConversationStore", () => {
     const root = await temporaryRoot();
     const store = new ConversationStore(root, new MemorySecrets());
     const value = conversation("Packaged context");
+    const content = "export const packaged = true;";
+    const sourceAnchor = {
+      formatVersion: 1 as const,
+      contentSha256: digest(content),
+      normalizedContentSha256: digest(content),
+      documentVersion: 12,
+      beforeLineSha256: digest("before"),
+      afterLineSha256: digest("after"),
+      workspaceRelativePath: "src/worker.ts",
+    };
     value.messages[0]!.contexts = [
       {
         id: "context-packaged",
@@ -197,9 +207,10 @@ describe("ConversationStore", () => {
         language: "typescript",
         startLine: 3,
         endLine: 5,
-        content: "export const packaged = true;",
+        content,
         charCount: 29,
         unsaved: true,
+        sourceAnchor,
       },
     ];
     value.messages[0]!.contextTransportVersion = 2;
@@ -211,8 +222,97 @@ describe("ConversationStore", () => {
     );
     expect((await store.loadAll())[0]?.messages[0]).toMatchObject({
       contextTransportVersion: 2,
-      contexts: [expect.objectContaining({ id: "context-packaged" })],
+      contexts: [expect.objectContaining({ id: "context-packaged", sourceAnchor })],
     });
+  });
+
+  it("normalizes version-1 anchors strictly while accepting legacy snapshots without one", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const content = "first  \r\nsecond\t ";
+    const validAnchor = {
+      formatVersion: 1,
+      contentSha256: digest(content),
+      normalizedContentSha256: digest("first\nsecond"),
+      documentVersion: 4,
+      workspaceRelativePath: "repo/src/source.ts",
+    };
+
+    for (const sourceAnchor of [
+      { ...validAnchor, contentSha256: "A".repeat(64) },
+      { ...validAnchor, normalizedContentSha256: "0".repeat(64) },
+      { ...validAnchor, documentVersion: -1 },
+      { ...validAnchor, workspaceRelativePath: "../source.ts" },
+      { ...validAnchor, unexpected: true },
+    ]) {
+      const invalid = conversation("Invalid anchor");
+      Object.assign(invalid.messages[0]!, {
+        contexts: [
+          {
+            id: "context-anchor-invalid",
+            kind: "selection",
+            fileName: "source.ts",
+            uri: "file:///workspace/source.ts",
+            language: "typescript",
+            startLine: 1,
+            endLine: 2,
+            content,
+            charCount: content.length,
+            unsaved: false,
+            sourceAnchor,
+          },
+        ],
+      });
+      await expect(store.save(invalid)).rejects.toThrow("Invalid conversation context snapshot");
+    }
+
+    const legacy = conversation("Legacy anchorless context");
+    legacy.messages[0]!.contexts = [
+      {
+        id: "context-anchorless",
+        kind: "selection",
+        fileName: "source.ts",
+        uri: "file:///workspace/source.ts",
+        language: "typescript",
+        startLine: 1,
+        endLine: 1,
+        content: "legacy",
+        charCount: 6,
+        unsaved: false,
+      },
+    ];
+    await store.save(legacy);
+    expect((await store.loadAll())[0]?.messages[0]?.contexts?.[0]?.sourceAnchor).toBeUndefined();
+  });
+
+  it("preserves a future-version context while dropping unsupported anchor metadata", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const future = conversation("Future anchor");
+    const context = {
+      id: "context-future-anchor",
+      kind: "selection",
+      fileName: "future.ts",
+      uri: "file:///workspace/future.ts",
+      language: "typescript",
+      startLine: 1,
+      endLine: 1,
+      content: "future()",
+      charCount: 8,
+      unsaved: false,
+    };
+    Object.assign(context, {
+      sourceAnchor: { formatVersion: 2, opaqueFutureField: "ignored by 0.1.1" },
+    });
+    Object.assign(future.messages[0]!, { contexts: [context] });
+
+    await store.save(future);
+
+    expect((await store.loadAll())[0]?.messages[0]?.contexts?.[0]).toMatchObject({
+      id: "context-future-anchor",
+      content: "future()",
+    });
+    expect((await store.loadAll())[0]?.messages[0]?.contexts?.[0]?.sourceAnchor).toBeUndefined();
   });
 
   it("round-trips a paused follow-up queue inside the encrypted conversation record", async () => {
@@ -985,6 +1085,10 @@ async function temporaryRoot() {
     await rm(root, { force: true, recursive: true });
   });
   return root;
+}
+
+function digest(value: string) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function primaryPath(root: string, id: string) {

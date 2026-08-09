@@ -516,9 +516,10 @@ function parseRemoteAdoptionStage(
     return value.remoteAdoptionStage as ActiveRunRecord["remoteAdoptionStage"];
   }
   if (value.remoteAdoptionStage !== undefined) return undefined;
-  // Upgrade an in-flight 0.1.7 record conservatively. A run which had not yet
-  // observed its first /c route can still do so; every other legacy run stays
-  // locked because its canonicalization history is unknowable.
+  // Upgrade a legacy in-flight record without an explicit adoption stage
+  // conservatively. A run which had not yet observed its first /c route can
+  // still do so; every other legacy run stays locked because its
+  // canonicalization history is unknowable.
   return value.allowRemoteAdoption === true ? "initial" : "locked";
 }
 

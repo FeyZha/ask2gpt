@@ -23,7 +23,10 @@ import {
   type QueuedFollowUp,
   type RelayErrorPayload,
   type RunState,
+  type SourceAnchorV1,
 } from "@ask2gpt/protocol";
+
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "../source-anchor";
 
 const KEY_NAME = "ask2gpt.conversationEncryptionKey.v1";
 const KEY_INITIALIZATION_LOCK = ".conversation-key-initialization.lock";
@@ -116,8 +119,8 @@ export interface ConversationNamespaceLease {
 
 /**
  * Gives concurrent Extension Hosts for the same workspace distinct storage
- * roots. Slot zero is the pre-0.1.4 directory, preserving existing history for
- * the normal single-window case; additional windows use isolated subfolders.
+ * roots. Slot zero is the legacy stable directory, preserving existing history
+ * for the normal single-window case; additional windows use isolated subfolders.
  */
 export async function acquireConversationNamespaceLease(
   stableStoragePath: string,
@@ -1086,6 +1089,13 @@ function normalizeContext(value: unknown): ContextSnapshot | undefined {
     return undefined;
   }
 
+  const unsupportedSourceAnchor = isUnsupportedSourceAnchor(value.sourceAnchor);
+  const sourceAnchor = unsupportedSourceAnchor
+    ? undefined
+    : normalizeSourceAnchor(value.sourceAnchor, value.content);
+  if (value.sourceAnchor !== undefined && !unsupportedSourceAnchor && !sourceAnchor) {
+    return undefined;
+  }
   const id = typeof value.id === "string" ? value.id : legacyContextId(value);
   return {
     id,
@@ -1098,7 +1108,79 @@ function normalizeContext(value: unknown): ContextSnapshot | undefined {
     content: value.content,
     charCount: value.content.length,
     unsaved: value.unsaved,
+    ...(sourceAnchor ? { sourceAnchor } : {}),
   };
+}
+
+function normalizeSourceAnchor(value: unknown, content: string): SourceAnchorV1 | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) return undefined;
+  const allowedKeys = new Set([
+    "formatVersion",
+    "contentSha256",
+    "normalizedContentSha256",
+    "documentVersion",
+    "beforeLineSha256",
+    "afterLineSha256",
+    "workspaceRelativePath",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return undefined;
+  if (
+    value.formatVersion !== 1 ||
+    !isSha256(value.contentSha256) ||
+    !isSha256(value.normalizedContentSha256) ||
+    !Number.isSafeInteger(value.documentVersion) ||
+    (value.documentVersion as number) < 0 ||
+    (value.beforeLineSha256 !== undefined && !isSha256(value.beforeLineSha256)) ||
+    (value.afterLineSha256 !== undefined && !isSha256(value.afterLineSha256)) ||
+    (value.workspaceRelativePath !== undefined &&
+      !isSafeWorkspaceRelativePath(value.workspaceRelativePath))
+  ) {
+    return undefined;
+  }
+  if (
+    value.contentSha256 !== sourceAnchorSha256(content) ||
+    value.normalizedContentSha256 !== sourceAnchorSha256(normalizeSourceAnchorContent(content))
+  ) {
+    return undefined;
+  }
+  return {
+    formatVersion: 1,
+    contentSha256: value.contentSha256,
+    normalizedContentSha256: value.normalizedContentSha256,
+    documentVersion: value.documentVersion as number,
+    ...(value.beforeLineSha256 ? { beforeLineSha256: value.beforeLineSha256 } : {}),
+    ...(value.afterLineSha256 ? { afterLineSha256: value.afterLineSha256 } : {}),
+    ...(value.workspaceRelativePath ? { workspaceRelativePath: value.workspaceRelativePath } : {}),
+  };
+}
+
+function isUnsupportedSourceAnchor(value: unknown) {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.formatVersion) &&
+    (value.formatVersion as number) > 1
+  );
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+function isSafeWorkspaceRelativePath(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 1_024 ||
+    value.startsWith("/") ||
+    /^[A-Za-z]:\//u.test(value) ||
+    /[\\:\p{Cc}\p{Cf}]/u.test(value)
+  ) {
+    return false;
+  }
+  return value
+    .split("/")
+    .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
 function legacyContextId(context: Record<string, unknown>) {

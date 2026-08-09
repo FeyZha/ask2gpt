@@ -210,6 +210,29 @@ const selectionCodeActionSource = await readFile(
   "utf8",
 );
 const extensionSource = await readFile(path.join(vscodeSourceRoot, "extension.ts"), "utf8");
+const sourceTraceIndexSource = await readFile(
+  path.join(vscodeSourceRoot, "source-trace-index.ts"),
+  "utf8",
+);
+const webviewProviderSource = await readFile(
+  path.join(vscodeSourceRoot, "webview-provider.ts"),
+  "utf8",
+);
+const contextServiceSource = await readFile(
+  path.join(vscodeSourceRoot, "services", "context-service.ts"),
+  "utf8",
+);
+const conversationStoreSource = await readFile(
+  path.join(vscodeSourceRoot, "services", "conversation-store.ts"),
+  "utf8",
+);
+const controllerSource = await readFile(path.join(vscodeSourceRoot, "controller.ts"), "utf8");
+const sourceAnchorSource = await readFile(path.join(vscodeSourceRoot, "source-anchor.ts"), "utf8");
+const protocolSource = await readFile(
+  path.join(root, "packages", "protocol", "src", "index.ts"),
+  "utf8",
+);
+const typesSource = await readFile(path.join(vscodeSourceRoot, "types.ts"), "utf8");
 const webviewMessageValidationSource = await readFile(
   path.join(vscodeSourceRoot, "webview-message-validation.ts"),
   "utf8",
@@ -256,6 +279,44 @@ if (
 ) {
   failures.push(
     "Webview source-reference navigation must send bounded references, never a URI or path authority",
+  );
+}
+if (
+  (webviewProviderSource.match(/withSourceTraceHints\(/gu)?.length ?? 0) < 3 ||
+  !sourceTraceIndexSource.includes("nearestTraceContexts") ||
+  !sourceTraceIndexSource.includes('message.status === "streaming"') ||
+  !sourceTraceIndexSource.includes("candidate.id === state.activeConversationId") ||
+  !sourceTraceIndexSource.includes("MAX_HINTED_ASSISTANT_MESSAGES = 200") ||
+  !sourceTraceIndexSource.includes("MAX_SOURCE_FILE_REFERENCES = 1_000") ||
+  !sourceTraceIndexSource.includes("MAX_SOURCE_SYMBOLS = 4_096") ||
+  !sourceTraceIndexSource.includes("delete decorated.sourceTraceHints") ||
+  !sourceTraceIndexSource.includes(
+    "source-trace-policy:active-only;assistant=200;file-references=1000;symbols=4096",
+  ) ||
+  /from\s+["']vscode["']/u.test(sourceTraceIndexSource) ||
+  !/interface SourceTraceHint\s*\{\s*\/\*[\s\S]*?fileReferences:\s*string\[\];[\s\S]*?sourceSymbols:\s*string\[\];\s*\}/u.test(
+    typesSource,
+  )
+) {
+  failures.push(
+    "Source affordances must be host-derived, terminal-only, URI-free hints scoped to the nearest user turn",
+  );
+}
+if (
+  !protocolSource.includes("interface SourceAnchorV1") ||
+  !protocolSource.includes("normalizedContentSha256: string") ||
+  !contextServiceSource.includes("sourceAnchor: sourceAnchor(") ||
+  (contextServiceSource.match(/\.\.\.baseSnapshot\(/gu)?.length ?? 0) !== 3 ||
+  !contextServiceSource.includes("sourceAnchorSha256") ||
+  !conversationStoreSource.includes("normalizeSourceAnchor(value.sourceAnchor, value.content)") ||
+  !conversationStoreSource.includes("sourceAnchorSha256") ||
+  !sourceAnchorSource.includes("normalizeSourceAnchorContent") ||
+  !sourceAnchorSource.includes("sourceAnchorMatchesContent") ||
+  conversationStoreSource.includes("sourceTraceHints") ||
+  controllerSource.includes("sourceTraceHints")
+) {
+  failures.push(
+    "SourceAnchor V1 must be captured and strictly restored while derived trace hints remain non-persistent",
   );
 }
 if (vscodePackage.scripts.package !== "node ../../scripts/package-vscode.mjs") {

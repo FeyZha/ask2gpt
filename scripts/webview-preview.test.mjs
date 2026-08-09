@@ -19,8 +19,8 @@ test("preview state satisfies the current AppState invariants", () => {
   const state = validatePreviewState(createPreviewState());
   assert.equal(state.activeConversationId, "preview-main");
   assert.equal(state.backend.connection.phase, "ready");
-  assert.equal(state.backend.connection.hostVersion, "0.1.0");
-  assert.equal(state.backend.connection.relayVersion, "0.1.0");
+  assert.equal(state.backend.connection.hostVersion, "0.1.1");
+  assert.equal(state.backend.connection.relayVersion, "0.1.1");
   assert.equal(state.backend.connection.protocolVersion, 15);
   assert.equal(state.backend.selectorVersion, 50);
   assert.equal(state.backend.project.name, "ask2gpt-tour");
@@ -40,6 +40,10 @@ test("preview state satisfies the current AppState invariants", () => {
     state.conversations[0].messages[1].markdown,
     /insight-board\.ts:68.*`summarize\(\)`/u,
   );
+  assert.deepEqual(state.sourceTraceHints["preview-main"]["preview-assistant-existing"], {
+    fileReferences: ["insight-board.ts:68"],
+    sourceSymbols: ["summarize"],
+  });
   assert.deepEqual(state.automaticContextIds, []);
 });
 

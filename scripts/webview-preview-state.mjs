@@ -46,8 +46,8 @@ export function createPreviewState() {
         since: PREVIEW_TIME,
         browserDetected: true,
         hasStoredTrust: true,
-        hostVersion: "0.1.0",
-        relayVersion: "0.1.0",
+        hostVersion: "0.1.1",
+        relayVersion: "0.1.1",
         protocolVersion: 15,
         lastConnectedAt: PREVIEW_TIME,
       },
@@ -187,6 +187,14 @@ export function createPreviewState() {
       followUpQueueMode: "queue",
       composerEnterBehavior: "enter",
     },
+    sourceTraceHints: {
+      "preview-main": {
+        "preview-assistant-existing": {
+          fileReferences: ["insight-board.ts:68"],
+          sourceSymbols: ["summarize"],
+        },
+      },
+    },
     locale: "zh-CN",
     pendingContexts: [context, file],
     automaticContextIds: [],
@@ -207,6 +215,9 @@ export function validatePreviewState(state) {
   }
   if (typeof state.contextLocked !== "boolean") failures.push("contextLocked must be boolean");
   if (!state.backend?.connection?.phase) failures.push("backend.connection.phase is required");
+  if (!state.sourceTraceHints || typeof state.sourceTraceHints !== "object") {
+    failures.push("sourceTraceHints are required for the linked-source preview");
+  }
   if (typeof state.backend?.connection?.browserDetected !== "boolean") {
     failures.push("backend.connection.browserDetected is required");
   }

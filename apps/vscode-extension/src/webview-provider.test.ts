@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 
-import type { AppState, GenerationViewUpdate, WebviewToHostMessage } from "./types";
+import type {
+  AppState,
+  GenerationViewUpdate,
+  HostToWebviewMessage,
+  WebviewToHostMessage,
+} from "./types";
 
 const contextNavigationMock = vi.hoisted(() => ({
   openContextFromState: vi.fn(async () => undefined),
@@ -155,8 +160,31 @@ describe("Ask2GPTViewProvider state delivery", () => {
     provider.dispose();
   });
 
+  it("embeds nested source-trace hints without mutating the controller's initial state", () => {
+    const state = traceableState();
+    const original = structuredClone(state);
+    const postMessage = vi.fn(async () => true);
+    const harness = createStateDeliveryHarness(() => state, postMessage);
+
+    expect(initialStateFromHtml(harness.view.webview.html).sourceTraceHints).toEqual({
+      "conversation-1": {
+        "assistant-1": {
+          fileReferences: ["src/store.ts:34"],
+          sourceSymbols: ["search"],
+        },
+      },
+    });
+    expect(state).toEqual(original);
+    expect(state.sourceTraceHints).toBeUndefined();
+
+    harness.ready();
+    expect(postMessage).not.toHaveBeenCalled();
+    harness.provider.dispose();
+  });
+
   it("delivers authoritative state before revealing a turn in a ready renderer", async () => {
-    const state = appState({ activeRuns: 0 });
+    const state = traceableState();
+    const original = structuredClone(state);
     let releaseState!: (delivered: boolean) => void;
     const stateDelivery = new Promise<boolean>((resolve) => {
       releaseState = resolve;
@@ -168,23 +196,36 @@ describe("Ask2GPTViewProvider state delivery", () => {
     harness.ready();
     postMessage.mockClear();
 
-    await harness.provider.revealTurn("conversation-1", "assistant-1", "context-1");
+    await harness.provider.revealTurn("conversation-1", "user-1", "context-1");
 
     expect(postMessage).toHaveBeenCalledOnce();
-    expect(postMessage).toHaveBeenLastCalledWith({ type: "state", state });
+    const stateMessage = postMessage.mock.calls[0]?.[0] as HostToWebviewMessage | undefined;
+    expect(stateMessage?.type).toBe("state");
+    if (stateMessage?.type !== "state") throw new Error("Expected a state delivery.");
+    expect(stateMessage.state.sourceTraceHints).toEqual({
+      "conversation-1": {
+        "assistant-1": {
+          fileReferences: ["src/store.ts:34"],
+          sourceSymbols: ["search"],
+        },
+      },
+    });
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "revealTurn" }));
+    expect(state).toEqual(original);
+    expect(state.sourceTraceHints).toBeUndefined();
 
     releaseState(true);
     await vi.waitFor(() => expect(postMessage).toHaveBeenCalledTimes(2));
-    expect(postMessage.mock.calls.map(([message]) => message)).toEqual([
-      { type: "state", state },
-      {
-        type: "revealTurn",
-        conversationId: "conversation-1",
-        messageId: "assistant-1",
-        contextId: "context-1",
-      },
-    ]);
+    const deliveredMessages = postMessage.mock.calls.map(
+      ([message]) => message as HostToWebviewMessage,
+    );
+    expect(deliveredMessages[0]?.type).toBe("state");
+    expect(deliveredMessages[1]).toEqual({
+      type: "revealTurn",
+      conversationId: "conversation-1",
+      messageId: "user-1",
+      contextId: "context-1",
+    });
     harness.provider.dispose();
   });
 
@@ -193,7 +234,7 @@ describe("Ask2GPTViewProvider state delivery", () => {
     const postMessage = vi.fn(async () => true);
     const harness = createStateDeliveryHarness(() => state, postMessage);
 
-    await harness.provider.revealTurn("conversation-1", "assistant-1");
+    await harness.provider.revealTurn("conversation-1", "user-1");
     expect(postMessage).not.toHaveBeenCalled();
 
     harness.ready();
@@ -201,7 +242,7 @@ describe("Ask2GPTViewProvider state delivery", () => {
     expect(postMessage).toHaveBeenCalledWith({
       type: "revealTurn",
       conversationId: "conversation-1",
-      messageId: "assistant-1",
+      messageId: "user-1",
     });
     harness.provider.dispose();
   });
@@ -257,12 +298,12 @@ describe("Ask2GPTViewProvider state delivery", () => {
     );
     firstReceive?.({ type: "ready" });
 
-    await provider.revealTurn("conversation-1", "assistant-1");
+    await provider.revealTurn("conversation-1", "user-1");
     await vi.waitFor(() => expect(firstPost).toHaveBeenCalledTimes(2));
     expect(firstPost).toHaveBeenLastCalledWith({
       type: "revealTurn",
       conversationId: "conversation-1",
-      messageId: "assistant-1",
+      messageId: "user-1",
     });
 
     provider.resolveWebviewView(
@@ -276,7 +317,7 @@ describe("Ask2GPTViewProvider state delivery", () => {
       expect(secondPost).toHaveBeenCalledWith({
         type: "revealTurn",
         conversationId: "conversation-1",
-        messageId: "assistant-1",
+        messageId: "user-1",
       }),
     );
     releaseOldReveal(true);
@@ -1650,6 +1691,50 @@ function appState({ activeRuns }: { activeRuns: number }): AppState {
     contextLocked: false,
     locale: "en",
   };
+}
+
+function traceableState(): AppState {
+  const state = appState({ activeRuns: 0 });
+  state.conversations[0]!.messages = [
+    {
+      id: "user-1",
+      role: "user",
+      markdown: "Review this source",
+      status: "complete",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      contextTransportVersion: 2,
+      contexts: [
+        {
+          id: "context-1",
+          kind: "selection",
+          fileName: "src/store.ts",
+          uri: "file:///workspace/src/store.ts",
+          language: "typescript",
+          startLine: 34,
+          endLine: 36,
+          content: "export function search() { return true; }",
+          charCount: 41,
+          unsaved: false,
+        },
+      ],
+    },
+    {
+      id: "assistant-1",
+      role: "assistant",
+      markdown: "See src/store.ts:34 and `search()`.",
+      status: "complete",
+      createdAt: "2026-07-24T00:00:01.000Z",
+    },
+  ];
+  return state;
+}
+
+function initialStateFromHtml(html: string): AppState {
+  const serialized = /<script id="ask2gpt-initial-state"[^>]*>([\s\S]*?)<\/script>/u.exec(
+    html,
+  )?.[1];
+  if (!serialized) throw new Error("Initial Webview state was not embedded.");
+  return JSON.parse(serialized) as AppState;
 }
 
 function streamingState(markdown: string): AppState {

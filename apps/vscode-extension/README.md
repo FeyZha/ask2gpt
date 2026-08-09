@@ -4,6 +4,8 @@ Ask project-code questions in VS Code through your signed-in ChatGPT web session
 start a Codex/Coding Agent task, use an OpenAI API key, run shell commands, or modify your workspace.
 ChatGPT account and web usage limits still apply.
 
+This document describes Ask2GPT 0.1.1 and Relay protocol v15.
+
 ## Required companion
 
 Install the matching `ask2gpt-relay-<version>.zip` from the same
@@ -29,14 +31,21 @@ API key is required. Chrome 116+ and VS Code 1.96+ are supported.
   Unit tests, or Performance/security. A shortcut only fills the conversation's editable draft; it
   never sends automatically.
 - Review every context item before sending; Ask2GPT never scans the workspace for more files.
-- Click a context card or a verified `file.ts:line`/inline symbol in an answer to return to attached
-  source. With code selected, **Find Related Turn** locates the sent question that used that snapshot.
+- Click a context card or a Host-verified `file.ts:line`/inline symbol in an answer to return to
+  attached source. With code selected, **Find Related Turn** accepts only unique content evidence,
+  then keeps the matched turn and exact context card highlighted until you clear the trace.
 
 Code context remains a compact attachment card in the VS Code transcript and a file capsule on the
 ChatGPT page. Only the human-written question appears as prompt text; the Relay uploads each bounded
 snapshot as an in-memory text file for ChatGPT to read.
-Source links are resolved only against snapshots explicitly attached before that answer; they never
-trigger a workspace-wide file search.
+The Host derives clickable hints only from contexts on the nearest user turn before an answer.
+Unattached references stay ordinary text. A selection snapshot that is missing or repeated in the
+current document fails closed instead of opening an old line. Durable contexts include versioned
+`SourceAnchorV1` hash metadata for provenance and relocation.
+
+To keep long histories responsive, source affordances are indexed only for the active conversation
+and at most its 200 newest terminal assistant messages. Older answers remain readable, with source
+tokens rendered as ordinary text.
 
 Ask2GPT supports streaming Markdown, ChatGPT-style code blocks with multicolor syntax highlighting and
 block-level copy, multi-turn conversations, title/history sync, model-option sync, stop/regenerate,
@@ -51,6 +60,9 @@ needs repository search, file edits, terminal commands, tests, or Git operations
 Only explicitly selected text is relayed to the visible ChatGPT page. Sensitive filenames, binary
 files, and oversized content are rejected. Ask2GPT does not request Chrome cookie, history, download,
 clipboard, native-messaging, or file-URL permissions.
+
+Renaming or moving a file can invalidate URI-based source navigation and reverse lookup. Ask2GPT does
+not search the workspace to guess a replacement path.
 
 The complete installation guide, synthetic tutorial, demo, limitations, and security model are in the
 [project README](https://github.com/FeyZha/ask2gpt#readme).

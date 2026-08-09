@@ -2,7 +2,7 @@ import { PROTOCOL_VERSION } from "@ask2gpt/protocol";
 import * as vscode from "vscode";
 
 import { Ask2GPTController } from "./controller";
-import { findConversationTraceMatches, type ConversationTraceMatch } from "./conversation-trace";
+import { createFindRelatedTurnCommand } from "./find-related-turn-command";
 import { BrowserChatBackend } from "./services/browser-chat-backend";
 import { ChromeRelayServer } from "./services/chrome-relay-server";
 import { ContextService } from "./services/context-service";
@@ -39,7 +39,7 @@ export const FIND_RELATED_TURN_COMMAND = "ask2gpt.findRelatedTurn";
 export async function activate(context: vscode.ExtensionContext) {
   const logger = new SafeLogger();
 
-  // Keep the existing workspace namespace stable so 0.1.3 conversation
+  // Keep the existing workspace namespace stable so encrypted conversation
   // history and Chrome relay state remain available after an upgrade.
   const storageNamespaceId = await resolveStorageNamespaceId(context.workspaceState);
   const packageJson: unknown = context.extension.packageJSON;
@@ -49,7 +49,7 @@ export async function activate(context: vscode.ExtensionContext) {
     "version" in packageJson &&
     typeof packageJson.version === "string"
       ? packageJson.version
-      : "0.1.0";
+      : "0.1.1";
 
   // Records remain inside extension-private global storage, but each relay
   // instance gets its own namespace to prevent cross-window lost updates.
@@ -157,70 +157,44 @@ export async function activate(context: vscode.ExtensionContext) {
     () => selectionReferenceFromEditor(vscode.window.activeTextEditor),
     attachSelectionAndOpen,
   );
-  const findRelatedTurn = async () => {
-    const editor = vscode.window.activeTextEditor;
-    const reference = selectionReferenceFromEditor(editor);
-    if (!editor || !reference) {
-      void vscode.window.showWarningMessage(
-        vscode.env.language.toLowerCase().startsWith("zh")
-          ? "请先在编辑器中选择代码。"
-          : "Select code in the editor first.",
-      );
-      return;
-    }
-
-    const selectedContent = editor.document.getText(editor.selection);
-    const matches = distinctTraceTurns(
-      findConversationTraceMatches(controller.getState(), reference, selectedContent),
-    );
-    const isZh = vscode.env.language.toLowerCase().startsWith("zh");
-    if (matches.length === 0) {
-      const attachLabel = isZh ? "使用此选区提问" : "Ask about this selection";
-      const action = await vscode.window.showInformationMessage(
-        isZh
-          ? "没有找到与当前选区关联的已发送对话。"
-          : "No sent conversation is linked to the current selection.",
-        attachLabel,
-      );
-      if (action === attachLabel) await attachSelectionAndOpen(reference);
-      return;
-    }
-
-    const selected =
-      matches.length === 1
-        ? matches[0]
-        : await vscode.window
-            .showQuickPick(
-              matches.map((match) => ({
-                label: `$(comment-discussion) ${match.conversationTitle}`,
-                description: `${match.conversationArchivedAt ? `${isZh ? "已归档" : "Archived"} · ` : ""}${match.contextFileName}:L${match.contextStartLine}–${match.contextEndLine}`,
-                detail: traceQuestionPreview(match.messageMarkdown),
-                match,
-              })),
-              {
-                matchOnDescription: true,
-                matchOnDetail: true,
-                placeHolder: isZh
-                  ? "选择与当前代码关联的对话轮次"
-                  : "Choose a conversation turn linked to this code",
-              },
-            )
-            .then((item) => item?.match);
-    if (!selected) return;
-
-    if (selected.conversationArchivedAt) {
-      const restoreLabel = isZh ? "恢复并打开" : "Restore and open";
-      const action = await vscode.window.showInformationMessage(
-        isZh ? "关联轮次位于已归档对话中。" : "The linked turn is in an archived conversation.",
-        restoreLabel,
-      );
-      if (action !== restoreLabel) return;
-      await controller.unarchiveConversation(selected.conversationId, true);
-    } else {
-      await controller.selectConversation(selected.conversationId);
-    }
-    await provider.revealTurn(selected.conversationId, selected.messageId, selected.contextId);
-  };
+  const findRelatedTurn = createFindRelatedTurnCommand({
+    getActiveSelection: () => {
+      const editor = vscode.window.activeTextEditor;
+      const reference = selectionReferenceFromEditor(editor);
+      if (!editor || !reference) return undefined;
+      const document = editor.document;
+      const selection = editor.selection;
+      const viewColumn = editor.viewColumn;
+      return {
+        reference,
+        selectedContent: document.getText(selection),
+        restoreFocus: async () => {
+          try {
+            await vscode.window.showTextDocument(document, {
+              preserveFocus: false,
+              selection,
+              viewColumn,
+            });
+          } catch {
+            // Navigation already succeeded; a closing editor must not turn
+            // focus restoration into a false command failure.
+          }
+        },
+      };
+    },
+    getState: () => controller.getState(),
+    isZh: () => vscode.env.language.toLowerCase().startsWith("zh"),
+    showWarningMessage: (message) => vscode.window.showWarningMessage(message),
+    showInformationMessage: (message, ...items) =>
+      vscode.window.showInformationMessage(message, ...items),
+    showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
+    attachSelectionAndOpen: async (reference) => attachSelectionAndOpen(reference),
+    selectConversation: async (conversationId) => controller.selectConversation(conversationId),
+    unarchiveConversation: async (conversationId, activate) =>
+      controller.unarchiveConversation(conversationId, activate),
+    revealTurn: async (conversationId, messageId, contextId) =>
+      provider.revealTurn(conversationId, messageId, contextId),
+  });
   const selectionCodeActions = registerSelectionCodeActionProvider();
   context.subscriptions.push(
     provider,
@@ -284,21 +258,6 @@ export async function activate(context: vscode.ExtensionContext) {
     version: extensionVersion,
     port: relay.port,
   });
-}
-
-function distinctTraceTurns(matches: ConversationTraceMatch[]) {
-  const seen = new Set<string>();
-  return matches.filter((match) => {
-    const key = `${match.conversationId}:${match.messageId}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function traceQuestionPreview(markdown: string) {
-  const preview = markdown.replace(/\s+/gu, " ").trim();
-  return preview.length > 120 ? `${preview.slice(0, 119)}…` : preview;
 }
 
 export async function deactivate() {

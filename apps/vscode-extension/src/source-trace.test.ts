@@ -63,6 +63,7 @@ vi.mock("vscode", () => {
 import type { ContextSnapshot, ConversationMessage } from "@ask2gpt/protocol";
 import * as vscode from "vscode";
 
+import { createFindRelatedTurnCommand } from "./find-related-turn-command";
 import { openAnswerSourceReferenceFromState, openAnswerSymbolFromState } from "./source-trace";
 import type { AppState } from "./types";
 
@@ -94,7 +95,7 @@ describe("answer source trace", () => {
       endLine: 39,
       content: sixLines(),
     });
-    registerDocument(attached.uri, numberedDocument(50));
+    registerDocument(attached.uri, numberedDocumentWithSnapshot(50, 34, attached.content));
     const state = appState([
       userMessage("question", [attached]),
       assistantMessage("answer", "See 06_vector_store.py:34-35 for the setup."),
@@ -112,9 +113,35 @@ describe("answer source trace", () => {
     );
     expect(lastEditor().selection).toMatchObject({
       start: { line: 33, character: 0 },
-      end: { line: 34, character: "line 35".length },
+      end: { line: 34, character: "selected 2".length },
     });
     expect(lastEditor().revealRange).toHaveBeenCalledWith(lastEditor().selection, 2);
+
+    const openedRange = lastEditor().selection as vscode.Range;
+    const revealTurn = vi.fn(async () => undefined);
+    await createFindRelatedTurnCommand({
+      getActiveSelection: () => ({
+        reference: {
+          uri: attached.uri,
+          documentVersion: 1,
+          startLine: openedRange.start.line,
+          startCharacter: openedRange.start.character,
+          endLine: openedRange.end.line,
+          endCharacter: openedRange.end.character,
+        },
+        selectedContent: sixLines().split("\n").slice(0, 2).join("\n"),
+      }),
+      getState: () => state,
+      isZh: () => false,
+      showWarningMessage: vi.fn(),
+      showInformationMessage: vi.fn(async () => undefined),
+      showQuickPick: vi.fn(async () => undefined),
+      attachSelectionAndOpen: vi.fn(async () => undefined),
+      selectConversation: vi.fn(async () => undefined),
+      unarchiveConversation: vi.fn(async () => undefined),
+      revealTurn,
+    })();
+    expect(revealTurn).toHaveBeenCalledWith("conversation-a", "question", attached.id);
 
     await expect(
       openAnswerSourceReferenceFromState(
@@ -135,7 +162,7 @@ describe("answer source trace", () => {
       endLine: 39,
       content: sixLines(),
     });
-    registerDocument(attached.uri, numberedDocument(50));
+    registerDocument(attached.uri, numberedDocumentWithSnapshot(50, 34, attached.content));
     const alias = "06_vector_store.L34-L39.py";
     const state = appState([
       userMessage("question", [attached]),
@@ -158,6 +185,98 @@ describe("answer source trace", () => {
       "src/06_vector_store.py:34",
     );
     expect(lastEditor().selection).toMatchObject({ start: { line: 33 }, end: { line: 33 } });
+  });
+
+  it("relocates file-line references only when the attached selection snapshot is unique", async () => {
+    const attached = sourceContext({
+      fileName: "move.ts",
+      uri: "file:///workspace/move.ts",
+      startLine: 10,
+      endLine: 11,
+      content: "alpha\nbeta",
+    });
+    registerDocument(attached.uri, "header\nother\nalpha\nbeta\ntail");
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", "See move.ts:11."),
+    ]);
+
+    await openAnswerSourceReferenceFromState(state, "conversation-a", "answer", "move.ts:11");
+
+    expect(lastEditor().selection).toMatchObject({
+      start: { line: 3, character: 0 },
+      end: { line: 3, character: 4 },
+    });
+  });
+
+  it.each([
+    ["missing", "header\ntail", "SOURCE_LINE_STALE"],
+    ["ambiguous", "alpha\nbeta\nalpha\nbeta", "SOURCE_LINE_AMBIGUOUS"],
+  ])(
+    "rejects a %s selection snapshot instead of opening its old line",
+    async (_case, live, code) => {
+      const attached = sourceContext({
+        fileName: "stale.ts",
+        uri: "file:///workspace/stale.ts",
+        startLine: 1,
+        endLine: 2,
+        content: "alpha\nbeta",
+      });
+      registerDocument(attached.uri, live);
+      const state = appState([
+        userMessage("question", [attached]),
+        assistantMessage("answer", "See stale.ts:1."),
+      ]);
+
+      await expect(
+        openAnswerSourceReferenceFromState(state, "conversation-a", "answer", "stale.ts:1"),
+      ).rejects.toMatchObject({ code });
+      expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a stale whole-file line reference even when the old line number still exists", async () => {
+    const attached = sourceContext({
+      kind: "current-file",
+      fileName: "changed.ts",
+      uri: "file:///workspace/changed.ts",
+      startLine: 1,
+      endLine: 3,
+      content: "one\ntwo\nthree",
+    });
+    registerDocument(attached.uri, "one\nreplaced\nthree");
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", "See changed.ts:2."),
+    ]);
+
+    await expect(
+      openAnswerSourceReferenceFromState(state, "conversation-a", "answer", "changed.ts:2"),
+    ).rejects.toMatchObject({ code: "SOURCE_LINE_STALE" });
+    expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
+  });
+
+  it("relocates a whole-file line reference after a unique external insertion", async () => {
+    const attached = sourceContext({
+      kind: "current-file",
+      fileName: "moved.ts",
+      uri: "file:///workspace/moved.ts",
+      startLine: 1,
+      endLine: 2,
+      content: "one\ntwo",
+    });
+    registerDocument(attached.uri, "header\none\ntwo");
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", "See moved.ts:2."),
+    ]);
+
+    await openAnswerSourceReferenceFromState(state, "conversation-a", "answer", "moved.ts:2");
+
+    expect(lastEditor().selection).toMatchObject({
+      start: { line: 2, character: 0 },
+      end: { line: 2, character: 3 },
+    });
   });
 
   it("uses QuickPick when old context evidence leaves a basename ambiguous", async () => {
@@ -209,7 +328,6 @@ describe("answer source trace", () => {
 
   it("uses a qualified document-symbol provider result and highlights its definition", async () => {
     const attached = sourceContext({
-      kind: "current-file",
       fileName: "store.ts",
       uri: "file:///workspace/store.ts",
       startLine: 1,
@@ -249,7 +367,32 @@ describe("answer source trace", () => {
     });
   });
 
-  it("falls back to an attached definition snapshot when no symbol provider is available", async () => {
+  it("rejects a symbol in a changed whole-file snapshot before consulting a provider", async () => {
+    const attached = sourceContext({
+      kind: "current-file",
+      fileName: "changed.ts",
+      uri: "file:///workspace/changed.ts",
+      startLine: 1,
+      endLine: 2,
+      content: "function compute() { return 1; }\ncompute();",
+    });
+    registerDocument(attached.uri, "function compute() { return 2; }\ncompute();");
+    vscodeMock.executeCommand.mockResolvedValue([
+      { name: "compute", selectionRange: range(0, 9, 0, 16), children: [] },
+    ]);
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", "Call `compute()` here."),
+    ]);
+
+    await expect(
+      openAnswerSymbolFromState(state, "conversation-a", "answer", "compute()"),
+    ).rejects.toMatchObject({ code: "SOURCE_LINE_STALE" });
+    expect(vscodeMock.executeCommand).not.toHaveBeenCalled();
+    expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
+  });
+
+  it("relocates an attached definition snapshot when no symbol provider is available", async () => {
     const attached = sourceContext({
       fileName: "worker.py",
       uri: "file:///workspace/worker.py",
@@ -257,10 +400,7 @@ describe("answer source trace", () => {
       endLine: 21,
       content: "def compute(value):\n    return value",
     });
-    const liveLines = Array.from({ length: 25 }, (_, index) => `line ${index + 1}`);
-    liveLines[19] = "def compute(value):";
-    liveLines[20] = "    return value";
-    registerDocument(attached.uri, liveLines.join("\n"));
+    registerDocument(attached.uri, "header\nother\ndef compute(value):\n    return value\ntail");
     vscodeMock.executeCommand.mockRejectedValue(new Error("No language provider"));
     const state = appState([
       userMessage("question", [attached]),
@@ -270,9 +410,39 @@ describe("answer source trace", () => {
     await openAnswerSymbolFromState(state, "conversation-a", "answer", "compute()");
 
     expect(lastEditor().selection).toMatchObject({
-      start: { line: 19, character: 4 },
-      end: { line: 19, character: 11 },
+      start: { line: 2, character: 4 },
+      end: { line: 2, character: 11 },
     });
+  });
+
+  it("does not accept a symbol-provider definition outside the attached selection evidence", async () => {
+    const attached = sourceContext({
+      fileName: "worker.py",
+      uri: "file:///workspace/worker.py",
+      startLine: 20,
+      endLine: 20,
+      content: "result = compute(value)",
+    });
+    registerDocument(attached.uri, "def compute(value): pass\nother\nresult = compute(value)");
+    vscodeMock.executeCommand.mockResolvedValue([
+      {
+        name: "compute",
+        containerName: "",
+        location: {
+          uri: { toString: () => attached.uri },
+          range: range(0, 4, 0, 11),
+        },
+      },
+    ]);
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", "The call is `compute()` here."),
+    ]);
+
+    await expect(
+      openAnswerSymbolFromState(state, "conversation-a", "answer", "compute()"),
+    ).rejects.toMatchObject({ code: "SOURCE_SYMBOL_NOT_FOUND" });
+    expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
   });
 
   it("offers a QuickPick when the same symbol has multiple attached definitions", async () => {
@@ -352,6 +522,31 @@ describe("answer source trace", () => {
     await expect(
       openAnswerSymbolFromState(state, "conversation-a", "answer", "forgedFn()"),
     ).rejects.toMatchObject({ code: "SOURCE_SYMBOL_STALE" });
+    expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
+  });
+
+  it("binds an answer only to the nearest preceding user turn", async () => {
+    const older = sourceContext({
+      kind: "current-file",
+      fileName: "older.ts",
+      uri: "file:///workspace/older.ts",
+      startLine: 1,
+      endLine: 1,
+      content: "function olderFn() {}",
+    });
+    const state = appState([
+      userMessage("older-question", [older]),
+      assistantMessage("older-answer", "Earlier reply."),
+      userMessage("nearest-question", []),
+      assistantMessage("answer", "See older.ts:1 and `olderFn()`."),
+    ]);
+
+    await expect(
+      openAnswerSourceReferenceFromState(state, "conversation-a", "answer", "older.ts:1"),
+    ).rejects.toMatchObject({ code: "SOURCE_REFERENCE_NOT_FOUND" });
+    await expect(
+      openAnswerSymbolFromState(state, "conversation-a", "answer", "olderFn()"),
+    ).rejects.toMatchObject({ code: "SOURCE_SYMBOL_NOT_FOUND" });
     expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
   });
 
@@ -481,12 +676,26 @@ function registerDocument(uri: string, content: string) {
 
 function textDocument(content: string) {
   const lines = content.split("\n");
+  const lineOffsets: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    lineOffsets.push(offset);
+    offset += line.length + 1;
+  }
+  const positionAt = (target: number) => {
+    const bounded = Math.max(0, Math.min(target, content.length));
+    let line = 0;
+    while (line + 1 < lineOffsets.length && lineOffsets[line + 1]! <= bounded) line += 1;
+    return new vscode.Position(line, bounded - lineOffsets[line]!);
+  };
   return {
     lineCount: lines.length,
     lineAt: (line: number) => ({
       text: lines[line]!,
       range: range(line, 0, line, lines[line]!.length),
     }),
+    getText: () => content,
+    positionAt,
   };
 }
 
@@ -497,8 +706,12 @@ function range(startLine: number, startCharacter: number, endLine: number, endCh
   );
 }
 
-function numberedDocument(lineCount: number) {
-  return Array.from({ length: lineCount }, (_, index) => `line ${index + 1}`).join("\n");
+function numberedDocumentWithSnapshot(lineCount: number, startLine: number, snapshot: string) {
+  const lines = Array.from({ length: lineCount }, (_, index) => `line ${index + 1}`);
+  for (const [index, line] of snapshot.split("\n").entries()) {
+    lines[startLine - 1 + index] = line;
+  }
+  return lines.join("\n");
 }
 
 function sixLines() {

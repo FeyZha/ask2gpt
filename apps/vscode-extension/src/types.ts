@@ -166,6 +166,13 @@ export interface ModelPickerState {
   stale?: boolean;
 }
 
+export interface SourceTraceHint {
+  /** Exact textual references proven to address this turn's attached context. */
+  fileReferences: string[];
+  /** Definition names proven to exist inside this turn's attached snapshots. */
+  sourceSymbols: string[];
+}
+
 export interface AppState {
   activeConversationId: string;
   conversations: Conversation[];
@@ -178,6 +185,8 @@ export interface AppState {
   modelPicker: ModelPickerState;
   /** Optional for compatibility with retained webviews created by an older host. */
   composerPreferences?: ComposerPreferences;
+  /** Host-derived, non-persisted source affordances scoped by conversation and message ID. */
+  sourceTraceHints?: Record<string, Record<string, SourceTraceHint>>;
   locale: "zh-CN" | "en";
 }
 

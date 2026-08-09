@@ -10,6 +10,7 @@ import {
 } from "./context-policy";
 import { Ask2GPTError } from "./errors";
 import type { SelectionReference } from "../selection-reference";
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "../source-anchor";
 
 function activeEditor() {
   const editor = vscode.window.activeTextEditor;
@@ -27,9 +28,10 @@ function baseSnapshot(
   endLine: number,
 ): Omit<ContextSnapshot, "kind"> {
   assertAllowedContext(document.fileName, content);
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
   return {
     id: randomUUID(),
-    fileName: displayFileName(document),
+    fileName: displayFileName(document, workspaceFolder),
     uri: document.uri.toString(true),
     language: document.languageId,
     startLine,
@@ -37,6 +39,7 @@ function baseSnapshot(
     content,
     charCount: content.length,
     unsaved: document.isDirty,
+    sourceAnchor: sourceAnchor(document, content, startLine, endLine, workspaceFolder),
   };
 }
 
@@ -138,9 +141,11 @@ function portableBasename(fileName: string) {
   return fileName.split(/[\\/]/).at(-1) ?? fileName;
 }
 
-function displayFileName(document: vscode.TextDocument) {
+function displayFileName(
+  document: vscode.TextDocument,
+  workspaceFolder: vscode.WorkspaceFolder | undefined,
+) {
   const fallback = portableBasename(document.fileName || document.uri.path || "Untitled");
-  const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
   if (!workspaceFolder) return fallback;
 
   const includeWorkspaceFolder = (vscode.workspace.workspaceFolders?.length ?? 0) > 1;
@@ -150,4 +155,57 @@ function displayFileName(document: vscode.TextDocument) {
     .replace(/^\.\/+/, "")
     .trim();
   return relative && !/^(?:[A-Za-z]:)?\//.test(relative) ? relative : fallback;
+}
+
+function sourceAnchor(
+  document: vscode.TextDocument,
+  content: string,
+  startLine: number,
+  endLine: number,
+  workspaceFolder: vscode.WorkspaceFolder | undefined,
+): NonNullable<ContextSnapshot["sourceAnchor"]> {
+  const beforeLineIndex = startLine - 2;
+  const afterLineIndex = endLine;
+  const beforeLine = lineText(document, beforeLineIndex);
+  const afterLine = lineText(document, afterLineIndex);
+  const relativePath = workspaceRelativePath(document, workspaceFolder);
+  return {
+    formatVersion: 1,
+    contentSha256: sourceAnchorSha256(content),
+    normalizedContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(content)),
+    documentVersion: document.version,
+    ...(beforeLine === undefined ? {} : { beforeLineSha256: sourceAnchorSha256(beforeLine) }),
+    ...(afterLine === undefined ? {} : { afterLineSha256: sourceAnchorSha256(afterLine) }),
+    ...(relativePath ? { workspaceRelativePath: relativePath } : {}),
+  };
+}
+
+function lineText(document: vscode.TextDocument, lineIndex: number) {
+  if (lineIndex < 0 || lineIndex >= document.lineCount) return undefined;
+  return document.lineAt(lineIndex).text;
+}
+
+function workspaceRelativePath(
+  document: vscode.TextDocument,
+  workspaceFolder: vscode.WorkspaceFolder | undefined,
+) {
+  if (!workspaceFolder) return undefined;
+  const includeWorkspaceFolder = (vscode.workspace.workspaceFolders?.length ?? 0) > 1;
+  const relative = vscode.workspace
+    .asRelativePath(document.uri, includeWorkspaceFolder)
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "");
+  if (
+    relative.length === 0 ||
+    relative.length > 1_024 ||
+    relative.startsWith("/") ||
+    /^[A-Za-z]:\//u.test(relative) ||
+    /[\\:\p{Cc}\p{Cf}]/u.test(relative)
+  ) {
+    return undefined;
+  }
+  const segments = relative.split("/");
+  return segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    ? undefined
+    : relative;
 }

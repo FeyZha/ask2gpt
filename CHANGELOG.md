@@ -3,6 +3,28 @@
 All notable changes to Ask2GPT are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-08-09
+
+### Added
+
+- Durable `SourceAnchorV1` provenance for captured contexts, including exact and normalized content
+  hashes, document version, optional adjacent-line hashes, and a workspace-relative path.
+
+### Changed
+
+- Trusted source-trace hints are now derived by the Host only from attachments on the nearest user
+  turn before an answer. Derivation is cached, limited to the active conversation, and bounded by
+  message and payload budgets. Unattached file and symbol references remain ordinary text.
+- **Find Related Turn** now requires same-URI unique content evidence. A successful trace keeps the
+  exact turn and matched context card highlighted until the user clears it.
+
+### Security
+
+- Selection navigation fails closed when its exact snapshot is missing or repeated, and symbol
+  providers cannot escape the attached evidence. Historical whole-file references require exact,
+  normalized, uniquely relocated, or adjacent-anchor evidence after a change. Rename/move recovery
+  never searches the workspace for a guessed replacement URI.
+
 ## [0.1.0] - 2026-08-08
 
 ### Added

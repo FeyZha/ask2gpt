@@ -1,6 +1,6 @@
 # Ask2GPT — Chrome Relay 编程助手：架构与安全边界
 
-本文描述 0.1.0 和 Relay 协议 v15。
+本文描述 0.1.1 和 Relay 协议 v15。
 
 产品架构目标是在 VS Code 中提供 Codex 风格的对话体验，同时使用用户已登录的 ChatGPT 网页
 会话作为回答来源：模型、消息、流式回答、标题和当前可见历史以 ChatGPT 页面为事实来源。
@@ -192,15 +192,28 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 ### 源码追踪
 
 - 待发送和已发送的上下文卡片只向 Host 发送 `conversationId + contextId`；Host 从权威
-  `AppState` 反查 URI、打开文档，并优先用快照内容在当前文档中做唯一重定位。
-- 回答中的 `file:line` 与明确函数引用由 Markdown AST 标成轻量按钮。Webview 只发送
+  `AppState` 反查 URI，并统一校验 `file`、`untitled`、`vscode-remote` scheme、文件 basename
+  和敏感文件策略。selection 必须以精确快照在当前文档中唯一重定位；内容缺失或重复时分别按
+  stale/ambiguous fail closed，不静默使用旧行号。整文件附件只接受 raw/normalized hash、唯一原文
+  或唯一邻接行锚点证明的范围；回答行号与函数定位复用同一解析器，不把当前同号行伪装成原引用。
+- Host 只从每条 assistant 前最近一条 user turn 的附件和终态回答派生 `SourceTraceHint`；只有
+  已证明落在这些附件内的 `file:line` 和定义名进入 Webview 可点击白名单，未附加引用保持普通文本。
+  派生范围仅限当前活动会话，并缓存未变化的会话；单次最多检查最近 200 条终态 assistant，且对
+  文件引用与符号总数设上限，避免长期历史阻塞 Extension Host 或膨胀 Webview 状态。
+- 点击回答中的源码按钮时，Webview 只发送
   `conversationId + assistantMessageId + kind + reference`，不发送 URI；Host 必须重新解析权威
-  assistant markdown，确认引用真实存在，再只在该回答之前已附加的 context 和附件别名中解析。
+  assistant markdown，确认引用真实存在，再只在最近 user turn 的 context 和附件别名中解析。
 - 函数定位仅对这些已附加 URI 调用只读的 Document Symbol Provider；无语言服务时可从有界快照
-  的定义索引回退。文件名或定义有歧义时使用 VS Code QuickPick，不随机选择。
-- “查找关联对话”在命令点击时扫描加密状态中已发送 user message 的 context 快照，以相同 URI、
-  内容和行范围匹配当前选区；命中后先切换权威会话，再发送 `revealTurn` 让 Webview 滚动并短暂标记。
-- 源码追踪不会调用工作区文件枚举或搜索；未在该轮明确附加的文件不会因回答文本而被打开。
+  的定义索引回退，且定义范围仍必须位于附件证据内。文件名或定义有歧义时使用 VS Code QuickPick，
+  不随机选择。
+- 每个捕获上下文随加密会话持久化 `SourceAnchorV1`：精确内容与规范化内容 SHA-256、文档版本、
+  可选邻接行 SHA-256 和工作区相对路径。它只补充来源与重定位证据，不授权读取其他文件；较新、
+  当前版本无法识别的 anchor 会被丢弃但不会导致整段对话不可读。
+- “查找关联对话”只扫描加密状态中已发送 user message 的 context 快照，并要求相同 URI 与唯一
+  内容关系；仅行号重叠不构成证据。命中后先切换权威会话，再以精确 `contextId` 发送
+  `revealTurn`；问题轮次和对应上下文卡片持续强调，直到用户手动清除。
+- 源码追踪不会调用工作区文件枚举或搜索；未在最近 user turn 明确附加的文件不会因回答文本而
+  被打开。文件重命名或移动后，原 URI 反查可能失效，系统不会搜索工作区猜测替代路径。
 
 ### 后台模型同步
 
@@ -322,8 +335,9 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 240px、320px 和 400px 下保持单栏，菜单、文件名、预览和操作按钮不越界。
 - 流式 Markdown 只替换当前快照，不重新挂载整段消息或重播入场动画。
 - `prefers-reduced-motion` 下关闭非必要动画和顺滑滚动，保留等价状态文本。
-- 回答源码引用使用点状下划线、图标与真实按钮；反查轮次显示短暂左侧追踪条和“匹配此选区”标签，
-  在高对比与 reduced-motion 模式仍保留非颜色状态。
+- 回答源码引用使用点状下划线、图标与真实按钮；反查轮次显示左侧追踪条和“匹配此选区”标签，
+  同时强调精确命中的上下文卡片，并保持到用户手动清除；高对比与 reduced-motion 模式仍保留
+  非颜色状态。
 
 ## 不可信边界与隐私
 

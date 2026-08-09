@@ -13,8 +13,49 @@ import {
   makeRelayStatusRequestPayload,
   safeParseRelayEnvelope,
 } from "./index";
+import type { ContextSnapshot, SourceAnchorV1 } from "./index";
 
 describe("relay protocol", () => {
+  it("keeps source anchors versioned while legacy context snapshots remain valid", () => {
+    const sourceAnchor: SourceAnchorV1 = {
+      formatVersion: 1,
+      contentSha256: "a".repeat(64),
+      normalizedContentSha256: "b".repeat(64),
+      documentVersion: 7,
+      beforeLineSha256: "c".repeat(64),
+      afterLineSha256: "d".repeat(64),
+      workspaceRelativePath: "src/index.ts",
+    };
+    const current: ContextSnapshot = {
+      id: "context-current",
+      kind: "selection",
+      fileName: "src/index.ts",
+      uri: "file:///workspace/src/index.ts",
+      language: "typescript",
+      startLine: 2,
+      endLine: 2,
+      content: "const answer = 42;",
+      charCount: 18,
+      unsaved: false,
+      sourceAnchor,
+    };
+    const legacy: ContextSnapshot = {
+      id: "context-legacy",
+      kind: "file",
+      fileName: "legacy.ts",
+      uri: "file:///workspace/legacy.ts",
+      language: "typescript",
+      startLine: 1,
+      endLine: 1,
+      content: "export {};",
+      charCount: 10,
+      unsaved: false,
+    };
+
+    expect(current.sourceAnchor).toEqual(sourceAnchor);
+    expect(legacy.sourceAnchor).toBeUndefined();
+  });
+
   it("classifies conversation placeholders and accessibility navigation as generic titles", () => {
     for (const title of [
       "New chat",

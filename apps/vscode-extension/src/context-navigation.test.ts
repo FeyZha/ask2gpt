@@ -31,11 +31,16 @@ vi.mock("vscode", () => {
     Selection,
     TextEditorRevealType: { InCenterIfOutsideViewport: 2 },
     Uri: {
-      parse: (value: string) => ({
-        fsPath: value.replace(/^file:\/\//u, ""),
-        path: value.replace(/^file:\/\//u, ""),
-        toString: () => value,
-      }),
+      parse: (value: string) => {
+        const scheme = /^([A-Za-z][A-Za-z\d+.-]*):/u.exec(value)?.[1]?.toLowerCase();
+        if (!scheme) throw new Error("Invalid URI");
+        const path =
+          scheme === "file"
+            ? value.replace(/^file:\/\//u, "")
+            : (/^[A-Za-z][A-Za-z\d+.-]*:\/\/[^/]+(\/.*)$/u.exec(value)?.[1] ??
+              value.slice(scheme.length + 1));
+        return { scheme, fsPath: path, path, toString: () => value };
+      },
     },
     window: { showTextDocument: vscodeMock.showTextDocument },
     workspace: { openTextDocument: vscodeMock.openTextDocument },
@@ -45,6 +50,7 @@ vi.mock("vscode", () => {
 import type { ContextSnapshot } from "@ask2gpt/protocol";
 
 import { openContextFromState, resolveContextFromState } from "./context-navigation";
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "./source-anchor";
 import type { AppState } from "./types";
 
 describe("context navigation", () => {
@@ -125,11 +131,11 @@ describe("context navigation", () => {
   });
 
   it.each([
-    ["missing", "not-present", "before\nafter"],
-    ["repeated", "same", "same\nsame"],
+    ["missing", "not-present", "before\nafter", "CONTEXT_RANGE_STALE"],
+    ["repeated", "same", "same\nsame", "CONTEXT_RANGE_AMBIGUOUS"],
   ])(
-    "falls back to the original line range when selection content is %s",
-    async (_case, content, source) => {
+    "rejects a %s selection snapshot instead of trusting its old line number",
+    async (_case, content, source, code) => {
       const document = textDocument(source);
       const editor = {
         selection: undefined as unknown,
@@ -143,15 +149,91 @@ describe("context navigation", () => {
         startLine: 2,
       });
 
-      await openContextFromState(appState(selected), "conversation-a", "fallback-context");
-
-      expect(editor.selection).toMatchObject({
-        start: { line: 1, character: 0 },
-        end: { line: 1, character: source.split("\n")[1]!.length },
-      });
-      expect(editor.revealRange).toHaveBeenCalledWith(editor.selection, 2);
+      await expect(
+        openContextFromState(appState(selected), "conversation-a", "fallback-context"),
+      ).rejects.toMatchObject({ code });
+      expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
     },
   );
+
+  it("accepts a normalized full-file anchor without trusting stale line metadata", async () => {
+    const captured = "alpha  \r\nbeta\t ";
+    const document = textDocument("alpha\nbeta");
+    const editor = { selection: undefined as unknown, revealRange: vi.fn() };
+    vscodeMock.openTextDocument.mockResolvedValue(document);
+    vscodeMock.showTextDocument.mockResolvedValue(editor);
+    const file = anchoredContext("normalized-file", captured, {
+      endLine: 2,
+      kind: "current-file",
+    });
+
+    await openContextFromState(appState(file), "conversation-a", file.id);
+
+    expect(editor.selection).toMatchObject({
+      start: { line: 0, character: 0 },
+      end: { line: 1, character: 4 },
+    });
+  });
+
+  it("relocates a full-file snapshot after lines are inserted outside the snapshot", async () => {
+    const captured = "alpha\nbeta";
+    const document = textDocument("inserted\nalpha\nbeta");
+    const editor = { selection: undefined as unknown, revealRange: vi.fn() };
+    vscodeMock.openTextDocument.mockResolvedValue(document);
+    vscodeMock.showTextDocument.mockResolvedValue(editor);
+    const file = anchoredContext("inserted-file", captured, {
+      endLine: 2,
+      kind: "file",
+    });
+
+    await openContextFromState(appState(file), "conversation-a", file.id);
+
+    expect(editor.selection).toMatchObject({
+      start: { line: 1, character: 0 },
+      end: { line: 2, character: 4 },
+    });
+  });
+
+  it.each([
+    ["inserted inside", "alpha\ninserted\nbeta", "CONTEXT_RANGE_STALE"],
+    ["deleted", "alpha", "CONTEXT_RANGE_STALE"],
+    ["replaced in place", "gamma\ndelta", "CONTEXT_RANGE_STALE"],
+    ["repeated", "alpha\nbeta\nseparator\nalpha\nbeta", "CONTEXT_RANGE_AMBIGUOUS"],
+  ])("rejects a full-file snapshot that is %s", async (_case, source, code) => {
+    const file = anchoredContext("drifted-file", "alpha\nbeta", {
+      endLine: 2,
+      kind: "file",
+    });
+    vscodeMock.openTextDocument.mockResolvedValue(textDocument(source));
+
+    await expect(
+      openContextFromState(appState(file), "conversation-a", file.id),
+    ).rejects.toMatchObject({ code });
+    expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
+  });
+
+  it("uses a unique pair of adjacent-line hashes to relocate a bounded file snapshot", async () => {
+    const document = textDocument("header\nBEGIN\nnew one\nnew two\nEND\nfooter");
+    const editor = { selection: undefined as unknown, revealRange: vi.fn() };
+    vscodeMock.openTextDocument.mockResolvedValue(document);
+    vscodeMock.showTextDocument.mockResolvedValue(editor);
+    const file = anchoredContext("neighbor-file", "old one\nold two", {
+      endLine: 11,
+      kind: "file",
+      startLine: 10,
+      sourceAnchor: sourceAnchor("old one\nold two", {
+        beforeLineSha256: sourceAnchorSha256("BEGIN"),
+        afterLineSha256: sourceAnchorSha256("END"),
+      }),
+    });
+
+    await openContextFromState(appState(file), "conversation-a", file.id);
+
+    expect(editor.selection).toMatchObject({
+      start: { line: 2, character: 0 },
+      end: { line: 3, character: 7 },
+    });
+  });
 
   it("rejects missing or stale host context instead of opening a webview-supplied target", async () => {
     const state = appState(context("pending-context", "file:///workspace/pending.ts"));
@@ -175,7 +257,7 @@ describe("context navigation", () => {
       ),
     ).rejects.toMatchObject({
       code: "CONTEXT_RANGE_STALE",
-      message: "The file changed and the attached line range is no longer available.",
+      message: "The file changed and the attached code is no longer available.",
     });
     expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
 
@@ -193,10 +275,49 @@ describe("context navigation", () => {
         "repeated-stale-context",
       ),
     ).rejects.toMatchObject({
-      code: "CONTEXT_RANGE_STALE",
-      message: "The file changed and the attached line range is no longer available.",
+      code: "CONTEXT_RANGE_AMBIGUOUS",
+      message: "The attached code now appears more than once in the file.",
     });
     expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unsupported scheme", "https://evil.example/source.ts", "source.ts"],
+    ["mismatched basename", "file:///workspace/other.ts", "source.ts"],
+  ])("rejects an untrusted context URI with an %s", async (_case, uri, fileName) => {
+    const selected = context("untrusted-context", uri, { fileName });
+
+    await expect(
+      openContextFromState(appState(selected), "conversation-a", "untrusted-context"),
+    ).rejects.toMatchObject({ code: "CONTEXT_TARGET_UNTRUSTED" });
+    expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["untitled", "untitled:source.ts"],
+    ["remote", "vscode-remote://ssh-remote+host/workspace/source.ts"],
+  ])("opens a trusted %s editor context", async (_case, uri) => {
+    vscodeMock.openTextDocument.mockResolvedValue(textDocument("value"));
+    vscodeMock.showTextDocument.mockResolvedValue({
+      selection: undefined,
+      revealRange: vi.fn(),
+    });
+    const selected = context("trusted-context", uri, { fileName: "source.ts" });
+
+    await openContextFromState(appState(selected), "conversation-a", "trusted-context");
+
+    expect(vscodeMock.openTextDocument).toHaveBeenCalledOnce();
+  });
+
+  it("applies sensitive-file policy to both captured filenames and URI targets", async () => {
+    const selected = context("sensitive-context", "file:///workspace/.env", {
+      fileName: ".env",
+    });
+
+    await expect(
+      openContextFromState(appState(selected), "conversation-a", "sensitive-context"),
+    ).rejects.toMatchObject({ code: "SENSITIVE_CONTEXT" });
+    expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
   });
 });
 
@@ -216,6 +337,28 @@ function context(
     content: "value",
     charCount: 5,
     unsaved: false,
+    ...overrides,
+  };
+}
+
+function anchoredContext(id: string, content: string, overrides: Partial<ContextSnapshot> = {}) {
+  return context(id, `file:///workspace/${id}.ts`, {
+    content,
+    charCount: content.length,
+    sourceAnchor: sourceAnchor(content),
+    ...overrides,
+  });
+}
+
+function sourceAnchor(
+  content: string,
+  overrides: Partial<NonNullable<ContextSnapshot["sourceAnchor"]>> = {},
+) {
+  return {
+    formatVersion: 1 as const,
+    contentSha256: sourceAnchorSha256(content),
+    normalizedContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(content)),
+    documentVersion: 3,
     ...overrides,
   };
 }
@@ -306,6 +449,7 @@ function textDocument(content: string) {
   return {
     lineCount: lines.length,
     lineAt: (line: number) => ({
+      text: lines[line]!,
       range: {
         start: { line, character: 0 },
         end: { line, character: lines[line]!.length },

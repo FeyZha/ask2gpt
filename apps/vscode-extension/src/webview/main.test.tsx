@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { ContextSnapshot } from "@ask2gpt/protocol";
@@ -1791,11 +1791,19 @@ describe("Ask2GPT webview", () => {
       {
         id: "assistant-stream",
         role: "assistant",
-        markdown: "partial",
+        markdown: "partial stable.ts:1",
         status: "streaming",
         createdAt: new Date().toISOString(),
       },
     );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "assistant-stream": {
+          fileReferences: ["stable.ts:1"],
+          sourceSymbols: [],
+        },
+      },
+    };
     state.conversations[0]!.run = {
       id: "run-stream",
       messageId: "assistant-stream",
@@ -1807,23 +1815,98 @@ describe("Ask2GPT webview", () => {
     const contextButton = await screen.findByRole("button", {
       name: "预览上下文: stable.ts",
     });
+    expect(document.querySelector(".source-reference")).toBeNull();
     sendHostMessage({
       type: "generationUpdate",
       update: {
         conversationId: "conversation-1",
         messageId: "assistant-stream",
         runId: "run-stream",
-        markdown: "compact snapshot",
+        markdown: "compact snapshot stable.ts:1",
         updatedAt: "2026-07-25T00:00:01.000Z",
       },
     });
 
-    expect(await screen.findByText("compact snapshot")).toBeTruthy();
+    expect(await screen.findByText(/compact snapshot stable\.ts:1/u)).toBeTruthy();
+    expect(document.querySelector(".source-reference")).toBeNull();
     expect(
       screen.getByRole("button", {
         name: "预览上下文: stable.ts",
       }),
     ).toBe(contextButton);
+  });
+
+  it("only exposes terminal source hints and ignores a late compact streaming frame", async () => {
+    render(<App />);
+    const streaming = makeState();
+    streaming.locale = "en";
+    streaming.conversations[0]!.messages.push(
+      {
+        id: "user-source-race",
+        role: "user",
+        markdown: "Locate this code",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:00.000Z",
+        contexts: [
+          makeContext({
+            id: "source-race-context",
+            fileName: "race.ts",
+            startLine: 1,
+            endLine: 12,
+          }),
+        ],
+      },
+      {
+        id: "assistant-source-race",
+        role: "assistant",
+        markdown: "Partial answer at race.ts:4",
+        status: "streaming",
+        createdAt: "2026-07-25T00:00:01.000Z",
+      },
+    );
+    streaming.sourceTraceHints = {
+      "conversation-1": {
+        "assistant-source-race": {
+          fileReferences: ["race.ts:4"],
+          sourceSymbols: [],
+        },
+      },
+    };
+    streaming.conversations[0]!.run = {
+      id: "run-source-race",
+      messageId: "assistant-source-race",
+      status: "streaming",
+      startedAt: "2026-07-25T00:00:01.000Z",
+    };
+    sendHostMessage({ type: "state", state: streaming });
+
+    expect(await screen.findByText(/Partial answer at race\.ts:4/u)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open race.ts:4 in the editor" })).toBeNull();
+
+    const terminal = structuredClone(streaming);
+    terminal.conversations[0]!.run = undefined;
+    terminal.conversations[0]!.messages[1]!.markdown = "Complete answer at race.ts:4";
+    terminal.conversations[0]!.messages[1]!.status = "complete";
+    sendHostMessage({ type: "state", state: terminal });
+
+    const sourceAction = await screen.findByRole("button", {
+      name: "Open race.ts:4 in the editor",
+    });
+    expect(screen.getByText(/Complete answer at/u)).toBeTruthy();
+
+    sendHostMessage({
+      type: "generationUpdate",
+      update: {
+        conversationId: "conversation-1",
+        messageId: "assistant-source-race",
+        runId: "run-source-race",
+        markdown: "Late compact answer at race.ts:4",
+        updatedAt: "2026-07-25T00:00:03.000Z",
+      },
+    });
+
+    expect(screen.queryByText(/Late compact answer/u)).toBeNull();
+    expect(screen.getByRole("button", { name: "Open race.ts:4 in the editor" })).toBe(sourceAction);
   });
 
   it("buffers hidden streaming updates, restores the newest one, and never revives it after terminal state", async () => {
@@ -2594,8 +2677,7 @@ describe("Ask2GPT webview", () => {
     });
   });
 
-  it("reveals a host-selected turn and clears its trace label after the emphasis window", async () => {
-    vi.useFakeTimers();
+  it("reveals the exact context in a host-selected turn until the user clears it", async () => {
     render(<App />);
     const state = makeState();
     state.locale = "en";
@@ -2620,6 +2702,11 @@ describe("Ask2GPT webview", () => {
         markdown: "Question that used this selection",
         status: "complete",
         createdAt: "2026-07-25T00:00:03.000Z",
+        contexts: [
+          makeContext({ id: "trace-context-1", fileName: "first.ts" }),
+          makeContext({ id: "trace-context-2", fileName: "second.ts" }),
+          makeContext({ id: "trace-context-3", fileName: "matched.ts" }),
+        ],
       },
       {
         id: "answer-trace-target",
@@ -2641,24 +2728,86 @@ describe("Ask2GPT webview", () => {
       type: "revealTurn",
       conversationId: "conversation-1",
       messageId: "question-trace-target",
+      contextId: "trace-context-3",
     });
 
-    const label = within(target).getByText("Matched selection", {
-      selector: ".message-trace-label",
-    });
+    const label = within(target).getByRole("status");
+    expect(label.textContent).toContain("Matched selection");
     expect(label.getAttribute("role")).toBe("status");
+    expect(within(label).queryByRole("button")).toBeNull();
     expect(target.classList.contains("message--trace-target")).toBe(true);
     expect(scrollIntoView).toHaveBeenCalledWith({
       behavior: "smooth",
       block: "start",
       inline: "nearest",
     });
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "auto",
+      block: "nearest",
+      inline: "nearest",
+    });
 
-    await act(() => vi.advanceTimersByTimeAsync(2_799));
-    expect(within(target).getByText("Matched selection")).toBeTruthy();
-    await act(() => vi.advanceTimersByTimeAsync(1));
+    const matchedContext = within(target).getByText("matched.ts").closest(".sent-context");
+    expect(matchedContext?.classList.contains("sent-context--trace-target")).toBe(true);
+    expect(within(matchedContext as HTMLElement).getByText("Linked")).toBeTruthy();
+    const matchedContextOpen = (matchedContext as HTMLElement).querySelector<HTMLButtonElement>(
+      ".sent-context__open",
+    )!;
+
+    fireEvent.click(within(target).getByRole("button", { name: "Clear selection match" }));
     expect(within(target).queryByText("Matched selection")).toBeNull();
     expect(target.classList.contains("message--trace-target")).toBe(false);
+    expect(matchedContext?.classList.contains("sent-context--trace-target")).toBe(false);
+    await waitFor(() => expect(document.activeElement).toBe(matchedContextOpen));
+
+    const switchedState = structuredClone(state);
+    switchedState.activeConversationId = "conversation-2";
+    switchedState.modelPicker.conversationId = "conversation-2";
+    switchedState.conversations.push({
+      id: "conversation-2",
+      title: "Another conversation",
+      createdAt: "2026-07-25T00:00:05.000Z",
+      updatedAt: "2026-07-25T00:00:05.000Z",
+      messages: [],
+    });
+    sendHostMessage({ type: "state", state: switchedState });
+    expect(screen.queryByText("Question that used this selection")).toBeNull();
+
+    sendHostMessage({ type: "state", state });
+    const remountedTarget = screen
+      .getAllByRole("article", { name: "Your question" })
+      .find((article) => article.textContent?.includes("Question that used this selection"))!;
+    expect(within(remountedTarget).queryByText("Matched selection")).toBeNull();
+    expect(remountedTarget.classList.contains("message--trace-target")).toBe(false);
+    fireEvent.click(
+      within(remountedTarget).getByRole("button", { name: "Show more code context" }),
+    );
+    expect(
+      within(remountedTarget)
+        .getByText("matched.ts")
+        .closest(".sent-context")
+        ?.classList.contains("sent-context--trace-target"),
+    ).toBe(false);
+  });
+
+  it("keeps actionable warnings visible until dismissal while informational notices expire", async () => {
+    vi.useFakeTimers();
+    render(<App />);
+    sendHostMessage({ type: "state", state: makeState() });
+
+    sendHostMessage({ type: "notice", level: "warning", message: "The source file changed." });
+    const warning = screen.getByText("The source file changed.").closest(".toast") as HTMLElement;
+    expect(warning).toBeTruthy();
+
+    await act(() => vi.advanceTimersByTimeAsync(8_000));
+    expect(screen.getByText("The source file changed.")).toBeTruthy();
+    fireEvent.click(within(warning).getByRole("button", { name: "关闭提示" }));
+    expect(screen.queryByText("The source file changed.")).toBeNull();
+
+    sendHostMessage({ type: "notice", level: "info", message: "Copied." });
+    expect(screen.getByText("Copied.")).toBeTruthy();
+    await act(() => vi.advanceTimersByTimeAsync(2_600));
+    expect(screen.queryByText("Copied.")).toBeNull();
   });
 
   it("tracks the current prompt in the question rail while the transcript scrolls", async () => {
@@ -3502,6 +3651,14 @@ describe("Ask2GPT webview", () => {
         createdAt: "2026-07-25T00:00:02.000Z",
       },
     );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "answer-source-links": {
+          fileReferences: ["06_vector_store.py:34", "06_vector_store.py:35-36"],
+          sourceSymbols: [],
+        },
+      },
+    };
     sendHostMessage({ type: "state", state });
 
     const plain = await screen.findByRole("button", {
@@ -3553,6 +3710,25 @@ describe("Ask2GPT webview", () => {
     });
   });
 
+  it("leaves file and symbol references inert without host authorization", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push({
+      id: "answer-without-source-hints",
+      role: "assistant",
+      markdown: "See missing.py:10 and `missing.py:11`, then call `missing_helper()`.",
+      status: "complete",
+      createdAt: "2026-07-25T00:00:01.000Z",
+    });
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText(/See missing\.py:10/u)).toBeTruthy();
+    expect(screen.getByText("missing.py:11", { selector: "code" })).toBeTruthy();
+    expect(screen.getByText("missing_helper()", { selector: "code" })).toBeTruthy();
+    expect(document.querySelector(".source-reference")).toBeNull();
+  });
+
   it("links known attached functions while leaving unknown inline code unchanged", async () => {
     render(<App />);
     const state = makeState();
@@ -3569,7 +3745,7 @@ describe("Ask2GPT webview", () => {
             id: "symbol-source",
             fileName: "06_vector_store.py",
             language: "python",
-            content: "endpoint = get_embeddings_endpoint()",
+            content: "def get_embeddings_endpoint():\n    return endpoint",
             startLine: 21,
             endLine: 22,
           }),
@@ -3583,6 +3759,14 @@ describe("Ask2GPT webview", () => {
         createdAt: "2026-07-25T00:00:02.000Z",
       },
     );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "answer-symbol-link": {
+          fileReferences: [],
+          sourceSymbols: ["get_embeddings_endpoint"],
+        },
+      },
+    };
     sendHostMessage({ type: "state", state });
 
     const known = await screen.findByRole("button", {
@@ -3598,6 +3782,66 @@ describe("Ask2GPT webview", () => {
       kind: "symbol",
       reference: "get_embeddings_endpoint()",
     });
+  });
+
+  it("does not borrow source authorization across a newer user turn without context", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push(
+      {
+        id: "older-question-with-source",
+        role: "user",
+        markdown: "Explain the old source",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:01.000Z",
+        contexts: [
+          makeContext({
+            id: "older-source",
+            fileName: "older.py",
+            language: "python",
+            content: "def older_helper():\n    return True",
+            startLine: 1,
+            endLine: 2,
+          }),
+        ],
+      },
+      {
+        id: "older-answer-with-hints",
+        role: "assistant",
+        markdown: "See older.py:1 and `older_helper()`.",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:02.000Z",
+      },
+      {
+        id: "newer-question-without-source",
+        role: "user",
+        markdown: "What about this new turn?",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:03.000Z",
+      },
+      {
+        id: "newer-answer-without-hints",
+        role: "assistant",
+        markdown: "See older.py:1 and `older_helper()`.",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:04.000Z",
+      },
+    );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "older-answer-with-hints": {
+          fileReferences: ["older.py:1"],
+          sourceSymbols: ["older_helper"],
+        },
+      },
+    };
+    sendHostMessage({ type: "state", state });
+
+    const answers = await screen.findAllByRole("article", { name: "Answer" });
+    expect(answers[0]!.querySelectorAll(".source-reference")).toHaveLength(2);
+    expect(answers[1]!.querySelector(".source-reference")).toBeNull();
+    expect(within(answers[1]!).getByText("older_helper()", { selector: "code" })).toBeTruthy();
   });
 
   it("blocks sending until first-time chat setup completes", async () => {

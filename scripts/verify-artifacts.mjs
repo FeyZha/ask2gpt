@@ -316,11 +316,32 @@ function assertTraceabilityBundles(extensionBundle, webviewBundle, styles) {
   const extensionMarkers = [
     "ask2gpt.findRelatedTurn",
     "openSourceReference",
+    "sourceTraceHints",
+    "source-trace-policy:active-only;assistant=200;file-references=1000;symbols=4096",
+    "sourceAnchor",
+    "contentSha256",
+    "normalizedContentSha256",
+    "documentVersion",
+    "beforeLineSha256",
+    "afterLineSha256",
+    "workspaceRelativePath",
     "vscode.executeDocumentSymbolProvider",
+    "CONTEXT_RANGE_AMBIGUOUS",
     "SOURCE_CONTEXT_UNTRUSTED",
   ];
-  const webviewMarkers = ["openSourceReference", "source.ask2gpt.invalid", "source-reference"];
-  const styleMarkers = [".source-reference", ".source-reference:focus-visible"];
+  const webviewMarkers = [
+    "openSourceReference",
+    "sourceTraceHints",
+    "source.ask2gpt.invalid",
+    "source-reference",
+    "Clear selection match",
+  ];
+  const styleMarkers = [
+    ".source-reference",
+    ".source-reference:focus-visible",
+    ".message-trace-label",
+    ".sent-context--trace-target",
+  ];
   const missing = [
     ...extensionMarkers.filter((marker) => !extensionBundle.includes(marker)),
     ...webviewMarkers.filter((marker) => !webviewBundle.includes(marker)),

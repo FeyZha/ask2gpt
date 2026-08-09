@@ -1,6 +1,6 @@
 {
   "name": "ask2gpt-workspace",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Ask project code in VS Code through your signed-in ChatGPT web session.",
   "license": "MIT",

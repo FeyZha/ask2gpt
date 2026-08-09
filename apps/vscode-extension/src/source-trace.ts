@@ -6,9 +6,17 @@ import {
   extractAnswerSourceDefinitions,
   normalizeAnswerSourceSymbol,
 } from "./answer-source-symbol";
+import {
+  findUniqueContextSnapshotRange,
+  resolveNonSelectionSnapshotRange,
+} from "./context-navigation";
 import { assertAllowedContextFile } from "./services/context-policy";
 import { Ask2GPTError } from "./services/errors";
 import { planContextDelivery } from "./services/prompt-builder";
+import {
+  trustedContextUri as resolveTrustedContextUri,
+  TrustedContextUriError,
+} from "./trusted-context-uri";
 import type { AppState } from "./types";
 
 interface TraceContext {
@@ -28,8 +36,6 @@ interface SymbolLocation {
   document: vscode.TextDocument;
   range: vscode.Range;
 }
-
-const ALLOWED_CONTEXT_URI_SCHEMES = new Set(["file", "untitled", "vscode-remote"]);
 
 export async function openAnswerSourceReferenceFromState(
   state: AppState,
@@ -75,17 +81,17 @@ export async function openAnswerSymbolFromState(
     throw traceError(state.locale, "SOURCE_SYMBOL_STALE");
   }
 
-  const groups = traceContextGroupsBefore(conversation, messageIndex);
+  const contexts = traceContextsBefore(conversation, messageIndex);
   const leaf = requested.split(".").at(-1)!;
-  for (const group of groups) {
-    const relevant = group.filter(({ context }) => containsSymbol(context.content, leaf));
-    if (relevant.length === 0) continue;
+  const relevant = contexts.filter(({ context }) => containsSymbol(context.content, leaf));
+  if (relevant.length > 0) {
     const locations = await resolveSymbolLocations(relevant, requested, state.locale);
-    if (locations.length === 0) continue;
-    const selected = await chooseSymbolLocation(locations, requested, state.locale);
-    if (!selected) return;
-    await showRange(selected.document, selected.range);
-    return;
+    if (locations.length > 0) {
+      const selected = await chooseSymbolLocation(locations, requested, state.locale);
+      if (!selected) return;
+      await showRange(selected.document, selected.range);
+      return;
+    }
   }
 
   throw traceError(state.locale, "SOURCE_SYMBOL_NOT_FOUND");
@@ -114,11 +120,11 @@ function parseExactFileReference(reference: string) {
   return exact;
 }
 
-function traceContextGroupsBefore(conversation: Conversation, beforeIndex: number) {
-  const groups: TraceContext[][] = [];
+function traceContextsBefore(conversation: Conversation, beforeIndex: number) {
   for (let index = beforeIndex - 1; index >= 0; index -= 1) {
     const message = conversation.messages[index];
-    if (message?.role !== "user" || !message.contexts || message.contexts.length === 0) continue;
+    if (message?.role !== "user") continue;
+    if (!message.contexts || message.contexts.length === 0) return [];
     let delivery: ReturnType<typeof planContextDelivery> = [];
     try {
       delivery = planContextDelivery(message.contexts);
@@ -126,14 +132,12 @@ function traceContextGroupsBefore(conversation: Conversation, beforeIndex: numbe
       // Old encrypted records can outlive a tightened bundle policy. Original
       // host-owned filenames remain safe navigation evidence in that case.
     }
-    groups.push(
-      message.contexts.map((context) => ({
-        context,
-        attachmentFileName: delivery.find((item) => item.contextId === context.id)?.fileName,
-      })),
-    );
+    return message.contexts.map((context) => ({
+      context,
+      attachmentFileName: delivery.find((item) => item.contextId === context.id)?.fileName,
+    }));
   }
-  return groups;
+  return [];
 }
 
 function resolveFileReferenceCandidates(
@@ -141,19 +145,16 @@ function resolveFileReferenceCandidates(
   beforeIndex: number,
   reference: ReturnType<typeof parseExactFileReference>,
 ) {
-  for (const group of traceContextGroupsBefore(conversation, beforeIndex)) {
-    const matches = group.flatMap((candidate) => {
-      const match = fileNameMatch(reference.path, candidate);
-      if (!match) return [];
-      const location = sourceLinesForReference(candidate.context, reference, match.attachmentAlias);
-      if (!location) return [];
-      return [{ ...location, score: match.score }];
-    });
-    if (matches.length === 0) continue;
-    const bestScore = Math.max(...matches.map((match) => match.score));
-    return deduplicateSourceLocations(matches.filter((match) => match.score === bestScore));
-  }
-  return [];
+  const matches = traceContextsBefore(conversation, beforeIndex).flatMap((candidate) => {
+    const match = fileNameMatch(reference.path, candidate);
+    if (!match) return [];
+    const location = sourceLinesForReference(candidate.context, reference, match.attachmentAlias);
+    if (!location) return [];
+    return [{ ...location, score: match.score }];
+  });
+  if (matches.length === 0) return [];
+  const bestScore = Math.max(...matches.map((match) => match.score));
+  return deduplicateSourceLocations(matches.filter((match) => match.score === bestScore));
 }
 
 function fileNameMatch(referencePath: string, candidate: TraceContext) {
@@ -241,8 +242,41 @@ async function chooseSourceLocation(
 async function openLineLocation(location: ResolvedSourceLocation, locale: AppState["locale"]) {
   const uri = trustedContextUri(location.context, locale);
   const document = await vscode.workspace.openTextDocument(uri);
-  const startIndex = location.startLine - 1;
-  const endIndex = location.endLine - 1;
+  let startIndex = location.startLine - 1;
+  let endIndex = location.endLine - 1;
+  if (location.context.kind === "selection") {
+    const snapshot = findUniqueContextSnapshotRange(document, location.context.content);
+    if (snapshot.status !== "found") {
+      throw traceError(
+        locale,
+        snapshot.status === "ambiguous" ? "SOURCE_LINE_AMBIGUOUS" : "SOURCE_LINE_STALE",
+      );
+    }
+    const snapshotLineCount = location.context.content.split(/\r?\n/u).length;
+    const startOffset = location.startLine - location.context.startLine;
+    const endOffset = location.endLine - location.context.startLine;
+    if (startOffset < 0 || endOffset < startOffset || endOffset >= snapshotLineCount) {
+      throw traceError(locale, "SOURCE_LINE_STALE");
+    }
+    startIndex = snapshot.range.start.line + startOffset;
+    endIndex = snapshot.range.start.line + endOffset;
+  } else {
+    const snapshot = resolveNonSelectionSnapshotRange(document, location.context);
+    if (snapshot.status !== "found") {
+      throw traceError(
+        locale,
+        snapshot.status === "ambiguous" ? "SOURCE_LINE_AMBIGUOUS" : "SOURCE_LINE_STALE",
+      );
+    }
+    const startOffset = location.startLine - location.context.startLine;
+    const endOffset = location.endLine - location.context.startLine;
+    const snapshotLineCount = location.context.endLine - location.context.startLine + 1;
+    if (startOffset < 0 || endOffset < startOffset || endOffset >= snapshotLineCount) {
+      throw traceError(locale, "SOURCE_LINE_STALE");
+    }
+    startIndex = snapshot.range.start.line + startOffset;
+    endIndex = snapshot.range.start.line + endOffset;
+  }
   if (
     !Number.isInteger(startIndex) ||
     !Number.isInteger(endIndex) ||
@@ -287,6 +321,7 @@ async function resolveSymbolLocations(
   for (const { context } of contexts) {
     const uri = trustedContextUri(context, locale);
     const document = await vscode.workspace.openTextDocument(uri);
+    const evidenceRange = contextEvidenceRange(document, context, locale);
     let symbols: Array<vscode.DocumentSymbol | vscode.SymbolInformation> = [];
     try {
       symbols =
@@ -302,6 +337,7 @@ async function resolveSymbolLocations(
       if (symbol.name !== leaf) continue;
       if (symbol.uri && symbol.uri.toString(true) !== uri.toString(true)) continue;
       if (!isRangeInsideDocument(document, symbol.range)) continue;
+      if (!rangeContainsRange(evidenceRange, symbol.range)) continue;
       const containerMatch =
         !requestedContainer ||
         symbol.containerName === requestedContainer ||
@@ -319,21 +355,22 @@ async function resolveSymbolLocations(
     if (locations.some((location) => location.context.uri === context.uri)) continue;
     for (const definition of extractAnswerSourceDefinitions(context.content)) {
       if (definition.name !== leaf) continue;
-      const lineIndex = context.startLine - 1 + definition.lineOffset;
-      if (lineIndex < context.startLine - 1 || lineIndex > context.endLine - 1) continue;
+      const lineIndex = evidenceRange.start.line + definition.lineOffset;
       if (lineIndex < 0 || lineIndex >= document.lineCount) continue;
       const line = document.lineAt(lineIndex);
       const liveDefinition = extractAnswerSourceDefinitions(line.text).find(
         (candidate) => candidate.name === definition.name && candidate.lineOffset === 0,
       );
       if (!liveDefinition) continue;
+      const range = new vscode.Range(
+        new vscode.Position(lineIndex, liveDefinition.startCharacter),
+        new vscode.Position(lineIndex, liveDefinition.endCharacter),
+      );
+      if (!rangeContainsRange(evidenceRange, range)) continue;
       locations.push({
         context,
         document,
-        range: new vscode.Range(
-          new vscode.Position(lineIndex, liveDefinition.startCharacter),
-          new vscode.Position(lineIndex, liveDefinition.endCharacter),
-        ),
+        range,
         score: 250,
       });
     }
@@ -375,6 +412,28 @@ function flattenDocumentSymbols(
   });
 }
 
+function contextEvidenceRange(
+  document: vscode.TextDocument,
+  context: ContextSnapshot,
+  locale: AppState["locale"],
+) {
+  if (context.kind === "selection") {
+    const snapshot = findUniqueContextSnapshotRange(document, context.content);
+    if (snapshot.status === "found") return snapshot.range;
+    throw traceError(
+      locale,
+      snapshot.status === "ambiguous" ? "SOURCE_LINE_AMBIGUOUS" : "SOURCE_LINE_STALE",
+    );
+  }
+
+  const snapshot = resolveNonSelectionSnapshotRange(document, context);
+  if (snapshot.status === "found") return snapshot.range;
+  throw traceError(
+    locale,
+    snapshot.status === "ambiguous" ? "SOURCE_LINE_AMBIGUOUS" : "SOURCE_LINE_STALE",
+  );
+}
+
 async function chooseSymbolLocation(
   locations: SymbolLocation[],
   symbol: string,
@@ -403,22 +462,25 @@ async function showRange(document: vscode.TextDocument, range: vscode.Range) {
 }
 
 function trustedContextUri(context: ContextSnapshot, locale: AppState["locale"]) {
-  assertAllowedContextFile(context.fileName);
-  let uri: vscode.Uri;
   try {
-    uri = vscode.Uri.parse(context.uri, true);
-  } catch {
-    throw traceError(locale, "SOURCE_CONTEXT_UNTRUSTED");
+    return resolveTrustedContextUri(context);
+  } catch (error) {
+    if (error instanceof TrustedContextUriError) {
+      throw traceError(locale, "SOURCE_CONTEXT_UNTRUSTED");
+    }
+    throw error;
   }
-  if (!ALLOWED_CONTEXT_URI_SCHEMES.has(uri.scheme.toLowerCase())) {
-    throw traceError(locale, "SOURCE_CONTEXT_UNTRUSTED");
-  }
-  const targetPath = uri.fsPath || uri.path || context.fileName;
-  assertAllowedContextFile(targetPath);
-  if (pathBaseName(normalizePath(targetPath)) !== pathBaseName(normalizePath(context.fileName))) {
-    throw traceError(locale, "SOURCE_CONTEXT_UNTRUSTED");
-  }
-  return uri;
+}
+
+function rangeContainsRange(outer: vscode.Range, inner: vscode.Range) {
+  return (
+    comparePositions(outer.start, inner.start) <= 0 && comparePositions(inner.end, outer.end) <= 0
+  );
+}
+
+function comparePositions(left: vscode.Position, right: vscode.Position) {
+  if (left.line !== right.line) return left.line - right.line;
+  return left.character - right.character;
 }
 
 function isRangeInsideDocument(document: vscode.TextDocument, range: vscode.Range) {
@@ -471,6 +533,10 @@ function traceError(locale: AppState["locale"], code: string) {
     SOURCE_LINE_STALE: {
       en: "The referenced line range is no longer available in the file.",
       "zh-CN": "文件中已找不到回答引用的行范围。",
+    },
+    SOURCE_LINE_AMBIGUOUS: {
+      en: "The attached code now appears more than once in the file.",
+      "zh-CN": "附加的代码目前在文件中出现多次，无法唯一定位。",
     },
     SOURCE_CONTEXT_UNTRUSTED: {
       en: "The attached source target is not a trusted editor document.",

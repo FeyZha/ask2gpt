@@ -10,8 +10,8 @@ interface WorkspaceState {
 }
 
 /**
- * Keeps the pre-0.1.4 workspace namespace stable for conversation history and
- * for the primary relay route.
+ * Keeps the legacy workspace namespace stable for conversation history and the
+ * primary relay route.
  */
 export async function resolveStorageNamespaceId(
   workspaceState: WorkspaceState,

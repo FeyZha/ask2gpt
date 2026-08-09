@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const vscodeMock = vi.hoisted(() => ({
@@ -49,6 +51,7 @@ describe("ContextService", () => {
     vscodeMock.workspace.openTextDocument.mockReset();
     vscodeMock.workspace.getWorkspaceFolder.mockReset();
     vscodeMock.workspace.getWorkspaceFolder.mockReturnValue({ name: "repo" });
+    vscodeMock.workspace.workspaceFolders = [{ name: "repo" }];
     vscodeMock.workspace.asRelativePath.mockReset();
     vscodeMock.workspace.asRelativePath.mockImplementation(
       (uri: { path?: string }, includeWorkspaceFolder: boolean) => {
@@ -82,6 +85,40 @@ describe("ContextService", () => {
       unsaved: true,
     });
     expect(getText).toHaveBeenCalledTimes(1);
+  });
+
+  it("captures deterministic content and adjacent-line hashes without storing adjacent source", () => {
+    const content = "selected  \r\nnext\t ";
+    const options = {
+      getText: vi.fn((selection?: unknown) =>
+        selection ? content : "private neighbor one\nselected\nnext\nprivate neighbor two",
+      ),
+      lines: ["private neighbor one", "selected  ", "next\t ", "private neighbor two"],
+      selection: {
+        isEmpty: false,
+        start: { line: 1, character: 0 },
+        end: { line: 2, character: 6 },
+      },
+      version: 19,
+    };
+
+    vscodeMock.window.activeTextEditor = editor(options);
+    const snapshot = new ContextService().captureSelection();
+    vscodeMock.window.activeTextEditor = editor(options);
+    const repeated = new ContextService().captureSelection();
+
+    expect(snapshot.sourceAnchor).toEqual({
+      formatVersion: 1,
+      contentSha256: digest(content),
+      normalizedContentSha256: digest("selected\nnext"),
+      documentVersion: 19,
+      beforeLineSha256: digest("private neighbor one"),
+      afterLineSha256: digest("private neighbor two"),
+      workspaceRelativePath: "src/index.ts",
+    });
+    expect(repeated.sourceAnchor).toEqual(snapshot.sourceAnchor);
+    expect(JSON.stringify(snapshot.sourceAnchor)).not.toContain("private neighbor");
+    expect(snapshot.sourceAnchor?.contentSha256).toMatch(/^[a-f0-9]{64}$/u);
   });
 
   it("captures the exact button range even after the visible selection collapses", () => {
@@ -182,6 +219,13 @@ describe("ContextService", () => {
       endLine: 2,
       content: "unsaved editor buffer",
       unsaved: true,
+      sourceAnchor: {
+        formatVersion: 1,
+        contentSha256: digest("unsaved editor buffer"),
+        normalizedContentSha256: digest("unsaved editor buffer"),
+        documentVersion: 1,
+        workspaceRelativePath: "src/index.ts",
+      },
     });
     expect(getText).toHaveBeenCalledWith();
   });
@@ -223,6 +267,16 @@ describe("ContextService", () => {
       { kind: "file", fileName: "src/second.ts" },
     ]);
     expect(snapshots.every((snapshot) => /^[a-f0-9-]{36}$/.test(snapshot.id))).toBe(true);
+    expect(
+      snapshots.map((snapshot) => ({
+        formatVersion: snapshot.sourceAnchor?.formatVersion,
+        contentSha256: snapshot.sourceAnchor?.contentSha256,
+        documentVersion: snapshot.sourceAnchor?.documentVersion,
+      })),
+    ).toEqual([
+      { formatVersion: 1, contentSha256: digest("export const first = 1;"), documentVersion: 1 },
+      { formatVersion: 1, contentSha256: digest("export const second = 2;"), documentVersion: 1 },
+    ]);
     expect(vscodeMock.workspace.openTextDocument).toHaveBeenCalledTimes(2);
   });
 
@@ -247,7 +301,23 @@ describe("ContextService", () => {
     vscodeMock.window.activeTextEditor = editor({
       fileName: String.raw`D:\external\tests\index.ts`,
     });
-    expect(new ContextService().captureCurrentFile().fileName).toBe("index.ts");
+    const outside = new ContextService().captureCurrentFile();
+    expect(outside.fileName).toBe("index.ts");
+    expect(outside.sourceAnchor?.workspaceRelativePath).toBeUndefined();
+  });
+
+  it("includes the workspace folder in a multi-root anchor and rejects escaping identities", () => {
+    vscodeMock.workspace.workspaceFolders = [{ name: "repo" }, { name: "other" }];
+    vscodeMock.window.activeTextEditor = editor();
+    expect(new ContextService().captureCurrentFile().sourceAnchor?.workspaceRelativePath).toBe(
+      "repo/src/index.ts",
+    );
+
+    vscodeMock.workspace.workspaceFolders = [{ name: "repo" }];
+    vscodeMock.workspace.asRelativePath.mockReturnValue("../external/index.ts");
+    expect(
+      new ContextService().captureCurrentFile().sourceAnchor?.workspaceRelativePath,
+    ).toBeUndefined();
   });
 
   it("rejects too many picker results before reading any file", async () => {
@@ -264,6 +334,7 @@ describe("ContextService", () => {
 });
 
 function document(fileName: string, content: string) {
+  const lines = content.split("\n");
   return {
     fileName,
     uri: {
@@ -272,14 +343,17 @@ function document(fileName: string, content: string) {
     },
     languageId: "typescript",
     isDirty: false,
-    lineCount: content.split("\n").length,
+    version: 1,
+    lineCount: lines.length,
     getText: () => content,
+    lineAt: (line: number) => ({ text: lines[line] ?? "" }),
   };
 }
 
 function editor(options?: {
   fileName?: string;
   getText?: (selection?: unknown) => string;
+  lines?: string[];
   version?: number;
   validateRange?: (range: unknown) => unknown;
   selection?: {
@@ -288,6 +362,7 @@ function editor(options?: {
     end: { line: number; character: number };
   };
 }) {
+  const lines = options?.lines ?? ["x", ""];
   return {
     selection:
       options?.selection ??
@@ -302,9 +377,14 @@ function editor(options?: {
       languageId: "typescript",
       isDirty: true,
       version: options?.version ?? 1,
-      lineCount: 2,
+      lineCount: lines.length,
       getText: options?.getText ?? (() => "x"),
+      lineAt: (line: number) => ({ text: lines[line] ?? "" }),
       validateRange: options?.validateRange ?? ((range: unknown) => range),
     },
   };
+}
+
+function digest(value: string) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }

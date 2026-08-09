@@ -41,7 +41,7 @@ describe("findConversationTraceMatches", () => {
     });
   });
 
-  it("requires the same URI and ranks exact, content, then range-only evidence", () => {
+  it("requires the same URI and excludes range-only evidence from direct matches", () => {
     const exact = makeConversation(
       "exact-conversation",
       [message("exact-message", "user", [context("exact")])],
@@ -91,9 +91,89 @@ describe("findConversationTraceMatches", () => {
       ["exact", "exact", "exact"],
       ["shifted", "content", "exact"],
       ["file", "content-and-range", "context-contains-selection"],
-      ["range", "range-overlap", "none"],
     ]);
     expect(matches.every((match) => match.contextId !== "wrong-uri")).toBe(true);
+    expect(matches.every((match) => match.contextId !== "range")).toBe(true);
+    expect(matches.every((match) => match.directNavigation)).toBe(true);
+    expect(matches.map((match) => match.confidence)).toEqual([
+      "exact",
+      "content-backed",
+      "content-backed",
+    ]);
+  });
+
+  it("does not match a replaced selection from URI and line overlap alone", () => {
+    const state = makeState([
+      makeConversation("replaced", [
+        message("replaced-message", "user", [
+          context("replaced-context", {
+            content: "oldImplementation()",
+            startLine: 3,
+            endLine: 3,
+          }),
+        ]),
+      ]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        selection({ startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 19 }),
+        "newImplementation()",
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not treat repeated containment as unique content evidence", () => {
+    const state = makeState([
+      makeConversation("repeated", [
+        message("repeated-message", "user", [
+          context("repeated-context", {
+            kind: "current-file",
+            content: "selected()\nbetween\nselected()",
+            startLine: 1,
+            endLine: 5,
+          }),
+        ]),
+      ]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        selection({ startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 10 }),
+        "selected()",
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps uniquely moved exact content as a content-backed direct match", () => {
+    const state = makeState([
+      makeConversation("moved", [
+        message("moved-message", "user", [
+          context("moved-context", {
+            content: "selected()",
+            startLine: 30,
+            endLine: 30,
+          }),
+        ]),
+      ]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        selection({ startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 10 }),
+        "selected()",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        confidence: "content-backed",
+        directNavigation: true,
+        contextId: "moved-context",
+        matchKind: "content",
+      }),
+    ]);
   });
 
   it("uses ContextService's inclusive line convention for selections ending at column zero", () => {
@@ -153,7 +233,7 @@ describe("findConversationTraceMatches", () => {
     expect(find([...conversations].reverse())).toEqual(find(conversations));
   });
 
-  it("keeps archived matches as metadata and rejects empty or malformed selections", () => {
+  it("keeps archived matches as metadata", () => {
     const archived = makeConversation("archived", [
       message("message", "user", [context("context")]),
     ]);
@@ -171,6 +251,19 @@ describe("findConversationTraceMatches", () => {
       contextUnsaved: false,
       messageMarkdown: "Question from message",
     });
+  });
+
+  it("returns no matches for empty content or a collapsed editor selection", () => {
+    const state = makeState([
+      makeConversation("conversation", [message("message", "user", [context("context")])]),
+    ]);
+    const reference = selection({
+      startLine: 2,
+      startCharacter: 0,
+      endLine: 2,
+      endCharacter: 10,
+    });
+
     expect(findConversationTraceMatches(state, reference, "")).toEqual([]);
     expect(
       findConversationTraceMatches(

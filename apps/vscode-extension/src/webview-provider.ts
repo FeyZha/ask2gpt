@@ -14,6 +14,7 @@ import { openAnswerSourceReferenceFromState, openAnswerSymbolFromState } from ".
 import { selectionReferenceFromEditor } from "./selection-reference";
 import { Ask2GPTError } from "./services/errors";
 import type { SafeLogger } from "./services/logger";
+import { withSourceTraceHints } from "./source-trace-index";
 import { normalizeExternalHttpUrl } from "./webview/external-url";
 import { parseWebviewMessage } from "./webview-message-validation";
 
@@ -122,7 +123,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
     this.pendingStateRuns = this.runIds(initialState);
     this.lastDeliveredRuns = this.runIds(initialState);
     this.stateDeliveryFailures = 0;
-    this.initialStateJson = JSON.stringify(initialState);
+    this.initialStateJson = JSON.stringify(withSourceTraceHints(initialState));
     view.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "dist", "webview")],
@@ -238,7 +239,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
             const currentState = this.controller.getState();
             const initialStateStillCurrent =
               this.initialStateJson !== undefined &&
-              this.initialStateJson === JSON.stringify(currentState);
+              this.initialStateJson === JSON.stringify(withSourceTraceHints(currentState));
             this.initialStateJson = undefined;
             if (initialStateStillCurrent) {
               // React hydrated the host-provided snapshot on its first render;
@@ -727,7 +728,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
       state,
     };
     this.stateDelivery = delivery;
-    void this.post({ type: "state", state }).then((delivered) => {
+    void this.post({ type: "state", state: withSourceTraceHints(state) }).then((delivered) => {
       if (this.stateDelivery?.id !== delivery.id) return;
       this.stateDelivery = undefined;
       if (delivery.generation !== this.viewGeneration) return;
