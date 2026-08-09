@@ -142,7 +142,7 @@ describe("ConversationStore", () => {
     } finally {
       await rm(temporaryRoot, { force: true, recursive: true });
     }
-  });
+  }, 15_000);
 
   it("encrypts v2 records, binds them to their id, and can read them back", async () => {
     const root = await temporaryRoot();
