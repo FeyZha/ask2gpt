@@ -92,6 +92,12 @@ describe("parseWebviewMessage", () => {
       conversationId: "conversation-1",
     });
     expect(
+      parseWebviewMessage({ type: "attachSelection", conversationId: "conversation-1" }),
+    ).toEqual({ type: "attachSelection", conversationId: "conversation-1" });
+    expect(
+      parseWebviewMessage({ type: "attachNotebookCell", conversationId: "conversation-1" }),
+    ).toEqual({ type: "attachNotebookCell", conversationId: "conversation-1" });
+    expect(
       parseWebviewMessage({ type: "archiveConversation", conversationId: "conversation-1" }),
     ).toEqual({ type: "archiveConversation", conversationId: "conversation-1" });
     expect(
@@ -142,10 +148,62 @@ describe("parseWebviewMessage", () => {
       conversationId: "conversation-1",
       contextId: "context-1",
     });
+    expect(
+      parseWebviewMessage({
+        type: "openSourceReference",
+        conversationId: "conversation-1",
+        messageId: "message-1",
+        kind: "file-line",
+        reference: "06_vector_store.py:34-39",
+      }),
+    ).toEqual({
+      type: "openSourceReference",
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      kind: "file-line",
+      reference: "06_vector_store.py:34-39",
+    });
   });
 
   it("rejects unknown, malformed and oversized messages", () => {
     expect(parseWebviewMessage({ type: "unknown" })).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "openSourceReference",
+        conversationId: "conversation-1",
+        messageId: "message-1",
+        kind: "file-line",
+        reference: "06_vector_store.py:34",
+        uri: "file:///outside.py",
+      }),
+    ).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "openSourceReference",
+        conversationId: "conversation-1",
+        messageId: "../message",
+        kind: "symbol",
+        reference: "get_embeddings_endpoint",
+      }),
+    ).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "openSourceReference",
+        conversationId: "conversation-1",
+        messageId: "message-1",
+        kind: "other",
+        reference: "get_embeddings_endpoint",
+      }),
+    ).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "openSourceReference",
+        conversationId: "conversation-1",
+        messageId: "message-1",
+        kind: "symbol",
+        reference: "x".repeat(769),
+      }),
+    ).toBeUndefined();
     expect(
       parseWebviewMessage({ type: "deleteConversation", conversationId: "../x" }),
     ).toBeUndefined();
@@ -236,6 +294,25 @@ describe("parseWebviewMessage", () => {
     ).toBeUndefined();
     expect(parseWebviewMessage({ type: "copy", text: 42 })).toBeUndefined();
     expect(parseWebviewMessage({ type: "attachFiles" })).toBeUndefined();
+    expect(parseWebviewMessage({ type: "attachSelection" })).toBeUndefined();
+    expect(parseWebviewMessage({ type: "attachNotebookCell" })).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "attachNotebookCell",
+        conversationId: "conversation-1",
+        notebookUri: "vscode-notebook-cell:/forged",
+      }),
+    ).toBeUndefined();
+    expect(
+      parseWebviewMessage({ type: "attachSelection", conversationId: "../conversation" }),
+    ).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "attachSelection",
+        conversationId: "conversation-1",
+        selection: "untrusted",
+      }),
+    ).toBeUndefined();
     expect(parseWebviewMessage({ type: "selectModel", modelId: "mode-high" })).toBeUndefined();
     expect(
       parseWebviewMessage({ type: "unarchiveConversation", conversationId: "conversation-1" }),

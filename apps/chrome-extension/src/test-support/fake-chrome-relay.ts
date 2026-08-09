@@ -31,6 +31,24 @@ interface FakeWindowBounds {
   top: number;
   width: number;
 }
+
+const FAKE_VISIBLE_SCREEN = { height: 1_080, left: 0, top: 0, width: 1_920 } as const;
+const INVALID_WINDOW_BOUNDS_ERROR =
+  "Invalid value for bounds. Bounds must be at least 50% within visible screen space.";
+
+function windowBoundsAreAtLeastHalfVisible(bounds: FakeWindowBounds) {
+  const intersectionWidth = Math.max(
+    0,
+    Math.min(bounds.left + bounds.width, FAKE_VISIBLE_SCREEN.left + FAKE_VISIBLE_SCREEN.width) -
+      Math.max(bounds.left, FAKE_VISIBLE_SCREEN.left),
+  );
+  const intersectionHeight = Math.max(
+    0,
+    Math.min(bounds.top + bounds.height, FAKE_VISIBLE_SCREEN.top + FAKE_VISIBLE_SCREEN.height) -
+      Math.max(bounds.top, FAKE_VISIBLE_SCREEN.top),
+  );
+  return intersectionWidth * intersectionHeight >= (bounds.width * bounds.height) / 2;
+}
 type DebuggerCommandHandler = (
   target: chrome.debugger.DebuggerSession,
   method: string,
@@ -466,6 +484,11 @@ export class FakeChromeRelayHarness {
     this.timeline.push(`tabs.onActivated:${tabId}:${tab.url}`);
     this.tabsOnActivated.emit({ tabId, windowId: tab.windowId });
     this.releaseRestoredTabMessageResponses(tabId);
+  }
+
+  emitAlarm(name: string) {
+    this.timeline.push(`alarms.onAlarm:${name}`);
+    this.alarmOnAlarm.emit({ name, scheduledTime: Date.now() });
   }
 
   outboundEnvelopes(socket: FakeRelayWebSocket) {
@@ -967,6 +990,15 @@ export class FakeChromeRelayHarness {
         if (createData.tabId !== undefined && createData.type === "popup") {
           throw new Error("Tabs can only be moved to and from normal windows.");
         }
+        const bounds = {
+          height: createData.height ?? 900,
+          left: createData.left ?? 100,
+          top: createData.top ?? 100,
+          width: createData.width ?? 1_200,
+        };
+        if (!windowBoundsAreAtLeastHalfVisible(bounds)) {
+          throw new Error(INVALID_WINDOW_BOUNDS_ERROR);
+        }
         const windowId = this.nextWindowId++;
         this.existingWindowIds.add(windowId);
         this.windowFocusById.set(windowId, createData.focused ?? true);
@@ -975,12 +1007,6 @@ export class FakeChromeRelayHarness {
           createData.state === "minimized" ? "minimized" : "normal",
         );
         this.windowTypeById.set(windowId, createData.type === "popup" ? "popup" : "normal");
-        const bounds = {
-          height: createData.height ?? 900,
-          left: createData.left ?? 100,
-          top: createData.top ?? 100,
-          width: createData.width ?? 1_200,
-        };
         this.windowBoundsById.set(windowId, bounds);
         let movedTab: FakeTab | undefined;
         if (createData.tabId !== undefined) {
@@ -1040,6 +1066,16 @@ export class FakeChromeRelayHarness {
         if (hasBounds && updateInfo.state !== undefined && updateInfo.state !== "normal") {
           throw new Error("Fake Chrome rejects minimized state combined with window bounds.");
         }
+        const currentBounds = this.windowBounds(windowId);
+        const nextBounds = {
+          height: updateInfo.height ?? currentBounds.height,
+          left: updateInfo.left ?? currentBounds.left,
+          top: updateInfo.top ?? currentBounds.top,
+          width: updateInfo.width ?? currentBounds.width,
+        };
+        if (hasBounds && !windowBoundsAreAtLeastHalfVisible(nextBounds)) {
+          throw new Error(INVALID_WINDOW_BOUNDS_ERROR);
+        }
         this.timeline.push(`window-updated:${windowId}:focused:${String(updateInfo.focused)}`);
         if (updateInfo.focused !== undefined) {
           this.windowFocusById.set(windowId, updateInfo.focused);
@@ -1053,13 +1089,6 @@ export class FakeChromeRelayHarness {
           this.timeline.push(`window-updated:${windowId}:state:${updateInfo.state}`);
         }
         if (hasBounds) {
-          const currentBounds = this.windowBounds(windowId);
-          const nextBounds = {
-            height: updateInfo.height ?? currentBounds.height,
-            left: updateInfo.left ?? currentBounds.left,
-            top: updateInfo.top ?? currentBounds.top,
-            width: updateInfo.width ?? currentBounds.width,
-          };
           this.windowBoundsById.set(windowId, nextBounds);
           this.timeline.push(
             `window-updated:${windowId}:bounds:${nextBounds.left},${nextBounds.top},${nextBounds.width},${nextBounds.height}`,
@@ -1164,7 +1193,7 @@ export class FakeChromeRelayHarness {
       windowId: tab.windowId,
       groupId: -1,
       url: tab.url,
-      pendingUrl: tab.url,
+      ...(tab.status === "loading" ? { pendingUrl: tab.url } : {}),
       status: tab.status,
     };
   }

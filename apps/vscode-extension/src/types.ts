@@ -5,6 +5,8 @@ import type {
   Conversation,
   ConversationCanonicalizationResultPayload,
   ConversationMessage,
+  ConversationLeasePurpose,
+  ConversationReleaseReason,
   ConversationSnapshotPayload,
   ConversationTranscriptProof,
   PendingRemotePromotion,
@@ -150,6 +152,12 @@ export interface ChatBackend {
     modelId: string,
     remoteUrl?: string,
   ): Promise<ChatModelOption>;
+  /** Relinquishes an idle page lease without deleting conversation or run state. */
+  releaseConversation?(
+    conversationId: string,
+    purpose?: ConversationLeasePurpose,
+    reason?: ConversationReleaseReason,
+  ): Promise<boolean>;
   closeConversation(conversationId: string): Promise<boolean>;
   acknowledgeTerminal(conversationId: string, runId: string, eventId: string): Promise<void>;
   onEvent(listener: (event: BackendEvent) => void): { dispose(): void };
@@ -166,6 +174,13 @@ export interface ModelPickerState {
   stale?: boolean;
 }
 
+export interface SourceTraceHint {
+  /** Exact textual references proven to address this turn's attached context. */
+  fileReferences: string[];
+  /** Definition names proven to exist inside this turn's attached snapshots. */
+  sourceSymbols: string[];
+}
+
 export interface AppState {
   activeConversationId: string;
   conversations: Conversation[];
@@ -178,6 +193,8 @@ export interface AppState {
   modelPicker: ModelPickerState;
   /** Optional for compatibility with retained webviews created by an older host. */
   composerPreferences?: ComposerPreferences;
+  /** Host-derived, non-persisted source affordances scoped by conversation and message ID. */
+  sourceTraceHints?: Record<string, Record<string, SourceTraceHint>>;
   locale: "zh-CN" | "en";
 }
 
@@ -218,10 +235,19 @@ export type WebviewToHostMessage =
   | { type: "resumeQueue"; conversationId: string }
   | { type: "stop"; conversationId: string; targetRunId: string }
   | { type: "regenerate"; conversationId: string; messageId: string }
+  | { type: "attachSelection"; conversationId: string }
+  | { type: "attachNotebookCell"; conversationId: string }
   | { type: "attachCurrentFile"; conversationId: string }
   | { type: "attachFiles"; conversationId: string }
   | { type: "removeContext"; conversationId: string; contextId: string }
   | { type: "openContext"; conversationId: string; contextId: string }
+  | {
+      type: "openSourceReference";
+      conversationId: string;
+      messageId: string;
+      kind: "file-line" | "symbol";
+      reference: string;
+    }
   | { type: "copy"; text: string }
   | { type: "retryConnection" }
   | { type: "openChatGpt" }
@@ -235,7 +261,8 @@ export type HostToWebviewMessage =
   | { type: "generationUpdate"; update: GenerationViewUpdate }
   | { type: "notice"; level: "info" | "warning" | "error"; message: string }
   | { type: "sendResult"; accepted: boolean; conversationId: string; requestId: string }
-  | { type: "focusComposer" };
+  | { type: "focusComposer" }
+  | { type: "revealTurn"; conversationId: string; messageId: string; contextId?: string };
 
 export function latestUserMessage(messages: ConversationMessage[]) {
   return [...messages].reverse().find((message) => message.role === "user");

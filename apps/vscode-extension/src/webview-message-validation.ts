@@ -4,6 +4,7 @@ const MAX_ID_LENGTH = 128;
 const MAX_QUESTION_LENGTH = 20_000;
 const MAX_COPY_LENGTH = 2 * 1024 * 1024;
 const MAX_EXTERNAL_URL_LENGTH = 4096;
+const MAX_SOURCE_REFERENCE_LENGTH = 768;
 const ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 export function parseWebviewMessage(value: unknown): WebviewToHostMessage | undefined {
@@ -17,6 +18,11 @@ export function parseWebviewMessage(value: unknown): WebviewToHostMessage | unde
       return value as WebviewToHostMessage;
     case "newConversation":
       return isId(value.sourceConversationId) ? (value as WebviewToHostMessage) : undefined;
+    case "attachSelection":
+    case "attachNotebookCell":
+      return isId(value.conversationId) && hasOnlyKeys(value, ["type", "conversationId"])
+        ? { type: value.type, conversationId: value.conversationId }
+        : undefined;
     case "attachCurrentFile":
     case "attachFiles":
       return isId(value.conversationId) ? (value as WebviewToHostMessage) : undefined;
@@ -32,6 +38,20 @@ export function parseWebviewMessage(value: unknown): WebviewToHostMessage | unde
             type: "openContext",
             conversationId: value.conversationId,
             contextId: value.contextId,
+          }
+        : undefined;
+    case "openSourceReference":
+      return isId(value.conversationId) &&
+        isId(value.messageId) &&
+        (value.kind === "file-line" || value.kind === "symbol") &&
+        isString(value.reference, 1, MAX_SOURCE_REFERENCE_LENGTH) &&
+        hasOnlyKeys(value, ["type", "conversationId", "messageId", "kind", "reference"])
+        ? {
+            type: "openSourceReference",
+            conversationId: value.conversationId,
+            messageId: value.messageId,
+            kind: value.kind,
+            reference: value.reference,
           }
         : undefined;
     case "selectConversation":

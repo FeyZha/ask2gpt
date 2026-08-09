@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import type { ContextSnapshot } from "@ask2gpt/protocol";
+import type { ContextSnapshot, NotebookSourceAnchorV2 } from "@ask2gpt/protocol";
 
 import type { AppState, HostToWebviewMessage, WebviewToHostMessage } from "../types";
 
@@ -1001,8 +1001,9 @@ describe("Ask2GPT webview", () => {
     fireEvent.click(trigger);
     const menu = screen.getByRole("menu", { name: "选择上下文" });
     const items = screen.getAllByRole("menuitem");
-    expect(items).toHaveLength(2);
-    expect(screen.queryByRole("menuitem", { name: /当前选中代码|Current selection/u })).toBeNull();
+    expect(items).toHaveLength(4);
+    expect(screen.getByRole("menuitem", { name: /当前选区|Current selection/u })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Notebook 单元格|Notebook cell/u })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /当前文件/u })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /选择文件/u })).toBeTruthy();
     expect(document.activeElement).toBe(items[0]);
@@ -1017,6 +1018,20 @@ describe("Ask2GPT webview", () => {
     expect(document.activeElement).toBe(trigger);
 
     fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitem", { name: /当前选区|Current selection/u }));
+    expect(posted).toContainEqual({
+      type: "attachSelection",
+      conversationId: "conversation-1",
+    });
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Notebook 单元格|Notebook cell/u }));
+    expect(posted).toContainEqual({
+      type: "attachNotebookCell",
+      conversationId: "conversation-1",
+    });
+
+    fireEvent.click(trigger);
     expect(screen.getByRole("menu", { name: "选择上下文" })).toBeTruthy();
     fireEvent.pointerDown(document.body);
     expect(screen.queryByRole("menu", { name: "选择上下文" })).toBeNull();
@@ -1024,6 +1039,284 @@ describe("Ask2GPT webview", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 0));
     });
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it("offers eight selection task shortcuts that only edit the current draft", async () => {
+    render(<App />);
+    const state = makeState();
+    const selection = makeContext({
+      id: "task-selection",
+      kind: "selection",
+      fileName: "auth.ts",
+      content: "export function authorize() { return true; }",
+    });
+    state.pendingContexts = [
+      makeContext({ id: "task-file", kind: "current-file", fileName: "policy.ts" }),
+      selection,
+    ];
+    sendHostMessage({ type: "state", state });
+
+    const actions = await screen.findByRole("region", { name: "代码任务快捷动作" });
+    const expected = [
+      ["explain", "解释这段代码", "解释这段代码的用途、执行流程和关键设计。"],
+      ["find-issues", "查找问题", "查找这段代码中的错误、边界情况和潜在问题。"],
+      ["fix-error", "修复报错", "分析并修复这段代码中的报错，说明根因和修改。"],
+      ["review", "代码审查", "审查这段代码，按严重程度指出问题并给出改进建议。"],
+      ["refactor", "重构", "重构这段代码以提高可读性和可维护性，并保持现有行为。"],
+      ["comments", "添加注释", "为这段代码添加必要且简洁的注释，避免解释显而易见的内容。"],
+      ["tests", "编写单元测试", "为这段代码编写覆盖正常路径、边界情况和失败路径的单元测试。"],
+      [
+        "performance-security",
+        "分析性能或安全问题",
+        "分析这段代码的性能和安全风险，并给出可执行的改进方案。",
+      ],
+    ] as const;
+    const buttons = within(actions).getAllByRole("button");
+    expect(buttons).toHaveLength(expected.length);
+    expected.forEach(([id, label, prompt], index) => {
+      expect(buttons[index]?.dataset.codeTask).toBe(id);
+      expect(buttons[index]?.textContent).toContain(label);
+      expect(buttons[index]?.title).toBe(prompt);
+      expect(buttons[index]?.getAttribute("type")).toBe("button");
+    });
+
+    const composer = screen.getByRole("textbox") as HTMLTextAreaElement;
+    posted.length = 0;
+    fireEvent.click(within(actions).getByRole("button", { name: /解释这段代码/u }));
+    await vi.waitFor(() => {
+      expect(composer.value).toBe(expected[0][2]);
+      expect(document.activeElement).toBe(composer);
+      expect(composer.selectionStart).toBe(composer.value.length);
+      expect(composer.selectionEnd).toBe(composer.value.length);
+    });
+    expect(composer.value).not.toContain(selection.content);
+    expect(within(actions).getByRole("status").textContent).toContain("已填入草稿");
+
+    fireEvent.change(composer, { target: { value: "保留原稿尾部空格  " } });
+    fireEvent.click(within(actions).getByRole("button", { name: /代码审查/u }));
+    expect(composer.value).toBe(`保留原稿尾部空格  \n\n${expected[3][2]}`);
+    fireEvent.click(within(actions).getByRole("button", { name: /代码审查/u }));
+    expect(composer.value).toBe(`保留原稿尾部空格  \n\n${expected[3][2]}`);
+    expect(within(actions).getByRole("status").textContent).toContain("已在草稿末尾");
+    fireEvent.click(within(actions).getByRole("button", { name: /^重构/u }));
+    expect(composer.value).toBe(`保留原稿尾部空格  \n\n${expected[3][2]}\n\n${expected[4][2]}`);
+
+    expect(
+      posted.filter(
+        (message) =>
+          message.type === "send" ||
+          message.type === "enqueueFollowUp" ||
+          message.type === "interruptWithFollowUp",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("shows selection shortcuts only for pending selection context and preserves their draft", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.pendingContexts = [
+      makeContext({ id: "only-file", kind: "current-file", fileName: "whole-file.ts" }),
+    ];
+    state.conversations[0]!.messages.push({
+      id: "historical-selection",
+      role: "user",
+      markdown: "Earlier question",
+      status: "complete",
+      createdAt: new Date().toISOString(),
+      contexts: [makeContext({ id: "sent-selection", kind: "selection" })],
+    });
+    sendHostMessage({ type: "state", state });
+
+    const composer = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
+    expect(screen.queryByRole("region", { name: "Code task shortcuts" })).toBeNull();
+
+    const withSelection = structuredClone(state);
+    withSelection.pendingContexts.push(
+      makeContext({ id: "pending-selection", kind: "selection", fileName: "selected.ts" }),
+    );
+    sendHostMessage({ type: "state", state: withSelection });
+    const actions = await screen.findByRole("region", { name: "Code task shortcuts" });
+    expect(within(actions).getAllByRole("button")).toHaveLength(8);
+    fireEvent.click(within(actions).getByRole("button", { name: /Review the code/u }));
+    expect(composer.value).toBe(
+      "Review this code, report issues by severity, and suggest concrete improvements.",
+    );
+
+    const withoutSelection = structuredClone(withSelection);
+    withoutSelection.pendingContexts = withoutSelection.pendingContexts.filter(
+      (context) => context.kind !== "selection",
+    );
+    sendHostMessage({ type: "state", state: withoutSelection });
+    expect(screen.queryByRole("region", { name: "Code task shortcuts" })).toBeNull();
+    expect(composer.value).toBe(
+      "Review this code, report issues by severity, and suggest concrete improvements.",
+    );
+  });
+
+  it("renders Notebook code cells as compact source-only cards with code task shortcuts", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    const notebookCell = makeNotebookContext({
+      id: "notebook-code-cell",
+      startLine: 3,
+      endLine: 12,
+      sourceAnchor: makeNotebookAnchor({ cellIndex: 3 }),
+    });
+    state.pendingContexts = [notebookCell];
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText("analysis.ipynb · Cell 4 · Python")).toBeTruthy();
+    expect(screen.getByText(/L3–12 · Outputs excluded/u)).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Code task shortcuts" })).toBeTruthy();
+    expect(screen.queryByText(/"outputs"/u)).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open in editor: analysis.ipynb · Cell 4 · Python · L3–12 · Outputs excluded",
+      }),
+    );
+    expect(posted).toContainEqual({
+      type: "openContext",
+      contextId: "notebook-code-cell",
+      conversationId: "conversation-1",
+    });
+
+    const sent = structuredClone(state);
+    sent.pendingContexts = [];
+    sent.conversations[0]!.messages.push({
+      id: "notebook-question",
+      role: "user",
+      markdown: "Explain this cell",
+      status: "complete",
+      createdAt: new Date().toISOString(),
+      contexts: [notebookCell],
+    });
+    sendHostMessage({ type: "state", state: sent });
+    const sentContexts = await screen.findByRole("group", {
+      name: "Code context sent with this question",
+    });
+    expect(within(sentContexts).getByText("analysis.ipynb · Cell 4 · Python")).toBeTruthy();
+    expect(within(sentContexts).getByText("L3–12 · Outputs excluded")).toBeTruthy();
+  });
+
+  it("does not offer code-only shortcuts for a Markdown Notebook cell", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.pendingContexts = [
+      makeNotebookContext({
+        id: "notebook-markup-cell",
+        language: "markdown",
+        content: "## Experiment notes",
+        sourceAnchor: makeNotebookAnchor({
+          cellIndex: 6,
+          cellKind: "markup",
+          cellLanguage: "markdown",
+          scope: "cell",
+        }),
+      }),
+    ];
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText("analysis.ipynb · Cell 7 · Markdown")).toBeTruthy();
+    expect(screen.getByText(/Outputs excluded/u)).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Code task shortcuts" })).toBeNull();
+  });
+
+  it("keeps selection task drafts isolated by conversation", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.pendingContexts = [makeContext({ id: "selection-a", kind: "selection" })];
+    state.conversations.push({
+      id: "conversation-2",
+      title: "Second conversation",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      messages: [],
+    });
+    sendHostMessage({ type: "state", state });
+
+    const composer = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
+    fireEvent.click(screen.getByRole("button", { name: /Review the code/u }));
+    const draftA =
+      "Review this code, report issues by severity, and suggest concrete improvements.";
+    expect(composer.value).toBe(draftA);
+
+    const selectedB = structuredClone(state);
+    selectedB.activeConversationId = "conversation-2";
+    selectedB.modelPicker.conversationId = "conversation-2";
+    selectedB.pendingContexts = [makeContext({ id: "selection-b", kind: "selection" })];
+    sendHostMessage({ type: "state", state: selectedB });
+    expect(composer.value).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: /Explain this code/u }));
+    const draftB = "Explain this code's purpose, execution flow, and key design decisions.";
+    expect(composer.value).toBe(draftB);
+
+    const selectedA = structuredClone(state);
+    sendHostMessage({ type: "state", state: selectedA });
+    expect(composer.value).toBe(draftA);
+    expect(
+      posted.some(
+        (message) =>
+          message.type === "send" ||
+          message.type === "enqueueFollowUp" ||
+          message.type === "interruptWithFollowUp",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps a full composer draft unchanged when a selection task would exceed the limit", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.pendingContexts = [makeContext({ id: "limit-selection", kind: "selection" })];
+    sendHostMessage({ type: "state", state });
+
+    const composer = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
+    expect(composer.maxLength).toBe(20_000);
+    const fullDraft = "x".repeat(20_000);
+    fireEvent.change(composer, { target: { value: fullDraft } });
+    posted.length = 0;
+    const actions = screen.getByRole("region", { name: "Code task shortcuts" });
+    fireEvent.click(within(actions).getByRole("button", { name: /Performance or security/u }));
+
+    expect(composer.value).toBe(fullDraft);
+    expect(within(actions).getByRole("status").textContent).toContain("20,000-character limit");
+    expect(posted.filter((message) => message.type === "prepareConversation")).toHaveLength(0);
+  });
+
+  it("sends only the chosen task prompt while selection content stays packaged", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    const selection = makeContext({
+      id: "send-selection",
+      kind: "selection",
+      fileName: "secret.ts",
+      content: "const secretImplementation = 42;",
+    });
+    state.pendingContexts = [selection];
+    sendHostMessage({ type: "state", state });
+
+    const composer = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
+    fireEvent.click(screen.getByRole("button", { name: /Fix the error/u }));
+    const prompt =
+      "Diagnose and fix the error in this code, explaining the root cause and changes.";
+    expect(composer.value).toBe(prompt);
+    expect(composer.value).not.toContain(selection.content);
+    posted.length = 0;
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    expect(posted.filter((message) => message.type === "send")).toEqual([
+      {
+        type: "send",
+        conversationId: "conversation-1",
+        requestId: "request-00000000-0000-4000-8000-000000000001",
+        text: prompt,
+      },
+    ]);
   });
 
   it("dismisses every composer overlay before honoring a host focus request", async () => {
@@ -1576,11 +1869,19 @@ describe("Ask2GPT webview", () => {
       {
         id: "assistant-stream",
         role: "assistant",
-        markdown: "partial",
+        markdown: "partial stable.ts:1",
         status: "streaming",
         createdAt: new Date().toISOString(),
       },
     );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "assistant-stream": {
+          fileReferences: ["stable.ts:1"],
+          sourceSymbols: [],
+        },
+      },
+    };
     state.conversations[0]!.run = {
       id: "run-stream",
       messageId: "assistant-stream",
@@ -1592,23 +1893,98 @@ describe("Ask2GPT webview", () => {
     const contextButton = await screen.findByRole("button", {
       name: "预览上下文: stable.ts",
     });
+    expect(document.querySelector(".source-reference")).toBeNull();
     sendHostMessage({
       type: "generationUpdate",
       update: {
         conversationId: "conversation-1",
         messageId: "assistant-stream",
         runId: "run-stream",
-        markdown: "compact snapshot",
+        markdown: "compact snapshot stable.ts:1",
         updatedAt: "2026-07-25T00:00:01.000Z",
       },
     });
 
-    expect(await screen.findByText("compact snapshot")).toBeTruthy();
+    expect(await screen.findByText(/compact snapshot stable\.ts:1/u)).toBeTruthy();
+    expect(document.querySelector(".source-reference")).toBeNull();
     expect(
       screen.getByRole("button", {
         name: "预览上下文: stable.ts",
       }),
     ).toBe(contextButton);
+  });
+
+  it("only exposes terminal source hints and ignores a late compact streaming frame", async () => {
+    render(<App />);
+    const streaming = makeState();
+    streaming.locale = "en";
+    streaming.conversations[0]!.messages.push(
+      {
+        id: "user-source-race",
+        role: "user",
+        markdown: "Locate this code",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:00.000Z",
+        contexts: [
+          makeContext({
+            id: "source-race-context",
+            fileName: "race.ts",
+            startLine: 1,
+            endLine: 12,
+          }),
+        ],
+      },
+      {
+        id: "assistant-source-race",
+        role: "assistant",
+        markdown: "Partial answer at race.ts:4",
+        status: "streaming",
+        createdAt: "2026-07-25T00:00:01.000Z",
+      },
+    );
+    streaming.sourceTraceHints = {
+      "conversation-1": {
+        "assistant-source-race": {
+          fileReferences: ["race.ts:4"],
+          sourceSymbols: [],
+        },
+      },
+    };
+    streaming.conversations[0]!.run = {
+      id: "run-source-race",
+      messageId: "assistant-source-race",
+      status: "streaming",
+      startedAt: "2026-07-25T00:00:01.000Z",
+    };
+    sendHostMessage({ type: "state", state: streaming });
+
+    expect(await screen.findByText(/Partial answer at race\.ts:4/u)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open race.ts:4 in the editor" })).toBeNull();
+
+    const terminal = structuredClone(streaming);
+    terminal.conversations[0]!.run = undefined;
+    terminal.conversations[0]!.messages[1]!.markdown = "Complete answer at race.ts:4";
+    terminal.conversations[0]!.messages[1]!.status = "complete";
+    sendHostMessage({ type: "state", state: terminal });
+
+    const sourceAction = await screen.findByRole("button", {
+      name: "Open race.ts:4 in the editor",
+    });
+    expect(screen.getByText(/Complete answer at/u)).toBeTruthy();
+
+    sendHostMessage({
+      type: "generationUpdate",
+      update: {
+        conversationId: "conversation-1",
+        messageId: "assistant-source-race",
+        runId: "run-source-race",
+        markdown: "Late compact answer at race.ts:4",
+        updatedAt: "2026-07-25T00:00:03.000Z",
+      },
+    });
+
+    expect(screen.queryByText(/Late compact answer/u)).toBeNull();
+    expect(screen.getByRole("button", { name: "Open race.ts:4 in the editor" })).toBe(sourceAction);
   });
 
   it("buffers hidden streaming updates, restores the newest one, and never revives it after terminal state", async () => {
@@ -1948,6 +2324,39 @@ describe("Ask2GPT webview", () => {
     );
   });
 
+  it("renders a language toolbar, block copy action and multi-token syntax highlighting", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    const source = [
+      "function answer(label: string) {",
+      '  const status = "ready";',
+      "  return `${label}: ${status} ${42}`;",
+      "}",
+    ].join("\n");
+    state.conversations[0]!.messages.push({
+      id: "assistant-colored-code",
+      role: "assistant",
+      markdown: `\`\`\`ts\n${source}\n\`\`\``,
+      status: "complete",
+      createdAt: new Date().toISOString(),
+    });
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText("TypeScript")).toBeTruthy();
+    const block = document.querySelector(".markdown-code-block");
+    expect(block).toBeTruthy();
+    expect(block?.querySelector("pre code.hljs.language-ts")?.textContent?.trim()).toBe(source);
+    expect(block?.querySelector(".hljs-keyword")).toBeTruthy();
+    expect(block?.querySelector(".hljs-title")).toBeTruthy();
+    expect(block?.querySelector(".hljs-string")).toBeTruthy();
+    expect(block?.querySelector(".hljs-number")).toBeTruthy();
+
+    posted.length = 0;
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    expect(posted).toContainEqual({ type: "copy", text: source });
+  });
+
   it("keeps user and assistant turns in transcript order", async () => {
     render(<App />);
     const state = makeState();
@@ -2115,6 +2524,7 @@ describe("Ask2GPT webview", () => {
       markdown: "比较这两个实现",
       status: "complete",
       createdAt: new Date().toISOString(),
+      contextTransportVersion: 2,
       contexts: [
         makeContext({ id: "context-a", fileName: "first.ts", charCount: 300 }),
         makeContext({ id: "context-b", fileName: "second.ts", charCount: 450 }),
@@ -2128,6 +2538,9 @@ describe("Ask2GPT webview", () => {
     expect(screen.getByText("second.ts")).toBeTruthy();
     expect(screen.queryByText("third.ts")).toBeNull();
     expect(screen.queryByText(/1,350 字符/)).toBeNull();
+    expect(screen.queryByText("封装为代码上下文")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "预览上下文: first.ts" }));
+    expect(screen.getByText(/封装为代码上下文/u)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "显示更多代码上下文" }));
     expect(screen.getByText("third.ts")).toBeTruthy();
     expect(screen.getByRole("button", { name: "收起代码上下文" })).toBeTruthy();
@@ -2140,6 +2553,36 @@ describe("Ask2GPT webview", () => {
     const userTurn = screen.getByRole("article", { name: "你的问题" });
     fireEvent.click(within(userTurn).getByRole("button", { name: "复制" }));
     expect(posted).toContainEqual({ type: "copy", text: "比较这两个实现" });
+  });
+
+  it("keeps the sent context line range visible without expanding its preview", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push({
+      id: "question-with-source-range",
+      role: "user",
+      markdown: "Explain this range",
+      status: "complete",
+      createdAt: new Date().toISOString(),
+      contexts: [
+        makeContext({
+          id: "source-range",
+          fileName: "06_vector_store.py",
+          startLine: 34,
+          endLine: 39,
+        }),
+      ],
+    });
+    sendHostMessage({ type: "state", state });
+
+    const contexts = await screen.findByRole("group", {
+      name: "Code context sent with this question",
+    });
+    expect(
+      within(contexts).getByText("L34\u201339", { selector: ".sent-context__line-range" }),
+    ).toBeTruthy();
+    expect(contexts.querySelector(".sent-context__details")).toBeNull();
   });
 
   it("anchors a newly appended user turn at the start of the transcript viewport", async () => {
@@ -2310,6 +2753,139 @@ describe("Ask2GPT webview", () => {
       block: "start",
       inline: "nearest",
     });
+  });
+
+  it("reveals the exact context in a host-selected turn until the user clears it", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push(
+      {
+        id: "question-before-trace",
+        role: "user",
+        markdown: "Earlier question",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:01.000Z",
+      },
+      {
+        id: "answer-before-trace",
+        role: "assistant",
+        markdown: "Earlier answer",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:02.000Z",
+      },
+      {
+        id: "question-trace-target",
+        role: "user",
+        markdown: "Question that used this selection",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:03.000Z",
+        contexts: [
+          makeContext({ id: "trace-context-1", fileName: "first.ts" }),
+          makeContext({ id: "trace-context-2", fileName: "second.ts" }),
+          makeContext({ id: "trace-context-3", fileName: "matched.ts" }),
+        ],
+      },
+      {
+        id: "answer-trace-target",
+        role: "assistant",
+        markdown: "Target answer",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:04.000Z",
+      },
+    );
+    sendHostMessage({ type: "state", state });
+
+    const target = screen
+      .getAllByRole("article", { name: "Your question" })
+      .find((article) => article.textContent?.includes("Question that used this selection"))!;
+    const scrollIntoView = vi.mocked(Element.prototype.scrollIntoView);
+    scrollIntoView.mockClear();
+
+    sendHostMessage({
+      type: "revealTurn",
+      conversationId: "conversation-1",
+      messageId: "question-trace-target",
+      contextId: "trace-context-3",
+    });
+
+    const label = within(target).getByRole("status");
+    expect(label.textContent).toContain("Matched selection");
+    expect(label.getAttribute("role")).toBe("status");
+    expect(within(label).queryByRole("button")).toBeNull();
+    expect(target.classList.contains("message--trace-target")).toBe(true);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "start",
+      inline: "nearest",
+    });
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "auto",
+      block: "nearest",
+      inline: "nearest",
+    });
+
+    const matchedContext = within(target).getByText("matched.ts").closest(".sent-context");
+    expect(matchedContext?.classList.contains("sent-context--trace-target")).toBe(true);
+    expect(within(matchedContext as HTMLElement).getByText("Linked")).toBeTruthy();
+    const matchedContextOpen = (matchedContext as HTMLElement).querySelector<HTMLButtonElement>(
+      ".sent-context__open",
+    )!;
+
+    fireEvent.click(within(target).getByRole("button", { name: "Clear selection match" }));
+    expect(within(target).queryByText("Matched selection")).toBeNull();
+    expect(target.classList.contains("message--trace-target")).toBe(false);
+    expect(matchedContext?.classList.contains("sent-context--trace-target")).toBe(false);
+    await waitFor(() => expect(document.activeElement).toBe(matchedContextOpen));
+
+    const switchedState = structuredClone(state);
+    switchedState.activeConversationId = "conversation-2";
+    switchedState.modelPicker.conversationId = "conversation-2";
+    switchedState.conversations.push({
+      id: "conversation-2",
+      title: "Another conversation",
+      createdAt: "2026-07-25T00:00:05.000Z",
+      updatedAt: "2026-07-25T00:00:05.000Z",
+      messages: [],
+    });
+    sendHostMessage({ type: "state", state: switchedState });
+    expect(screen.queryByText("Question that used this selection")).toBeNull();
+
+    sendHostMessage({ type: "state", state });
+    const remountedTarget = screen
+      .getAllByRole("article", { name: "Your question" })
+      .find((article) => article.textContent?.includes("Question that used this selection"))!;
+    expect(within(remountedTarget).queryByText("Matched selection")).toBeNull();
+    expect(remountedTarget.classList.contains("message--trace-target")).toBe(false);
+    fireEvent.click(
+      within(remountedTarget).getByRole("button", { name: "Show more code context" }),
+    );
+    expect(
+      within(remountedTarget)
+        .getByText("matched.ts")
+        .closest(".sent-context")
+        ?.classList.contains("sent-context--trace-target"),
+    ).toBe(false);
+  });
+
+  it("keeps actionable warnings visible until dismissal while informational notices expire", async () => {
+    vi.useFakeTimers();
+    render(<App />);
+    sendHostMessage({ type: "state", state: makeState() });
+
+    sendHostMessage({ type: "notice", level: "warning", message: "The source file changed." });
+    const warning = screen.getByText("The source file changed.").closest(".toast") as HTMLElement;
+    expect(warning).toBeTruthy();
+
+    await act(() => vi.advanceTimersByTimeAsync(8_000));
+    expect(screen.getByText("The source file changed.")).toBeTruthy();
+    fireEvent.click(within(warning).getByRole("button", { name: "关闭提示" }));
+    expect(screen.queryByText("The source file changed.")).toBeNull();
+
+    sendHostMessage({ type: "notice", level: "info", message: "Copied." });
+    expect(screen.getByText("Copied.")).toBeTruthy();
+    await act(() => vi.advanceTimersByTimeAsync(2_600));
+    expect(screen.queryByText("Copied.")).toBeNull();
   });
 
   it("tracks the current prompt in the question rail while the transcript scrolls", async () => {
@@ -3124,6 +3700,228 @@ describe("Ask2GPT webview", () => {
     });
   });
 
+  it("turns plain-text and inline-code file locations into source reference actions", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push(
+      {
+        id: "question-source-links",
+        role: "user",
+        markdown: "Where is this implemented?",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:01.000Z",
+        contexts: [
+          makeContext({
+            id: "vector-store-source",
+            fileName: "06_vector_store.py",
+            language: "python",
+            startLine: 1,
+            endLine: 80,
+          }),
+        ],
+      },
+      {
+        id: "answer-source-links",
+        role: "assistant",
+        markdown: "Start at 06_vector_store.py:34, then compare `06_vector_store.py:35-36`.",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:02.000Z",
+      },
+    );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "answer-source-links": {
+          fileReferences: ["06_vector_store.py:34", "06_vector_store.py:35-36"],
+          sourceSymbols: [],
+        },
+      },
+    };
+    sendHostMessage({ type: "state", state });
+
+    const plain = await screen.findByRole("button", {
+      name: "Open 06_vector_store.py:34 in the editor",
+    });
+    const inline = screen.getByRole("button", {
+      name: "Open 06_vector_store.py:35-36 in the editor",
+    });
+    fireEvent.click(plain);
+    fireEvent.click(inline);
+
+    expect(posted).toContainEqual({
+      type: "openSourceReference",
+      conversationId: "conversation-1",
+      messageId: "answer-source-links",
+      kind: "file-line",
+      reference: "06_vector_store.py:34",
+    });
+    expect(posted).toContainEqual({
+      type: "openSourceReference",
+      conversationId: "conversation-1",
+      messageId: "answer-source-links",
+      kind: "file-line",
+      reference: "06_vector_store.py:35-36",
+    });
+  });
+
+  it("does not turn fenced code or existing HTTP links into local source actions", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push({
+      id: "answer-non-source-links",
+      role: "assistant",
+      markdown:
+        "```text\n06_vector_store.py:34\n```\n\n[06_vector_store.py:35](https://example.com/source)",
+      status: "complete",
+      createdAt: "2026-07-25T00:00:01.000Z",
+    });
+    sendHostMessage({ type: "state", state });
+
+    const external = await screen.findByRole("link", { name: "06_vector_store.py:35" });
+    expect(document.querySelector(".source-reference")).toBeNull();
+    expect(screen.getByText("06_vector_store.py:34", { selector: "code" })).toBeTruthy();
+    fireEvent.click(external);
+    expect(posted).toContainEqual({
+      type: "openExternal",
+      url: "https://example.com/source",
+    });
+  });
+
+  it("leaves file and symbol references inert without host authorization", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push({
+      id: "answer-without-source-hints",
+      role: "assistant",
+      markdown: "See missing.py:10 and `missing.py:11`, then call `missing_helper()`.",
+      status: "complete",
+      createdAt: "2026-07-25T00:00:01.000Z",
+    });
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText(/See missing\.py:10/u)).toBeTruthy();
+    expect(screen.getByText("missing.py:11", { selector: "code" })).toBeTruthy();
+    expect(screen.getByText("missing_helper()", { selector: "code" })).toBeTruthy();
+    expect(document.querySelector(".source-reference")).toBeNull();
+  });
+
+  it("links known attached functions while leaving unknown inline code unchanged", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push(
+      {
+        id: "question-symbol-link",
+        role: "user",
+        markdown: "Explain this function",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:01.000Z",
+        contexts: [
+          makeContext({
+            id: "symbol-source",
+            fileName: "06_vector_store.py",
+            language: "python",
+            content: "def get_embeddings_endpoint():\n    return endpoint",
+            startLine: 21,
+            endLine: 22,
+          }),
+        ],
+      },
+      {
+        id: "answer-symbol-link",
+        role: "assistant",
+        markdown: "Call `get_embeddings_endpoint()`; do not call `unknown_helper()`.",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:02.000Z",
+      },
+    );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "answer-symbol-link": {
+          fileReferences: [],
+          sourceSymbols: ["get_embeddings_endpoint"],
+        },
+      },
+    };
+    sendHostMessage({ type: "state", state });
+
+    const known = await screen.findByRole("button", {
+      name: "Find the definition of get_embeddings_endpoint()",
+    });
+    const unknown = screen.getByText("unknown_helper()", { selector: "code" });
+    expect(unknown.closest("button")).toBeNull();
+    fireEvent.click(known);
+    expect(posted).toContainEqual({
+      type: "openSourceReference",
+      conversationId: "conversation-1",
+      messageId: "answer-symbol-link",
+      kind: "symbol",
+      reference: "get_embeddings_endpoint()",
+    });
+  });
+
+  it("does not borrow source authorization across a newer user turn without context", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.conversations[0]!.messages.push(
+      {
+        id: "older-question-with-source",
+        role: "user",
+        markdown: "Explain the old source",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:01.000Z",
+        contexts: [
+          makeContext({
+            id: "older-source",
+            fileName: "older.py",
+            language: "python",
+            content: "def older_helper():\n    return True",
+            startLine: 1,
+            endLine: 2,
+          }),
+        ],
+      },
+      {
+        id: "older-answer-with-hints",
+        role: "assistant",
+        markdown: "See older.py:1 and `older_helper()`.",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:02.000Z",
+      },
+      {
+        id: "newer-question-without-source",
+        role: "user",
+        markdown: "What about this new turn?",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:03.000Z",
+      },
+      {
+        id: "newer-answer-without-hints",
+        role: "assistant",
+        markdown: "See older.py:1 and `older_helper()`.",
+        status: "complete",
+        createdAt: "2026-07-25T00:00:04.000Z",
+      },
+    );
+    state.sourceTraceHints = {
+      "conversation-1": {
+        "older-answer-with-hints": {
+          fileReferences: ["older.py:1"],
+          sourceSymbols: ["older_helper"],
+        },
+      },
+    };
+    sendHostMessage({ type: "state", state });
+
+    const answers = await screen.findAllByRole("article", { name: "Answer" });
+    expect(answers[0]!.querySelectorAll(".source-reference")).toHaveLength(2);
+    expect(answers[1]!.querySelector(".source-reference")).toBeNull();
+    expect(within(answers[1]!).getByText("older_helper()", { selector: "code" })).toBeTruthy();
+  });
+
   it("blocks sending until first-time chat setup completes", async () => {
     render(<App />);
     const state = makeState();
@@ -3287,6 +4085,41 @@ function makeContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot 
     content: "export const answer = 42;",
     charCount: 25,
     unsaved: false,
+    ...overrides,
+  };
+}
+
+function makeNotebookContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot {
+  return makeContext({
+    kind: "selection",
+    fileName: "notebooks/analysis.ipynb",
+    uri: "file:///workspace/notebooks/analysis.ipynb",
+    language: "python",
+    content: "def score(rows):\n    return len(rows)",
+    charCount: 37,
+    sourceAnchor: makeNotebookAnchor(),
+    ...overrides,
+  });
+}
+
+function makeNotebookAnchor(
+  overrides: Partial<NotebookSourceAnchorV2> = {},
+): NotebookSourceAnchorV2 {
+  return {
+    formatVersion: 2,
+    notebookUri: "file:///workspace/notebooks/analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 5,
+    cellIndex: 3,
+    cellKind: "code",
+    cellLanguage: "python",
+    scope: "range",
+    documentVersion: 2,
+    range: { startLine: 2, startCharacter: 0, endLine: 11, endCharacter: 20 },
+    contentSha256: "a".repeat(64),
+    normalizedContentSha256: "b".repeat(64),
+    cellContentSha256: "c".repeat(64),
+    normalizedCellContentSha256: "d".repeat(64),
     ...overrides,
   };
 }

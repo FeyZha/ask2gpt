@@ -1,4 +1,4 @@
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import {
   copyFile,
   mkdir,
@@ -12,7 +12,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-import type { Conversation } from "@ask2gpt/protocol";
+import type { ContextSnapshot, Conversation, NotebookSourceAnchorV2 } from "@ask2gpt/protocol";
 import { describe, expect, it, onTestFinished } from "vitest";
 
 import {
@@ -182,6 +182,208 @@ describe("ConversationStore", () => {
       selectedModelId: "mode-very-high",
       archivedAt: "2026-07-23T02:03:04.000Z",
     });
+  });
+
+  it("round-trips the packaged context transport receipt without exposing source text", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const value = conversation("Packaged context");
+    const content = "export const packaged = true;";
+    const sourceAnchor = {
+      formatVersion: 1 as const,
+      contentSha256: digest(content),
+      normalizedContentSha256: digest(content),
+      documentVersion: 12,
+      beforeLineSha256: digest("before"),
+      afterLineSha256: digest("after"),
+      workspaceRelativePath: "src/worker.ts",
+    };
+    value.messages[0]!.contexts = [
+      {
+        id: "context-packaged",
+        kind: "selection",
+        fileName: "worker.ts",
+        uri: "file:///workspace/worker.ts",
+        language: "typescript",
+        startLine: 3,
+        endLine: 5,
+        content,
+        charCount: 29,
+        unsaved: true,
+        sourceAnchor,
+      },
+    ];
+    value.messages[0]!.contextTransportVersion = 2;
+
+    await store.save(value);
+
+    expect(await readFile(primaryPath(root, FIRST_ID), "utf8")).not.toContain(
+      "export const packaged",
+    );
+    expect((await store.loadAll())[0]?.messages[0]).toMatchObject({
+      contextTransportVersion: 2,
+      contexts: [expect.objectContaining({ id: "context-packaged", sourceAnchor })],
+    });
+  });
+
+  it("normalizes version-1 anchors strictly while accepting legacy snapshots without one", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const content = "first  \r\nsecond\t ";
+    const validAnchor = {
+      formatVersion: 1,
+      contentSha256: digest(content),
+      normalizedContentSha256: digest("first\nsecond"),
+      documentVersion: 4,
+      workspaceRelativePath: "repo/src/source.ts",
+    };
+
+    for (const sourceAnchor of [
+      { ...validAnchor, contentSha256: "A".repeat(64) },
+      { ...validAnchor, normalizedContentSha256: "0".repeat(64) },
+      { ...validAnchor, documentVersion: -1 },
+      { ...validAnchor, workspaceRelativePath: "../source.ts" },
+      { ...validAnchor, unexpected: true },
+    ]) {
+      const invalid = conversation("Invalid anchor");
+      Object.assign(invalid.messages[0]!, {
+        contexts: [
+          {
+            id: "context-anchor-invalid",
+            kind: "selection",
+            fileName: "source.ts",
+            uri: "file:///workspace/source.ts",
+            language: "typescript",
+            startLine: 1,
+            endLine: 2,
+            content,
+            charCount: content.length,
+            unsaved: false,
+            sourceAnchor,
+          },
+        ],
+      });
+      await expect(store.save(invalid)).rejects.toThrow("Invalid conversation context snapshot");
+    }
+
+    const legacy = conversation("Legacy anchorless context");
+    legacy.messages[0]!.contexts = [
+      {
+        id: "context-anchorless",
+        kind: "selection",
+        fileName: "source.ts",
+        uri: "file:///workspace/source.ts",
+        language: "typescript",
+        startLine: 1,
+        endLine: 1,
+        content: "legacy",
+        charCount: 6,
+        unsaved: false,
+      },
+    ];
+    await store.save(legacy);
+    expect((await store.loadAll())[0]?.messages[0]?.contexts?.[0]?.sourceAnchor).toBeUndefined();
+  });
+
+  it("preserves a future-version context while dropping unsupported anchor metadata", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const future = conversation("Future anchor");
+    const context = {
+      id: "context-future-anchor",
+      kind: "selection",
+      fileName: "future.ts",
+      uri: "file:///workspace/future.ts",
+      language: "typescript",
+      startLine: 1,
+      endLine: 1,
+      content: "future()",
+      charCount: 8,
+      unsaved: false,
+    };
+    Object.assign(context, {
+      sourceAnchor: { formatVersion: 3, opaqueFutureField: "ignored by 0.1.3" },
+    });
+    Object.assign(future.messages[0]!, { contexts: [context] });
+
+    await store.save(future);
+
+    expect((await store.loadAll())[0]?.messages[0]?.contexts?.[0]).toMatchObject({
+      id: "context-future-anchor",
+      content: "future()",
+    });
+    expect((await store.loadAll())[0]?.messages[0]?.contexts?.[0]?.sourceAnchor).toBeUndefined();
+  });
+
+  it("round-trips strict notebook cell anchors without persisting virtual cell URIs", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const value = conversation("Notebook anchor");
+    const content = "answer = 42\nprint(answer)";
+    const sourceAnchor = notebookAnchor(content, {
+      scope: "range",
+      range: { startLine: 0, startCharacter: 0, endLine: 1, endCharacter: 13 },
+      beforeCellSha256: digest("# Setup"),
+      afterCellSha256: digest("# Result"),
+    });
+    value.messages[0]!.contexts = [
+      notebookContext("notebook-context", content, sourceAnchor, 1, 2),
+    ];
+
+    await store.save(value);
+
+    const loaded = (await store.loadAll())[0]?.messages[0]?.contexts?.[0];
+    expect(loaded).toMatchObject({
+      uri: "file:///workspace/analysis.ipynb",
+      fileName: "analysis.ipynb",
+      sourceAnchor,
+    });
+    expect(JSON.stringify(loaded)).not.toContain("vscode-notebook-cell:");
+  });
+
+  it("rejects forged or internally inconsistent notebook anchors", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const content = "first\nsecond";
+    const valid = notebookAnchor(content);
+    const invalidAnchors: unknown[] = [
+      { ...valid, notebookUri: "file:///workspace/other.ipynb" },
+      { ...valid, notebookUri: "vscode-notebook-cell:/workspace/analysis.ipynb#0" },
+      { ...valid, cellLanguage: "javascript" },
+      { ...valid, cellContentSha256: "0".repeat(64) },
+      { ...valid, unexpected: true },
+      // A whole-cell claim must cover the actual final line and character.
+      { ...valid, range: { startLine: 0, startCharacter: 0, endLine: 0, endCharacter: 5 } },
+    ];
+
+    for (const [index, sourceAnchor] of invalidAnchors.entries()) {
+      const invalid = conversation(`Invalid notebook anchor ${index}`);
+      invalid.messages[0]!.contexts = [
+        notebookContext(`invalid-notebook-${index}`, content, sourceAnchor as never, 1, 2),
+      ];
+      await expect(store.save(invalid)).rejects.toThrow("Invalid conversation context snapshot");
+    }
+  });
+
+  it("keeps identical source ranges from different notebook cells distinct", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const value = conversation("Duplicate cell source");
+    const content = "pass";
+    value.messages[0]!.contexts = [
+      notebookContext("cell-zero", content, notebookAnchor(content, { cellIndex: 0 }), 1, 1),
+      notebookContext("cell-one", content, notebookAnchor(content, { cellIndex: 1 }), 1, 1),
+    ];
+
+    await store.save(value);
+
+    const contexts = (await store.loadAll())[0]?.messages[0]?.contexts;
+    expect(contexts).toHaveLength(2);
+    expect(
+      contexts?.map((context) =>
+        context.sourceAnchor?.formatVersion === 2 ? context.sourceAnchor.cellIndex : undefined,
+      ),
+    ).toEqual([0, 1]);
   });
 
   it("round-trips a paused follow-up queue inside the encrypted conversation record", async () => {
@@ -954,6 +1156,62 @@ async function temporaryRoot() {
     await rm(root, { force: true, recursive: true });
   });
   return root;
+}
+
+function notebookAnchor(
+  content: string,
+  overrides: Partial<NotebookSourceAnchorV2> = {},
+): NotebookSourceAnchorV2 {
+  const lines = content.split(/\r\n|\r|\n/u);
+  return {
+    formatVersion: 2,
+    notebookUri: "file:///workspace/analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 8,
+    cellIndex: 0,
+    cellKind: "code",
+    cellLanguage: "python",
+    scope: "cell",
+    documentVersion: 5,
+    range: {
+      startLine: 0,
+      startCharacter: 0,
+      endLine: lines.length - 1,
+      endCharacter: lines.at(-1)!.length,
+    },
+    contentSha256: digest(content),
+    normalizedContentSha256: digest(content),
+    cellContentSha256: digest(content),
+    normalizedCellContentSha256: digest(content),
+    workspaceRelativePath: "analysis.ipynb",
+    ...overrides,
+  };
+}
+
+function notebookContext(
+  id: string,
+  content: string,
+  sourceAnchor: NotebookSourceAnchorV2,
+  startLine: number,
+  endLine: number,
+): ContextSnapshot {
+  return {
+    id,
+    kind: "selection",
+    fileName: "analysis.ipynb",
+    uri: "file:///workspace/analysis.ipynb",
+    language: "python",
+    startLine,
+    endLine,
+    content,
+    charCount: content.length,
+    unsaved: true,
+    sourceAnchor,
+  };
+}
+
+function digest(value: string) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function primaryPath(root: string, id: string) {

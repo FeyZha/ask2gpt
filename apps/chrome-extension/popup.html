@@ -164,6 +164,75 @@
             </p>
           </section>
 
+          <section
+            id="tab-pool-section"
+            class="tab-pool"
+            data-ready="false"
+            data-pending="false"
+            aria-labelledby="tab-pool-title"
+            aria-busy="false"
+          >
+            <div class="tab-pool__heading">
+              <div>
+                <span class="eyebrow">Relay 页面</span>
+                <strong id="tab-pool-title">页面池状态</strong>
+              </div>
+              <span id="tab-pool-capacity" class="pool-capacity">上限 3</span>
+            </div>
+            <p id="tab-pool-summary" class="tab-pool__summary">正在读取页面池状态…</p>
+
+            <dl class="tab-pool__metrics" aria-label="Relay 页面池计数">
+              <div>
+                <dt>管理中</dt>
+                <dd id="tab-pool-managed">—</dd>
+              </div>
+              <div>
+                <dt>运行</dt>
+                <dd id="tab-pool-active">—</dd>
+              </div>
+              <div>
+                <dt>可复用</dt>
+                <dd id="tab-pool-reusable">—</dd>
+              </div>
+              <div>
+                <dt>受保护</dt>
+                <dd id="tab-pool-protected">—</dd>
+              </div>
+              <div>
+                <dt>旧页面</dt>
+                <dd id="tab-pool-legacy">—</dd>
+              </div>
+            </dl>
+
+            <button
+              id="cleanup-managed-tabs"
+              class="tab-pool__action"
+              type="button"
+              aria-describedby="tab-pool-safety tab-pool-feedback"
+              disabled
+            >
+              清理安全闲置页
+            </button>
+            <p id="tab-pool-safety" class="tab-pool__safety">
+              仅关闭由 Relay 创建、确认无任务且可安全复用的闲置页。
+            </p>
+
+            <aside id="tab-pool-legacy-warning" class="tab-pool__warning" hidden>
+              <strong>发现 <span id="tab-pool-legacy-count">0</span> 个旧页面</strong>
+              <p id="tab-pool-legacy-detail">
+                旧页面不会自动删除；请在 Chrome 标签栏逐一确认后手动关闭。
+              </p>
+            </aside>
+            <p
+              id="tab-pool-feedback"
+              class="tab-pool__feedback"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              hidden
+            ></p>
+          </section>
+
           <section id="window-section" class="window-section" aria-labelledby="window-title" hidden>
             <div class="section-heading">
               <span id="window-title" class="eyebrow">VS Code 窗口</span>

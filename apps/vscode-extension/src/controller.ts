@@ -29,8 +29,8 @@ import { ConversationStore } from "./services/conversation-store";
 import { Ask2GPTError } from "./services/errors";
 import { SafeLogger } from "./services/logger";
 import { DEFAULT_CHATGPT_MODE_ID, mergeChatGptModeOptions } from "./services/model-options";
-import { buildVisiblePrompt, buildVisiblePromptPlan } from "./services/prompt-builder";
-import type { SelectionReference } from "./selection-reference";
+import { buildLegacyVisiblePromptPlan, buildVisiblePromptPlan } from "./services/prompt-builder";
+import type { NotebookCellReference, SelectionReference } from "./selection-reference";
 
 const ACTIVE_CONVERSATION_KEY = "ask2gpt.activeConversationId";
 const PENDING_TAB_CLOSES_KEY = "ask2gpt.pendingTabCloses.v1";
@@ -39,6 +39,7 @@ const SAVE_TRAILING_DELAY_MS = 1_000;
 const SAVE_MAX_WAIT_MS = 5_000;
 const MAX_QUEUED_FOLLOW_UPS = 20;
 const SAFE_QUEUE_ID = /^[A-Za-z0-9._-]{1,128}$/;
+const SAFE_CONVERSATION_ID = /^[A-Za-z0-9-]{1,128}$/;
 const TRANSCRIPT_PREFLIGHT_NOT_SENT_MESSAGE =
   "Ask2GPT could not capture a complete, stable pre-send transcript; the question was not sent.";
 
@@ -172,6 +173,9 @@ export class Ask2GPTController {
         !conversation.run &&
         !conversation.queuedFollowUps?.length,
     );
+    const legacyEmptyConversationIds = new Set(
+      legacyEmptyConversations.map((conversation) => conversation.id),
+    );
     if (legacyEmptyConversations.length > 0) {
       this.conversations = this.conversations.filter(
         (conversation) => !legacyEmptyConversations.includes(conversation),
@@ -186,24 +190,33 @@ export class Ask2GPTController {
       }
     }
 
-    if (!this.conversations.some((conversation) => !conversation.archivedAt)) {
-      this.conversations.unshift(this.createConversation());
-    }
-    const storedActive = this.extensionContext.workspaceState.get<string>(
+    const storedActive = this.extensionContext.workspaceState.get<unknown>(
       this.activeConversationKey,
     );
-    const storedConversation = this.conversations.find((item) => item.id === storedActive);
+    const storedConversation =
+      typeof storedActive === "string"
+        ? this.conversations.find((item) => item.id === storedActive)
+        : undefined;
     const restoredActive = storedConversation?.archivedAt ? undefined : storedConversation;
     if (restoredActive) {
       this.activeConversationId = restoredActive.id;
-    } else if (storedActive && !storedConversation) {
+    } else if (
+      typeof storedActive === "string" &&
+      SAFE_CONVERSATION_ID.test(storedActive) &&
+      !legacyEmptyConversationIds.has(storedActive) &&
+      !storedConversation
+    ) {
       // The active id can legitimately point at an ephemeral blank composer,
-      // which has no encrypted history record. Preserve that navigation state
-      // as a fresh blank draft instead of silently reopening another chat.
-      const replacement = this.createConversation();
-      this.conversations.unshift(replacement);
-      this.activeConversationId = replacement.id;
+      // which has no encrypted history record. Reuse that exact identity so a
+      // VS Code reload cannot turn one draft into a succession of new relay
+      // conversations. Invalid workspace-state ids still fall back safely.
+      const restoredDraft = this.createConversation(storedActive);
+      this.conversations.unshift(restoredDraft);
+      this.activeConversationId = restoredDraft.id;
     } else {
+      if (!this.conversations.some((conversation) => !conversation.archivedAt)) {
+        this.conversations.unshift(this.createConversation());
+      }
       this.activeConversationId = this.mostRecentUnarchivedConversation()!.id;
     }
     if (this.activeConversationId !== storedActive) {
@@ -325,6 +338,7 @@ export class Ask2GPTController {
         if (active) return active;
       }
 
+      const previousConversationId = this.activeConversationId;
       const conversation = this.createConversation();
       // A blank composer is an ephemeral draft, not conversation history.
       // Its first accepted message is the point where the encrypted record
@@ -342,6 +356,7 @@ export class Ask2GPTController {
         });
       }
       this.emitState();
+      this.releaseInactiveConversation(previousConversationId);
       this.scheduleActiveConversationPreparation();
       return conversation;
     });
@@ -370,6 +385,7 @@ export class Ask2GPTController {
       ) {
         return;
       }
+      const previousConversationId = this.activeConversationId;
       this.activeConversationId = id;
       this.ensureDraft(this.activeConversation);
       this.seedModelPicker(id);
@@ -381,7 +397,10 @@ export class Ask2GPTController {
         });
       }
       this.emitState();
-      this.scheduleActiveConversationPreparation();
+      if (previousConversationId !== id) {
+        this.releaseInactiveConversation(previousConversationId);
+      }
+      this.scheduleActiveConversationPreparation(previousConversationId !== id);
     });
   }
 
@@ -469,7 +488,10 @@ export class Ask2GPTController {
         }
       }
       this.emitState();
-      if (activeConversationChanged) this.scheduleActiveConversationPreparation();
+      if (activeConversationChanged) {
+        this.releaseInactiveConversation(id);
+        this.scheduleActiveConversationPreparation(true);
+      }
     });
   }
 
@@ -497,6 +519,7 @@ export class Ask2GPTController {
         this.archivingConversations.delete(id);
       }
 
+      const previousConversationId = this.activeConversationId;
       if (activate) {
         this.activeConversationId = id;
         this.ensureDraft(conversation);
@@ -510,7 +533,12 @@ export class Ask2GPTController {
         }
       }
       this.emitState();
-      if (activate) this.scheduleActiveConversationPreparation();
+      if (activate) {
+        if (previousConversationId !== id) {
+          this.releaseInactiveConversation(previousConversationId);
+        }
+        this.scheduleActiveConversationPreparation(previousConversationId !== id);
+      }
     });
   }
 
@@ -562,7 +590,10 @@ export class Ask2GPTController {
         }
       }
       this.emitState();
-      if (activeConversationChanged) this.scheduleActiveConversationPreparation();
+      if (activeConversationChanged) {
+        this.releaseInactiveConversation(id);
+        this.scheduleActiveConversationPreparation(true);
+      }
 
       try {
         const delivered = await this.backend.closeConversation(id);
@@ -588,6 +619,25 @@ export class Ask2GPTController {
       const conversationId = this.activeConversationId;
       if (!this.hasDraftTarget(conversationId)) return false;
       this.attachSelection(conversationId, capturedReference);
+      return true;
+    });
+  }
+
+  attachNotebookCells(
+    conversationId = this.activeConversationId,
+    references?: readonly NotebookCellReference[],
+  ) {
+    if (!this.hasDraftTarget(conversationId)) return;
+    const contexts = this.contextService.captureNotebookCells(references);
+    if (contexts.length > 0) this.addContexts(contexts, conversationId);
+  }
+
+  attachNotebookCellsToActiveConversation(references: readonly NotebookCellReference[]) {
+    const capturedReferences = references.map((reference) => ({ ...reference }));
+    return this.enqueueConversationNavigation(async () => {
+      const conversationId = this.activeConversationId;
+      if (!this.hasDraftTarget(conversationId)) return false;
+      this.attachNotebookCells(conversationId, capturedReferences);
       return true;
     });
   }
@@ -751,7 +801,9 @@ export class Ask2GPTController {
       markdown: question.trim(),
       status: "complete",
       createdAt: now,
-      ...(attachedContexts.length > 0 ? { contexts: attachedContexts } : {}),
+      ...(attachedContexts.length > 0
+        ? { contexts: attachedContexts, contextTransportVersion: 2 as const }
+        : {}),
     };
     conversation.messages.push(userMessage);
     this.updateAutomaticTitle(conversation, question);
@@ -1170,6 +1222,7 @@ export class Ask2GPTController {
     const previousMarkdown = message.markdown;
     const previousStatus = message.status;
     const previousRunError = message.runError;
+    const previousContextTransportVersion = userMessage.contextTransportVersion;
     const previousSyncStatus = conversation.syncStatus;
     const previousUpdatedAt = conversation.updatedAt;
     const runId = randomUUID();
@@ -1177,6 +1230,7 @@ export class Ask2GPTController {
     message.markdown = "";
     message.status = "streaming";
     delete message.runError;
+    if (userMessage.contexts?.length) userMessage.contextTransportVersion = 2;
     conversation.run = {
       id: runId,
       messageId: message.id,
@@ -1211,6 +1265,7 @@ export class Ask2GPTController {
       message.markdown = previousMarkdown;
       message.status = previousStatus;
       message.runError = previousRunError;
+      userMessage.contextTransportVersion = previousContextTransportVersion;
       conversation.syncStatus = previousSyncStatus;
       if (conversation.updatedAt === startedAt) conversation.updatedAt = previousUpdatedAt;
       await this.store.save(conversation).catch((saveError: unknown) => {
@@ -1840,18 +1895,19 @@ export class Ask2GPTController {
     this.modelPickers.set(conversationId, { ...current, ...update, conversationId });
   }
 
-  private scheduleActiveConversationPreparation() {
+  private scheduleActiveConversationPreparation(forceLeaseRenewal = false) {
     const conversation = this.activeConversation;
     if (
       !conversation ||
       this.disposed ||
       !isBackendReady(this.backendStatus) ||
       conversation.archivedAt ||
-      conversation.run ||
-      this.dispatchingConversations.has(conversation.id) ||
       this.deletingConversations.has(conversation.id) ||
       this.archivingConversations.has(conversation.id) ||
-      this.conversationPreparations.has(conversation.id)
+      (!forceLeaseRenewal && conversation.run) ||
+      (!forceLeaseRenewal && this.dispatchingConversations.has(conversation.id)) ||
+      (!forceLeaseRenewal && this.conversationPreparations.has(conversation.id)) ||
+      (!conversation.remoteUrl && !hasVisibleConversationMessages(conversation))
     ) {
       return;
     }
@@ -1885,11 +1941,39 @@ export class Ask2GPTController {
         });
       })
       .finally(() => {
-        this.conversationPreparations.delete(conversation.id);
+        if (this.conversationPreparations.get(conversation.id) === task) {
+          this.conversationPreparations.delete(conversation.id);
+        }
       });
     this.conversationPreparations.set(conversation.id, task);
     this.backendTasks.add(task);
     void task.finally(() => this.backendTasks.delete(task));
+  }
+
+  private releaseInactiveConversation(conversationId: string) {
+    const releaseConversation = this.backend.releaseConversation;
+    if (this.disposed || !conversationId || !releaseConversation) return;
+
+    let release: Promise<boolean>;
+    try {
+      // Start the release before preparing the newly active conversation so
+      // Relay observes both commands in navigation order. Its completion is
+      // deliberately detached from the user-facing navigation transaction.
+      release = releaseConversation.call(this.backend, conversationId, "view", "inactive");
+    } catch (error) {
+      this.logger.error("conversation.view-release-failed", "TAB_RELEASE_FAILED", {
+        name: error instanceof Error ? error.name : "Unknown",
+      });
+      return;
+    }
+
+    // `false` is an expected best-effort outcome while rolling from a Relay
+    // that predates tab leases. Only an actual exception is diagnostic.
+    void Promise.resolve(release).catch((error: unknown) => {
+      this.logger.error("conversation.view-release-failed", "TAB_RELEASE_FAILED", {
+        name: error instanceof Error ? error.name : "Unknown",
+      });
+    });
   }
 
   private logRunDuration(event: string, startedAt: string) {
@@ -2037,7 +2121,9 @@ export class Ask2GPTController {
         markdown: queued.text,
         status: "complete",
         createdAt: attemptedAt,
-        ...(attachedContexts.length > 0 ? { contexts: attachedContexts } : {}),
+        ...(attachedContexts.length > 0
+          ? { contexts: attachedContexts, contextTransportVersion: 2 as const }
+          : {}),
       };
       conversation.messages.push(userMessage);
       this.updateAutomaticTitle(conversation, queued.text);
@@ -2433,10 +2519,10 @@ export class Ask2GPTController {
     }
   }
 
-  private createConversation(): Conversation {
+  private createConversation(id: string = randomUUID()): Conversation {
     const now = new Date().toISOString();
     return {
-      id: randomUUID(),
+      id,
       title: vscode.env.language.toLowerCase().startsWith("en") ? "New conversation" : "新对话",
       createdAt: now,
       updatedAt: now,
@@ -2569,6 +2655,20 @@ export class Ask2GPTController {
 }
 
 function haveSameExplicitContext(left: ContextSnapshot, right: ContextSnapshot) {
+  const leftNotebook = left.sourceAnchor?.formatVersion === 2 ? left.sourceAnchor : undefined;
+  const rightNotebook = right.sourceAnchor?.formatVersion === 2 ? right.sourceAnchor : undefined;
+  if (leftNotebook || rightNotebook) {
+    return (
+      leftNotebook !== undefined &&
+      rightNotebook !== undefined &&
+      left.uri === right.uri &&
+      leftNotebook.cellIndex === rightNotebook.cellIndex &&
+      leftNotebook.cellContentSha256 === rightNotebook.cellContentSha256 &&
+      left.startLine === right.startLine &&
+      left.endLine === right.endLine &&
+      left.content === right.content
+    );
+  }
   return (
     left.uri === right.uri &&
     left.startLine === right.startLine &&
@@ -2826,10 +2926,7 @@ function findMatchingMessageIndex(
 function isSameRemoteMessage(local: ConversationMessage, remote: RemoteHistoryMessage) {
   if (local.role !== remote.role) return false;
   if (local.markdown === remote.markdown) return true;
-  const visiblePrompt = visiblePromptForStoredMessage(local);
-  return Boolean(
-    visiblePrompt && renderedPromptPresentationMatches(remote.markdown, visiblePrompt),
-  );
+  return packagedPromptPresentationMatches(remote.markdown, local);
 }
 
 function canReuseByPosition(local: ConversationMessage, remote: RemoteHistoryMessage) {
@@ -2844,10 +2941,7 @@ function synchronizeRemoteMessage(
   remote: RemoteHistoryMessage,
   activeRunMessageId?: string,
 ) {
-  const visiblePrompt = visiblePromptForStoredMessage(local);
-  const preservePackagedQuestion = Boolean(
-    visiblePrompt && renderedPromptPresentationMatches(remote.markdown, visiblePrompt),
-  );
+  const preservePackagedQuestion = packagedPromptPresentationMatches(remote.markdown, local);
   const markdown = preservePackagedQuestion ? local.markdown : remote.markdown;
   const status = local.id === activeRunMessageId ? local.status : "complete";
   const runError = status === "error" ? local.runError : undefined;
@@ -2880,17 +2974,54 @@ function renderedPromptPresentationMatches(rendered: string, prompt: string) {
   );
 }
 
-function visiblePromptForStoredMessage(message: ConversationMessage) {
+function packagedPromptPresentationMatches(rendered: string, message: ConversationMessage) {
+  const presentation = promptPresentationForStoredMessage(message);
+  if (!presentation) return false;
+
+  const candidates = [presentation.prompt];
+  if (presentation.fileNames.length > 0) {
+    for (const separator of ["\n\n", "\n", " "]) {
+      const attachmentBlock = presentation.fileNames.join(separator);
+      candidates.push(
+        `${presentation.prompt}${separator}${attachmentBlock}`,
+        `${attachmentBlock}${separator}${presentation.prompt}`,
+      );
+    }
+  }
+
+  return candidates.some(
+    (candidate) =>
+      renderedPromptPresentationMatches(rendered, candidate) ||
+      rendered
+        .replace(/\r\n?/gu, "\n")
+        .replace(/\u00a0/gu, " ")
+        .trim() === promptInlinePresentationForTranscriptProof(candidate),
+  );
+}
+
+function promptPresentationForStoredMessage(message: ConversationMessage) {
   if (message.role !== "user" || !message.contexts || message.contexts.length === 0) {
     return undefined;
   }
   try {
-    return buildVisiblePrompt(message.markdown, message.contexts);
+    const plan = buildVisiblePromptPlan(message.markdown, message.contexts);
+    const legacyPlan = buildLegacyVisiblePromptPlan(message.markdown, message.contexts);
+    const packaged = message.contextTransportVersion === 2;
+    return {
+      prompt: packaged ? plan.prompt : legacyPlan.prompt,
+      fileNames: packaged
+        ? plan.attachments.map((attachment) => attachment.fileName)
+        : legacyPlan.attachmentFileNames,
+    };
   } catch {
     // Older encrypted records may contain context that a newer policy no
     // longer permits. A failed equivalence check must not abort history sync.
     return undefined;
   }
+}
+
+function visiblePromptForStoredMessage(message: ConversationMessage) {
+  return promptPresentationForStoredMessage(message)?.prompt;
 }
 
 function createRemoteMessage(

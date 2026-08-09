@@ -20,10 +20,15 @@ import {
   type ContextSnapshot,
   type Conversation,
   type ConversationMessage,
+  type NotebookSourceAnchorV2,
   type QueuedFollowUp,
   type RelayErrorPayload,
   type RunState,
+  type SourceAnchor,
+  type SourceAnchorV1,
 } from "@ask2gpt/protocol";
+
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "../source-anchor";
 
 const KEY_NAME = "ask2gpt.conversationEncryptionKey.v1";
 const KEY_INITIALIZATION_LOCK = ".conversation-key-initialization.lock";
@@ -116,8 +121,8 @@ export interface ConversationNamespaceLease {
 
 /**
  * Gives concurrent Extension Hosts for the same workspace distinct storage
- * roots. Slot zero is the pre-0.1.4 directory, preserving existing history for
- * the normal single-window case; additional windows use isolated subfolders.
+ * roots. Slot zero is the legacy stable directory, preserving existing history
+ * for the normal single-window case; additional windows use isolated subfolders.
  */
 export async function acquireConversationNamespaceLease(
   stableStoragePath: string,
@@ -962,6 +967,9 @@ function normalizeMessage(value: unknown, fallbackCreatedAt: string): Conversati
     status,
     createdAt: isIsoDate(value.createdAt) ? value.createdAt : fallbackCreatedAt,
     ...(contexts.length > 0 ? { contexts } : {}),
+    ...(role === "user" && contexts.length > 0 && value.contextTransportVersion === 2
+      ? { contextTransportVersion: 2 as const }
+      : {}),
     ...(runError ? { runError } : {}),
     ...(terminalReceipt ? { terminalReceipt } : {}),
   };
@@ -1045,9 +1053,7 @@ function normalizeContexts(value: unknown, legacyValue: unknown): ContextSnapsho
   for (const item of source) {
     const context = normalizeContext(item);
     if (!context) throw new Error("Invalid conversation context snapshot.");
-    const identity = [context.uri, context.startLine, context.endLine, context.content].join(
-      "\u0000",
-    );
+    const identity = contextIdentity(context);
     if (identities.has(identity)) continue;
     identities.add(identity);
     totalChars += context.content.length;
@@ -1083,6 +1089,20 @@ function normalizeContext(value: unknown): ContextSnapshot | undefined {
     return undefined;
   }
 
+  const unsupportedSourceAnchor = isUnsupportedSourceAnchor(value.sourceAnchor);
+  const sourceAnchor = unsupportedSourceAnchor
+    ? undefined
+    : normalizeSourceAnchor(
+        value.sourceAnchor,
+        value.content,
+        value.uri,
+        value.language,
+        value.startLine as number,
+        value.endLine as number,
+      );
+  if (value.sourceAnchor !== undefined && !unsupportedSourceAnchor && !sourceAnchor) {
+    return undefined;
+  }
   const id = typeof value.id === "string" ? value.id : legacyContextId(value);
   return {
     id,
@@ -1095,7 +1115,275 @@ function normalizeContext(value: unknown): ContextSnapshot | undefined {
     content: value.content,
     charCount: value.content.length,
     unsaved: value.unsaved,
+    ...(sourceAnchor ? { sourceAnchor } : {}),
   };
+}
+
+function normalizeSourceAnchor(
+  value: unknown,
+  content: string,
+  contextUri: string,
+  contextLanguage: string,
+  contextStartLine: number,
+  contextEndLine: number,
+): SourceAnchor | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) return undefined;
+  if (value.formatVersion === 2) {
+    return normalizeNotebookSourceAnchor(
+      value,
+      content,
+      contextUri,
+      contextLanguage,
+      contextStartLine,
+      contextEndLine,
+    );
+  }
+  return normalizeTextSourceAnchor(value, content);
+}
+
+function normalizeTextSourceAnchor(
+  value: Record<string, unknown>,
+  content: string,
+): SourceAnchorV1 | undefined {
+  const allowedKeys = new Set([
+    "formatVersion",
+    "contentSha256",
+    "normalizedContentSha256",
+    "documentVersion",
+    "beforeLineSha256",
+    "afterLineSha256",
+    "workspaceRelativePath",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return undefined;
+  if (
+    value.formatVersion !== 1 ||
+    !isSha256(value.contentSha256) ||
+    !isSha256(value.normalizedContentSha256) ||
+    !Number.isSafeInteger(value.documentVersion) ||
+    (value.documentVersion as number) < 0 ||
+    (value.beforeLineSha256 !== undefined && !isSha256(value.beforeLineSha256)) ||
+    (value.afterLineSha256 !== undefined && !isSha256(value.afterLineSha256)) ||
+    (value.workspaceRelativePath !== undefined &&
+      !isSafeWorkspaceRelativePath(value.workspaceRelativePath))
+  ) {
+    return undefined;
+  }
+  if (
+    value.contentSha256 !== sourceAnchorSha256(content) ||
+    value.normalizedContentSha256 !== sourceAnchorSha256(normalizeSourceAnchorContent(content))
+  ) {
+    return undefined;
+  }
+  return {
+    formatVersion: 1,
+    contentSha256: value.contentSha256,
+    normalizedContentSha256: value.normalizedContentSha256,
+    documentVersion: value.documentVersion as number,
+    ...(value.beforeLineSha256 ? { beforeLineSha256: value.beforeLineSha256 } : {}),
+    ...(value.afterLineSha256 ? { afterLineSha256: value.afterLineSha256 } : {}),
+    ...(value.workspaceRelativePath ? { workspaceRelativePath: value.workspaceRelativePath } : {}),
+  };
+}
+
+function normalizeNotebookSourceAnchor(
+  value: Record<string, unknown>,
+  content: string,
+  contextUri: string,
+  contextLanguage: string,
+  contextStartLine: number,
+  contextEndLine: number,
+): NotebookSourceAnchorV2 | undefined {
+  const allowedKeys = new Set([
+    "formatVersion",
+    "notebookUri",
+    "notebookType",
+    "notebookVersion",
+    "cellIndex",
+    "cellKind",
+    "cellLanguage",
+    "scope",
+    "documentVersion",
+    "range",
+    "contentSha256",
+    "normalizedContentSha256",
+    "cellContentSha256",
+    "normalizedCellContentSha256",
+    "beforeCellSha256",
+    "afterCellSha256",
+    "workspaceRelativePath",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return undefined;
+  if (
+    value.formatVersion !== 2 ||
+    typeof value.notebookUri !== "string" ||
+    value.notebookUri !== contextUri ||
+    !isAllowedNotebookContainerUri(value.notebookUri) ||
+    !isSafeBoundedLabel(value.notebookType, 128) ||
+    !isNonNegativeSafeInteger(value.notebookVersion) ||
+    !isNonNegativeSafeInteger(value.cellIndex) ||
+    (value.cellKind !== "code" && value.cellKind !== "markup") ||
+    !isSafeBoundedLabel(value.cellLanguage, 128) ||
+    value.cellLanguage !== contextLanguage ||
+    (value.scope !== "range" && value.scope !== "cell") ||
+    !isNonNegativeSafeInteger(value.documentVersion) ||
+    !isSha256(value.contentSha256) ||
+    !isSha256(value.normalizedContentSha256) ||
+    !isSha256(value.cellContentSha256) ||
+    !isSha256(value.normalizedCellContentSha256) ||
+    (value.beforeCellSha256 !== undefined && !isSha256(value.beforeCellSha256)) ||
+    (value.afterCellSha256 !== undefined && !isSha256(value.afterCellSha256)) ||
+    (value.workspaceRelativePath !== undefined &&
+      !isSafeWorkspaceRelativePath(value.workspaceRelativePath)) ||
+    !isNotebookCellRange(value.range)
+  ) {
+    return undefined;
+  }
+  if (
+    value.contentSha256 !== sourceAnchorSha256(content) ||
+    value.normalizedContentSha256 !== sourceAnchorSha256(normalizeSourceAnchorContent(content)) ||
+    (value.scope === "cell" &&
+      (value.cellContentSha256 !== value.contentSha256 ||
+        value.normalizedCellContentSha256 !== value.normalizedContentSha256))
+  ) {
+    return undefined;
+  }
+
+  const range = value.range;
+  const expectedEndLine =
+    range.endCharacter === 0 && range.endLine > range.startLine ? range.endLine : range.endLine + 1;
+  if (
+    range.startLine + 1 !== contextStartLine ||
+    Math.max(range.startLine + 1, expectedEndLine) !== contextEndLine ||
+    (value.scope === "range" && isEmptyCellRange(range)) ||
+    (value.scope === "cell" && !isFullCellRangeForContent(range, content))
+  ) {
+    return undefined;
+  }
+
+  return {
+    formatVersion: 2,
+    notebookUri: value.notebookUri,
+    notebookType: value.notebookType as string,
+    notebookVersion: value.notebookVersion as number,
+    cellIndex: value.cellIndex as number,
+    cellKind: value.cellKind,
+    cellLanguage: value.cellLanguage as string,
+    scope: value.scope,
+    documentVersion: value.documentVersion as number,
+    range: {
+      startLine: range.startLine as number,
+      startCharacter: range.startCharacter as number,
+      endLine: range.endLine as number,
+      endCharacter: range.endCharacter as number,
+    },
+    contentSha256: value.contentSha256,
+    normalizedContentSha256: value.normalizedContentSha256,
+    cellContentSha256: value.cellContentSha256,
+    normalizedCellContentSha256: value.normalizedCellContentSha256,
+    ...(value.beforeCellSha256 ? { beforeCellSha256: value.beforeCellSha256 } : {}),
+    ...(value.afterCellSha256 ? { afterCellSha256: value.afterCellSha256 } : {}),
+    ...(value.workspaceRelativePath ? { workspaceRelativePath: value.workspaceRelativePath } : {}),
+  };
+}
+
+function isUnsupportedSourceAnchor(value: unknown) {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.formatVersion) &&
+    (value.formatVersion as number) > 2
+  );
+}
+
+function contextIdentity(context: ContextSnapshot) {
+  const notebookIdentity =
+    context.sourceAnchor?.formatVersion === 2
+      ? [context.sourceAnchor.cellIndex, context.sourceAnchor.cellContentSha256]
+      : [];
+  return [
+    context.uri,
+    ...notebookIdentity,
+    context.startLine,
+    context.endLine,
+    context.content,
+  ].join("\u0000");
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isSafeBoundedLabel(value: unknown, maxLength: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= maxLength &&
+    !/[\p{Cc}\p{Cf}]/u.test(value)
+  );
+}
+
+function isAllowedNotebookContainerUri(value: string) {
+  return (
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    /^(?:file|untitled|vscode-remote):/u.test(value) &&
+    !/[\\\p{Cc}\p{Cf}]/u.test(value)
+  );
+}
+
+function isNotebookCellRange(
+  value: unknown,
+): value is Record<"startLine" | "startCharacter" | "endLine" | "endCharacter", number> {
+  if (!isRecord(value)) return false;
+  const allowedKeys = new Set(["startLine", "startCharacter", "endLine", "endCharacter"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
+  if (
+    !isNonNegativeSafeInteger(value.startLine) ||
+    !isNonNegativeSafeInteger(value.startCharacter) ||
+    !isNonNegativeSafeInteger(value.endLine) ||
+    !isNonNegativeSafeInteger(value.endCharacter)
+  ) {
+    return false;
+  }
+  return (
+    value.endLine > value.startLine ||
+    (value.endLine === value.startLine && value.endCharacter >= value.startCharacter)
+  );
+}
+
+function isEmptyCellRange(
+  range: Record<"startLine" | "startCharacter" | "endLine" | "endCharacter", number>,
+) {
+  return range.startLine === range.endLine && range.startCharacter === range.endCharacter;
+}
+
+function isFullCellRangeForContent(
+  range: Record<"startLine" | "startCharacter" | "endLine" | "endCharacter", number>,
+  content: string,
+) {
+  if (range.startLine !== 0 || range.startCharacter !== 0) return false;
+  const lines = content.split(/\r\n|\r|\n/u);
+  return range.endLine === lines.length - 1 && range.endCharacter === lines.at(-1)!.length;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+function isSafeWorkspaceRelativePath(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 1_024 ||
+    value.startsWith("/") ||
+    /^[A-Za-z]:\//u.test(value) ||
+    /[\\:\p{Cc}\p{Cf}]/u.test(value)
+  ) {
+    return false;
+  }
+  return value
+    .split("/")
+    .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
 function legacyContextId(context: Record<string, unknown>) {

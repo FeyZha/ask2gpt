@@ -43,7 +43,7 @@ describe("BrowserChatBackend", () => {
     expect(relay.sent.at(-1)).toMatchObject({
       type: "conversation.open",
       conversationId: "conversation",
-      payload: { remoteUrl, active: false },
+      payload: { remoteUrl, active: false, dispatchIntent: false, purpose: "view" },
     });
     expect((await backend.getStatus()).activeRuns).toBe(0);
   });
@@ -57,9 +57,27 @@ describe("BrowserChatBackend", () => {
     expect(relay.sent.at(-1)).toMatchObject({
       type: "conversation.open",
       conversationId: "conversation",
-      payload: { active: false, dispatchIntent: true },
+      payload: { active: false, dispatchIntent: true, purpose: "dispatch" },
     });
     expect((await backend.getStatus()).activeRuns).toBe(0);
+  });
+
+  it("keeps v15 rolling upgrades compatible with a pre-lease 0.1.1 Relay", async () => {
+    const relay = new FakeRelay();
+    relay.relayVersion = "0.1.1";
+    const backend = createBackend(relay);
+
+    await backend.prepareConversation("legacy-conversation", undefined, undefined, true);
+    const open = relay.sent.at(-1)!;
+    expect(open).toMatchObject({
+      type: "conversation.open",
+      payload: { active: false, dispatchIntent: true },
+    });
+    expect(open.payload).not.toHaveProperty("purpose");
+
+    const sendsBeforeRelease = relay.sent.length;
+    await expect(backend.releaseConversation("legacy-conversation")).resolves.toBe(false);
+    expect(relay.sent).toHaveLength(sendsBeforeRelease);
   });
 
   it("releases the reserved slot when send or regenerate throws", async () => {
@@ -156,6 +174,128 @@ describe("BrowserChatBackend", () => {
         conversationId: "conversation",
         payload: {
           requestId: request.id,
+          closeTab: true,
+          tabDisposition: "closed",
+        },
+      }),
+    );
+    await expect(closing).resolves.toBe(true);
+  });
+
+  it("releases a lease only after an exactly correlated acknowledgement", async () => {
+    const relay = new FakeRelay();
+    const backend = createBackend(relay);
+    await backend.send(request("conversation", "active-run"));
+
+    const releasing = backend.releaseConversation("conversation", "dispatch", "settled");
+    const release = relay.sent.at(-1)!;
+    expect(release).toMatchObject({
+      type: "conversation.release",
+      conversationId: "conversation",
+      payload: { purpose: "dispatch", reason: "settled" },
+    });
+    let settled = false;
+    void releasing.then(() => {
+      settled = true;
+    });
+    relay.emitEnvelope(
+      makeEnvelope({
+        type: "conversation.released",
+        instanceId: relay.instanceId,
+        conversationId: "conversation",
+        payload: {
+          requestId: release.id,
+          purpose: "view",
+          reason: "settled",
+        },
+      }),
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    relay.emitEnvelope(
+      makeEnvelope({
+        type: "conversation.released",
+        instanceId: relay.instanceId,
+        conversationId: "conversation",
+        payload: {
+          requestId: release.id,
+          purpose: "dispatch",
+          reason: "settled",
+        },
+      }),
+    );
+
+    await expect(releasing).resolves.toBe(true);
+    // Relinquishing the page lease is intentionally independent from the
+    // destructive close path and from Host-side run accounting.
+    await expect(backend.getStatus()).resolves.toMatchObject({ activeRuns: 1 });
+    expect(relay.sent.some((envelope) => envelope.type === "conversation.close")).toBe(false);
+  });
+
+  it("returns false when a lease release times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const relay = new FakeRelay();
+      const backend = createBackend(relay);
+
+      const releasing = backend.releaseConversation("conversation");
+      expect(relay.sent.at(-1)).toMatchObject({
+        type: "conversation.release",
+        payload: { purpose: "view", reason: "inactive" },
+      });
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      await expect(releasing).resolves.toBe(false);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves a pending release as false when the Relay disconnects", async () => {
+    const relay = new FakeRelay();
+    const backend = createBackend(relay);
+
+    const releasing = backend.releaseConversation("conversation", "view", "inactive");
+    relay.connected = false;
+    relay.emitConnectionChanged();
+
+    await expect(releasing).resolves.toBe(false);
+    await expect(backend.releaseConversation("conversation")).resolves.toBe(false);
+  });
+
+  it("keeps release errors conversation-scoped and leaves closeConversation usable", async () => {
+    const relay = new FakeRelay();
+    const backend = createBackend(relay);
+    const events: BackendEvent[] = [];
+    backend.onEvent((event) => events.push(event));
+
+    const releasing = backend.releaseConversation("conversation", "view", "inactive");
+    relay.emitEnvelope(
+      makeEnvelope({
+        type: "relay.error",
+        instanceId: relay.instanceId,
+        conversationId: "conversation",
+        payload: {
+          code: "CHATGPT_REMOTE_UNAVAILABLE",
+          message: "release failed",
+          recoverable: true,
+        },
+      }),
+    );
+    await expect(releasing).resolves.toBe(false);
+    expect(events).toHaveLength(0);
+    expect((await backend.getStatus()).error).toBeUndefined();
+
+    const closing = backend.closeConversation("conversation");
+    const close = relay.sent.at(-1)!;
+    relay.emitEnvelope(
+      makeEnvelope({
+        type: "conversation.closed",
+        instanceId: relay.instanceId,
+        conversationId: "conversation",
+        payload: {
+          requestId: close.id,
           closeTab: true,
           tabDisposition: "closed",
         },
@@ -669,7 +809,7 @@ describe("BrowserChatBackend", () => {
       connection: {
         phase: "syncing",
         hostVersion: "0.0.1",
-        relayVersion: "0.0.1",
+        relayVersion: "0.1.2",
         protocolVersion: 8,
         detectedProtocol: "ask2gpt.v15",
         lastConnectedAt: "2026-01-01T00:00:01.000Z",
@@ -864,6 +1004,7 @@ class FakeRelay {
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   };
   connected = true;
+  relayVersion = "0.1.2";
   authoritativeGeneration = 1;
   get connectionState() {
     return {
@@ -872,7 +1013,7 @@ class FakeRelay {
       browserDetected: true,
       hasStoredTrust: true,
       hostVersion: "0.0.1",
-      relayVersion: "0.0.1",
+      relayVersion: this.relayVersion,
       protocolVersion: 8,
       detectedProtocol: "ask2gpt.v15",
       lastConnectedAt: "2026-01-01T00:00:01.000Z",

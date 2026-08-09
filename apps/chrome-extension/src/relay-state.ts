@@ -11,8 +11,15 @@ import {
   type ValidatedContentEvent,
 } from "./security";
 
+export type TabProvenance = "created" | "borrowed" | "legacy-unknown";
+
 export interface TabRecord {
-  owned: true;
+  /**
+   * `false` is reserved for an adopted user tab. Older Relay versions require
+   * `owned === true`, so they fail closed instead of closing a borrowed page
+   * after a binary downgrade.
+   */
+  owned: boolean;
   instanceId: string;
   conversationId: string;
   tabId: number;
@@ -20,6 +27,22 @@ export interface TabRecord {
   remoteTitle?: string;
   projectScope?: string;
   createdAt: string;
+  /**
+   * How the Relay obtained the tab. This remains optional until every runtime
+   * constructor has migrated; absence is always treated as legacy-unknown and
+   * must never authorize recycling or closing a tab.
+   */
+  provenance?: TabProvenance;
+  /** Monotonic generation used to reject work from a previous tab lease. */
+  leaseEpoch?: number;
+  /** Most recent time the tab was used by its current lease. */
+  lastUsedAt?: string;
+  /** Present only after the current lease has become safely idle. */
+  idleSince?: string;
+  /** Durable request to return this lease to the managed pool once it is safe. */
+  releaseRequestedAt?: string;
+  /** Monotonic marker that permanently removes the tab from automatic management. */
+  userClaimedAt?: string;
 }
 
 export interface ActiveRunRecord {
@@ -261,7 +284,7 @@ export function isCompletedCanonicalizationCurrent(
 function parseTabRecord(value: unknown): TabRecord | undefined {
   if (
     !isRecord(value) ||
-    value.owned !== true ||
+    typeof value.owned !== "boolean" ||
     !isSafeId(value.instanceId) ||
     !isSafeId(value.conversationId) ||
     !Number.isSafeInteger(value.tabId) ||
@@ -295,8 +318,23 @@ function parseTabRecord(value: unknown): TabRecord | undefined {
   if (projectScope && remoteUrl && parseProjectPageUrl(remoteUrl)?.scope !== projectScope) {
     return undefined;
   }
+  const provenance =
+    value.provenance === undefined ? "legacy-unknown" : parseTabProvenance(value.provenance);
+  const leaseEpoch = value.leaseEpoch === undefined ? 0 : parseLeaseEpoch(value.leaseEpoch);
+  const lastUsedAt = value.lastUsedAt === undefined ? value.createdAt : value.lastUsedAt;
+  if (
+    !provenance ||
+    (provenance === "borrowed" ? value.owned !== false : value.owned !== true) ||
+    leaseEpoch === undefined ||
+    !isIsoDate(lastUsedAt) ||
+    (value.idleSince !== undefined && !isIsoDate(value.idleSince)) ||
+    (value.releaseRequestedAt !== undefined && !isIsoDate(value.releaseRequestedAt)) ||
+    (value.userClaimedAt !== undefined && !isIsoDate(value.userClaimedAt))
+  ) {
+    return undefined;
+  }
   return {
-    owned: true,
+    owned: provenance !== "borrowed",
     instanceId: value.instanceId,
     conversationId: value.conversationId,
     tabId: Number(value.tabId),
@@ -304,7 +342,25 @@ function parseTabRecord(value: unknown): TabRecord | undefined {
     ...(remoteUrl ? { remoteUrl } : {}),
     ...(remoteTitle ? { remoteTitle } : {}),
     ...(projectScope ? { projectScope } : {}),
+    provenance,
+    leaseEpoch,
+    lastUsedAt,
+    ...(typeof value.idleSince === "string" ? { idleSince: value.idleSince } : {}),
+    ...(typeof value.releaseRequestedAt === "string"
+      ? { releaseRequestedAt: value.releaseRequestedAt }
+      : {}),
+    ...(typeof value.userClaimedAt === "string" ? { userClaimedAt: value.userClaimedAt } : {}),
   };
+}
+
+function parseTabProvenance(value: unknown): TabProvenance | undefined {
+  if (value === "created" || value === "borrowed" || value === "legacy-unknown") return value;
+  return undefined;
+}
+
+function parseLeaseEpoch(value: unknown) {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) return undefined;
+  return Number(value);
 }
 
 function parseProjectScope(value: unknown) {
@@ -516,9 +572,10 @@ function parseRemoteAdoptionStage(
     return value.remoteAdoptionStage as ActiveRunRecord["remoteAdoptionStage"];
   }
   if (value.remoteAdoptionStage !== undefined) return undefined;
-  // Upgrade an in-flight 0.1.7 record conservatively. A run which had not yet
-  // observed its first /c route can still do so; every other legacy run stays
-  // locked because its canonicalization history is unknowable.
+  // Upgrade a legacy in-flight record without an explicit adoption stage
+  // conservatively. A run which had not yet observed its first /c route can
+  // still do so; every other legacy run stays locked because its
+  // canonicalization history is unknowable.
   return value.allowRemoteAdoption === true ? "initial" : "locked";
 }
 

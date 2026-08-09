@@ -2,6 +2,10 @@ import { PROTOCOL_VERSION } from "@ask2gpt/protocol";
 import * as vscode from "vscode";
 
 import { Ask2GPTController } from "./controller";
+import {
+  createFindRelatedTurnCommand,
+  type ActiveTraceSelection,
+} from "./find-related-turn-command";
 import { BrowserChatBackend } from "./services/browser-chat-backend";
 import { ChromeRelayServer } from "./services/chrome-relay-server";
 import { ContextService } from "./services/context-service";
@@ -19,7 +23,16 @@ import {
   createSelectionHandoff,
 } from "./selection-handoff";
 import { registerSelectionCodeActionProvider } from "./selection-code-action";
-import { selectionReferenceFromEditor, type SelectionReference } from "./selection-reference";
+import {
+  isClaimedNotebookCellCommandTarget,
+  isNotebookCellReference,
+  isOpenNotebookDocumentCommandTarget,
+  notebookCellReferencesFromEditor,
+  resolveNotebookCellCommandTarget,
+  selectionReferenceFromEditor,
+  type NotebookCellReference,
+  type SelectionReference,
+} from "./selection-reference";
 import { Ask2GPTViewProvider } from "./webview-provider";
 
 let shutdownResources:
@@ -33,10 +46,13 @@ let shutdownResources:
   | undefined;
 let shutdownPromise: Promise<void> | undefined;
 
+export const FIND_RELATED_TURN_COMMAND = "ask2gpt.findRelatedTurn";
+export const ATTACH_NOTEBOOK_CELL_COMMAND = "ask2gpt.attachNotebookCell";
+
 export async function activate(context: vscode.ExtensionContext) {
   const logger = new SafeLogger();
 
-  // Keep the existing workspace namespace stable so 0.1.3 conversation
+  // Keep the existing workspace namespace stable so encrypted conversation
   // history and Chrome relay state remain available after an upgrade.
   const storageNamespaceId = await resolveStorageNamespaceId(context.workspaceState);
   const packageJson: unknown = context.extension.packageJSON;
@@ -46,7 +62,7 @@ export async function activate(context: vscode.ExtensionContext) {
     "version" in packageJson &&
     typeof packageJson.version === "string"
       ? packageJson.version
-      : "0.0.1";
+      : "0.1.3";
 
   // Records remain inside extension-private global storage, but each relay
   // instance gets its own namespace to prevent cross-window lost updates.
@@ -130,6 +146,14 @@ export async function activate(context: vscode.ExtensionContext) {
   );
   const handoffSelection = createSelectionHandoff(controller, provider);
   const attachSelectionAndOpen = async (reference: SelectionReference | undefined) => {
+    if (!reference) {
+      void vscode.window.showWarningMessage(
+        vscode.env.language.toLowerCase().startsWith("zh")
+          ? "请先在编辑器中选择代码。"
+          : "Select code in the editor first.",
+      );
+      return;
+    }
     try {
       await handoffSelection(reference);
     } catch (error) {
@@ -146,6 +170,126 @@ export async function activate(context: vscode.ExtensionContext) {
     () => selectionReferenceFromEditor(vscode.window.activeTextEditor),
     attachSelectionAndOpen,
   );
+  const attachNotebookCellsAndOpen = async (
+    references: readonly NotebookCellReference[] | undefined,
+  ) => {
+    if (!references?.length) {
+      void vscode.window.showWarningMessage(
+        vscode.env.language.toLowerCase().startsWith("zh")
+          ? "请先在 Notebook 中选择一个或多个 Cell。"
+          : "Select one or more notebook cells first.",
+      );
+      return;
+    }
+    try {
+      if (!(await controller.attachNotebookCellsToActiveConversation(references))) return;
+      await provider.show(true);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : vscode.env.language.toLowerCase().startsWith("zh")
+            ? "无法附加当前 Notebook Cell。"
+            : "Could not attach the current notebook cell.";
+      void vscode.window.showWarningMessage(message);
+    }
+  };
+  const notebookTraceSelection = (
+    cell: vscode.NotebookCell,
+    reference: NotebookCellReference,
+  ): ActiveTraceSelection => {
+    const range =
+      reference.scope === "range"
+        ? new vscode.Range(
+            reference.startLine,
+            reference.startCharacter,
+            reference.endLine,
+            reference.endCharacter,
+          )
+        : undefined;
+    const selectedContent = range ? cell.document.getText(range) : cell.document.getText();
+    const notebook = cell.notebook;
+    const viewColumn = vscode.window.visibleNotebookEditors.find(
+      (editor) => editor.notebook === notebook,
+    )?.viewColumn;
+    return {
+      reference,
+      selectedContent,
+      restoreFocus: async () => {
+        try {
+          const restored = await vscode.window.showNotebookDocument(notebook, {
+            preserveFocus: false,
+            selections: [new vscode.NotebookRange(reference.cellIndex, reference.cellIndex + 1)],
+            viewColumn,
+          });
+          restored.revealRange(
+            new vscode.NotebookRange(reference.cellIndex, reference.cellIndex + 1),
+            vscode.NotebookEditorRevealType.InCenterIfOutsideViewport,
+          );
+        } catch {
+          // A closed notebook cannot turn a successful trace into a command failure.
+        }
+      },
+    };
+  };
+  const findRelatedTurn = createFindRelatedTurnCommand({
+    getActiveSelection: (commandTarget) => {
+      const resolvedTarget = resolveNotebookCellCommandTarget(
+        commandTarget,
+        vscode.workspace.notebookDocuments,
+        vscode.window.activeTextEditor,
+      );
+      if (resolvedTarget) {
+        return notebookTraceSelection(resolvedTarget.cell, resolvedTarget.reference);
+      }
+      if (isClaimedNotebookCellCommandTarget(commandTarget)) return undefined;
+
+      const editor = vscode.window.activeTextEditor;
+      const reference = selectionReferenceFromEditor(editor);
+      if (editor && reference) {
+        const document = editor.document;
+        const selection = editor.selection;
+        const viewColumn = editor.viewColumn;
+        return {
+          reference,
+          selectedContent: document.getText(selection),
+          restoreFocus: async () => {
+            try {
+              await vscode.window.showTextDocument(document, {
+                preserveFocus: false,
+                selection,
+                viewColumn,
+              });
+            } catch {
+              // Navigation already succeeded; a closing editor must not turn
+              // focus restoration into a false command failure.
+            }
+          },
+        };
+      }
+
+      const notebookEditor = vscode.window.activeNotebookEditor;
+      const notebookReference = notebookCellReferencesFromEditor(notebookEditor, editor)?.[0];
+      if (!notebookEditor || !notebookReference) return undefined;
+      const cell = notebookEditor.notebook.cellAt(notebookReference.cellIndex);
+      return notebookTraceSelection(cell, notebookReference);
+    },
+    getState: () => controller.getState(),
+    isZh: () => vscode.env.language.toLowerCase().startsWith("zh"),
+    showWarningMessage: (message) => vscode.window.showWarningMessage(message),
+    showInformationMessage: (message, ...items) =>
+      vscode.window.showInformationMessage(message, ...items),
+    showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
+    attachSelectionAndOpen: async (reference) => {
+      if ("type" in reference) return attachNotebookCellsAndOpen([reference]);
+      return attachSelectionAndOpen(reference);
+    },
+    selectConversation: async (conversationId) => controller.selectConversation(conversationId),
+    unarchiveConversation: async (conversationId, activate) =>
+      controller.unarchiveConversation(conversationId, activate),
+    revealTurn: async (conversationId, messageId, contextId) =>
+      provider.revealTurn(conversationId, messageId, contextId),
+  });
   const selectionCodeActions = registerSelectionCodeActionProvider();
   context.subscriptions.push(
     provider,
@@ -164,6 +308,40 @@ export async function activate(context: vscode.ExtensionContext) {
     // and range. The wrapper also safely recaptures the active range if another
     // extension invokes the command without the internal reference.
     vscode.commands.registerCommand(ATTACH_SELECTION_COMMAND, attachActiveSelection),
+    vscode.commands.registerCommand(ATTACH_NOTEBOOK_CELL_COMMAND, async (candidate?: unknown) => {
+      const resolvedTarget = resolveNotebookCellCommandTarget(
+        candidate,
+        vscode.workspace.notebookDocuments,
+        vscode.window.activeTextEditor,
+      );
+      const validReference = isNotebookCellReference(candidate) ? candidate : undefined;
+      const activeNotebookFallback =
+        candidate === undefined ||
+        isOpenNotebookDocumentCommandTarget(candidate, vscode.workspace.notebookDocuments);
+      if (
+        (!resolvedTarget && !validReference && !activeNotebookFallback) ||
+        (isClaimedNotebookCellReference(candidate) && !validReference) ||
+        (isClaimedNotebookCellCommandTarget(candidate) && !resolvedTarget)
+      ) {
+        void vscode.window.showWarningMessage(
+          vscode.env.language.toLowerCase().startsWith("zh")
+            ? "Notebook Cell 选区已失效，请重新选择后再试。"
+            : "The notebook cell selection is invalid. Select it again and retry.",
+        );
+        return;
+      }
+      await attachNotebookCellsAndOpen(
+        resolvedTarget
+          ? [resolvedTarget.reference]
+          : validReference
+            ? [validReference]
+            : notebookCellReferencesFromEditor(
+                vscode.window.activeNotebookEditor,
+                vscode.window.activeTextEditor,
+              ),
+      );
+    }),
+    vscode.commands.registerCommand(FIND_RELATED_TURN_COMMAND, findRelatedTurn),
     vscode.commands.registerCommand("ask2gpt.attachCurrentFile", async () => {
       const conversationId = controller.activeConversation?.id;
       if (!conversationId) return;
@@ -208,6 +386,15 @@ export async function activate(context: vscode.ExtensionContext) {
     version: extensionVersion,
     port: relay.port,
   });
+}
+
+function isClaimedNotebookCellReference(value: unknown) {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    (value as { type?: unknown }).type === "notebook-cell"
+  );
 }
 
 export async function deactivate() {

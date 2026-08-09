@@ -9,6 +9,10 @@ capability-limited:
 - Code context is captured only after an explicit user action: from the current selection, the
   current in-memory text buffer, or files the user confirms in the system file picker. Ask2GPT
   never enumerates, scans, searches, or infers files from the workspace.
+- Source navigation remains host-authoritative. Webview clicks carry conversation/message/context IDs
+  or a bounded textual reference, never a URI. The Host proves the reference exists in its stored
+  answer and resolves it only against source snapshots explicitly attached before that answer;
+  navigation never expands into workspace file search.
 - Conversation data is encrypted with AES-256-GCM under an OS-backed VS Code SecretStorage key.
 - AES-GCM records bind the conversation ID as authenticated additional data and keep one last-valid backup.
 - First-time key generation is serialized across Extension Host processes by an exclusive lock inside
@@ -52,9 +56,11 @@ capability-limited:
 - Before the non-idempotent send boundary, inactive or minimized owned tabs may receive a reversible
   visibility prewarm. The actual pointer action is allowed only after the exact tab has returned to its
   home window and is Chrome's active tab there. A minimized home window is temporarily restored at
-  validated off-screen bounds without focusing it, then returned to its original bounds/minimized
-  state after the terminal event. Read-only history prewarming may use a non-focused temporary window,
-  but no send action is permitted from that window.
+  Chrome's browser-managed restore bounds with `focused=false`, then returned to its original
+  bounds/minimized state after the terminal event. Relay never supplies fully off-screen coordinates:
+  Chromium requires at least half of extension-managed window bounds to intersect a current display.
+  Read-only history prewarming may use a non-focused temporary window, but no send action is permitted
+  from that window.
 - Model discovery calls only ChatGPT's same-origin `/backend-api/models` with the current page session.
   A short-lived access token may be read from page bootstrap data for that request, but it is never
   sent to the Relay or VS Code, persisted, cached, logged, or included in diagnostics.

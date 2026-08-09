@@ -111,6 +111,9 @@ describe("service-worker session recovery records", () => {
         remoteUrl: "https://chatgpt.com/c/abc",
         remoteTitle: "Event loop guide",
         createdAt: now,
+        provenance: "legacy-unknown",
+        leaseEpoch: 0,
+        lastUsedAt: now,
       },
       {
         owned: true,
@@ -120,8 +123,107 @@ describe("service-worker session recovery records", () => {
         remoteUrl: "https://chatgpt.com/g/runtime-scope/c/project-conversation",
         projectScope: "https://chatgpt.com/g/runtime-scope/",
         createdAt: now,
+        provenance: "legacy-unknown",
+        leaseEpoch: 0,
+        lastUsedAt: now,
       },
     ]);
+  });
+
+  it("restores explicit tab lease metadata while legacy records fail closed", () => {
+    const lastUsedAt = "2026-07-24T00:01:00.000Z";
+    const idleSince = "2026-07-24T00:02:00.000Z";
+    const releaseRequestedAt = "2026-07-24T00:02:30.000Z";
+    const userClaimedAt = "2026-07-24T00:03:00.000Z";
+    const tabs = parseStoredTabs([
+      {
+        owned: true,
+        instanceId: "instance-created",
+        conversationId: "conversation-created",
+        tabId: 17,
+        createdAt: now,
+        provenance: "created",
+        leaseEpoch: 9,
+        lastUsedAt,
+        idleSince,
+        releaseRequestedAt,
+        userClaimedAt,
+      },
+      {
+        owned: true,
+        instanceId: "instance-legacy",
+        conversationId: "conversation-legacy",
+        tabId: 18,
+        createdAt: now,
+      },
+      {
+        owned: false,
+        instanceId: "instance-borrowed",
+        conversationId: "conversation-borrowed",
+        tabId: 19,
+        createdAt: now,
+        provenance: "borrowed",
+        leaseEpoch: 1,
+        lastUsedAt,
+      },
+    ]);
+
+    expect(tabs.get(conversationKey("instance-created", "conversation-created"))).toMatchObject({
+      provenance: "created",
+      leaseEpoch: 9,
+      lastUsedAt,
+      idleSince,
+      releaseRequestedAt,
+      userClaimedAt,
+    });
+    expect(tabs.get(conversationKey("instance-legacy", "conversation-legacy"))).toMatchObject({
+      provenance: "legacy-unknown",
+      leaseEpoch: 0,
+      lastUsedAt: now,
+    });
+    expect(tabs.get(conversationKey("instance-borrowed", "conversation-borrowed"))).toMatchObject({
+      owned: false,
+      provenance: "borrowed",
+      leaseEpoch: 1,
+    });
+  });
+
+  it("rejects malformed tab lease authority instead of upgrading it", () => {
+    const base = {
+      owned: true,
+      instanceId: "instance-1",
+      conversationId: "conversation-1",
+      tabId: 17,
+      createdAt: now,
+    };
+    const tabs = parseStoredTabs([
+      { ...base, provenance: "extension-created" },
+      { ...base, conversationId: "conversation-2", tabId: 18, leaseEpoch: -1 },
+      { ...base, conversationId: "conversation-3", tabId: 19, lastUsedAt: "not-a-date" },
+      { ...base, conversationId: "conversation-4", tabId: 20, idleSince: "not-a-date" },
+      {
+        ...base,
+        conversationId: "conversation-5",
+        tabId: 21,
+        releaseRequestedAt: "not-a-date",
+      },
+      { ...base, conversationId: "conversation-6", tabId: 22, userClaimedAt: "not-a-date" },
+      {
+        ...base,
+        conversationId: "conversation-7",
+        tabId: 23,
+        provenance: "borrowed",
+      },
+      {
+        ...base,
+        owned: false,
+        conversationId: "conversation-8",
+        tabId: 24,
+        provenance: "created",
+      },
+    ]);
+
+    expect(tabs.size).toBe(0);
   });
 
   it("keeps valid mappings while dropping legacy generic or invalid remote titles", () => {
@@ -171,6 +273,9 @@ describe("service-worker session recovery records", () => {
         tabId: 20,
         remoteUrl: "https://chatgpt.com/c/skip-link-title",
         createdAt: now,
+        provenance: "legacy-unknown",
+        leaseEpoch: 0,
+        lastUsedAt: now,
       },
       {
         owned: true,
@@ -179,6 +284,9 @@ describe("service-worker session recovery records", () => {
         tabId: 21,
         remoteUrl: "https://chatgpt.com/c/generic-title",
         createdAt: now,
+        provenance: "legacy-unknown",
+        leaseEpoch: 0,
+        lastUsedAt: now,
       },
       {
         owned: true,
@@ -187,6 +295,9 @@ describe("service-worker session recovery records", () => {
         tabId: 22,
         remoteUrl: "https://chatgpt.com/c/invalid-title",
         createdAt: now,
+        provenance: "legacy-unknown",
+        leaseEpoch: 0,
+        lastUsedAt: now,
       },
     ]);
     expect(tabs.has(conversationKey("instance-title-only", "conversation-title-only"))).toBe(false);

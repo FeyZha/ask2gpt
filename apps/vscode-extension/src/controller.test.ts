@@ -5,6 +5,8 @@ import type {
   ContextSnapshot,
   Conversation,
   ConversationCanonicalizationResultPayload,
+  ConversationLeasePurpose,
+  ConversationReleaseReason,
   ConversationTranscriptProof,
   PendingRemotePromotion,
   RelayErrorPayload,
@@ -28,8 +30,8 @@ import type {
 import type { ContextService } from "./services/context-service";
 import type { ConversationStore, ConversationStoreLoadReport } from "./services/conversation-store";
 import type { SafeLogger } from "./services/logger";
-import { buildVisiblePrompt } from "./services/prompt-builder";
-import type { SelectionReference } from "./selection-reference";
+import { buildLegacyVisiblePrompt } from "./services/prompt-builder";
+import type { NotebookCellReference, SelectionReference } from "./selection-reference";
 
 const controllers: Ask2GPTController[] = [];
 
@@ -47,9 +49,8 @@ describe("Ask2GPTController", () => {
     expect(controller.activeConversation).toMatchObject({ messages: [] });
     expect(controller.getState().conversations).toHaveLength(1);
     expect(store.saved).toHaveLength(0);
-    expect(backend.prepared).toEqual([
-      { conversationId: controller.activeConversation!.id, remoteUrl: undefined },
-    ]);
+    expect(backend.prepared).toEqual([]);
+    expect(backend.modelRequests).toEqual([]);
 
     controller.attachSelection();
     expect(controller.getState().pendingContexts).toEqual([explicitContext()]);
@@ -176,7 +177,7 @@ describe("Ask2GPTController", () => {
     expect(controller.activeConversation?.id).toBe(visible.id);
   });
 
-  it("restores a missing ephemeral active id as a fresh blank draft", async () => {
+  it("restores a missing ephemeral active id as the same blank draft", async () => {
     const history = conversation("persisted-history");
     history.messages.push({
       id: "persisted-turn",
@@ -192,12 +193,57 @@ describe("Ask2GPTController", () => {
     const controller = await createController(store, new FakeBackend(), undefined, workspaceState);
 
     expect(controller.activeConversation).toMatchObject({ messages: [] });
-    expect(controller.activeConversation?.id).not.toBe(history.id);
+    expect(controller.activeConversation?.id).toBe("missing-ephemeral-id");
     expect(controller.getState().conversations).toHaveLength(2);
-    expect(workspaceState.get("ask2gpt.activeConversationId")).toBe(
-      controller.activeConversation?.id,
-    );
+    expect(workspaceState.get("ask2gpt.activeConversationId")).toBe("missing-ephemeral-id");
     expect(store.saved).toHaveLength(0);
+  });
+
+  it("keeps one ephemeral blank identity across a VS Code reload", async () => {
+    const store = new FakeStore([]);
+    const workspaceState = new Map<string, unknown>();
+    const firstBackend = new FakeBackend();
+    const first = await createController(store, firstBackend, undefined, workspaceState);
+    const ephemeralId = first.activeConversation!.id;
+
+    expect(workspaceState.get("ask2gpt.activeConversationId")).toBe(ephemeralId);
+    expect(firstBackend.prepared).toEqual([]);
+    await first.dispose();
+
+    const reloadedBackend = new FakeBackend();
+    const reloaded = await createController(store, reloadedBackend, undefined, workspaceState);
+
+    expect(reloaded.activeConversation?.id).toBe(ephemeralId);
+    expect(reloaded.getState().conversations).toHaveLength(1);
+    expect(workspaceState.get("ask2gpt.activeConversationId")).toBe(ephemeralId);
+    expect(reloadedBackend.prepared).toEqual([]);
+    expect(reloadedBackend.modelRequests).toEqual([]);
+    expect(store.saved).toHaveLength(0);
+  });
+
+  it("rejects an unsafe missing workspace active id instead of restoring it", async () => {
+    const history = conversation("safe-history");
+    history.messages.push({
+      id: "safe-history-turn",
+      role: "user",
+      markdown: "Keep the safe persisted conversation active",
+      status: "complete",
+      createdAt: history.createdAt,
+    });
+    const workspaceState = new Map<string, unknown>([
+      ["ask2gpt.activeConversationId", "../unsafe-ephemeral-id"],
+    ]);
+
+    const controller = await createController(
+      new FakeStore([history]),
+      new FakeBackend(),
+      undefined,
+      workspaceState,
+    );
+
+    expect(controller.activeConversation?.id).toBe(history.id);
+    expect(workspaceState.get("ask2gpt.activeConversationId")).toBe(history.id);
+    expect(controller.getState().conversations).toHaveLength(1);
   });
 
   it("promotes an ephemeral new conversation only when its first turn is accepted", async () => {
@@ -276,11 +322,12 @@ describe("Ask2GPTController", () => {
     expect(backend.sent).toHaveLength(0);
   });
 
-  it("upgrades composer activity into a dispatch-intent prewarm", async () => {
+  it("upgrades blank composer activity into a dispatch-intent prewarm", async () => {
     const active = conversation("dispatch-intent-prewarm");
-    active.remoteUrl = "https://chatgpt.com/g/ask2gpt/c/dispatch-intent";
     const backend = new FakeBackend();
     const controller = await createController(new FakeStore([active]), backend, active.id);
+
+    expect(backend.prepared).toEqual([]);
 
     controller.prepareConversationForDispatch(active.id);
     await vi.waitFor(() =>
@@ -290,9 +337,152 @@ describe("Ask2GPTController", () => {
     expect(backend.prepared.at(-1)).toMatchObject({
       conversationId: active.id,
       dispatchIntent: true,
-      remoteUrl: active.remoteUrl,
+      remoteUrl: undefined,
     });
     expect(backend.sent).toHaveLength(0);
+  });
+
+  it("releases the previous view lease once when switching conversations", async () => {
+    const first = conversation("release-select-a");
+    const second = conversation("release-select-b");
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([first, second]), backend, first.id);
+
+    await controller.selectConversation(second.id);
+
+    expect(backend.released).toEqual([
+      { conversationId: first.id, purpose: "view", reason: "inactive" },
+    ]);
+
+    await controller.selectConversation(second.id);
+    expect(backend.released).toHaveLength(1);
+  });
+
+  it("renews A when switching A to B to A even while A's first prewarm is pending", async () => {
+    const first = conversation("release-renew-a");
+    first.remoteUrl = "https://chatgpt.com/g/ask2gpt/c/release-renew-a";
+    const second = conversation("release-renew-b");
+    second.remoteUrl = "https://chatgpt.com/g/ask2gpt/c/release-renew-b";
+    const backend = new FakeBackend();
+    let finishFirstPrewarm!: () => void;
+    let holdFirstPrewarm = true;
+    backend.prepareHandler = (conversationId) => {
+      if (conversationId !== first.id || !holdFirstPrewarm) return Promise.resolve();
+      holdFirstPrewarm = false;
+      return new Promise<void>((resolve) => {
+        finishFirstPrewarm = resolve;
+      });
+    };
+    const controller = await createController(new FakeStore([first, second]), backend, first.id);
+
+    await controller.selectConversation(second.id);
+    await controller.selectConversation(first.id);
+
+    expect(backend.prepared.filter((entry) => entry.conversationId === first.id)).toHaveLength(2);
+    expect(backend.released).toEqual([
+      { conversationId: first.id, purpose: "view", reason: "inactive" },
+      { conversationId: second.id, purpose: "view", reason: "inactive" },
+    ]);
+
+    finishFirstPrewarm();
+    await Promise.resolve();
+  });
+
+  it("releases the previous view lease once when creating a conversation", async () => {
+    const initial = conversation("release-new");
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([initial]), backend, initial.id);
+
+    await controller.newConversation(initial.id);
+
+    expect(backend.released).toEqual([
+      { conversationId: initial.id, purpose: "view", reason: "inactive" },
+    ]);
+  });
+
+  it("releases the archived active conversation view lease once", async () => {
+    const archived = conversation("release-archive");
+    archived.messages.push({
+      id: "release-archive-message",
+      role: "user",
+      markdown: "Archive this conversation",
+      status: "complete",
+      createdAt: archived.createdAt,
+    });
+    const replacement = conversation("release-archive-replacement");
+    const backend = new FakeBackend();
+    const controller = await createController(
+      new FakeStore([archived, replacement]),
+      backend,
+      archived.id,
+    );
+
+    await controller.archiveConversation(archived.id);
+
+    expect(backend.released).toEqual([
+      { conversationId: archived.id, purpose: "view", reason: "inactive" },
+    ]);
+  });
+
+  it("releases the deleted active conversation view lease once", async () => {
+    const deleted = conversation("release-delete");
+    const replacement = conversation("release-delete-replacement");
+    const backend = new FakeBackend();
+    const controller = await createController(
+      new FakeStore([deleted, replacement]),
+      backend,
+      deleted.id,
+    );
+
+    await controller.deleteConversation(deleted.id);
+
+    expect(backend.released).toEqual([
+      { conversationId: deleted.id, purpose: "view", reason: "inactive" },
+    ]);
+  });
+
+  it("does not let a failed view release break conversation navigation", async () => {
+    const first = conversation("release-failure-a");
+    const second = conversation("release-failure-b");
+    const backend = new FakeBackend();
+    backend.releaseFailure = new Error("release unavailable");
+    const controller = await createController(new FakeStore([first, second]), backend, first.id);
+
+    await expect(controller.selectConversation(second.id)).resolves.toBeUndefined();
+    await Promise.resolve();
+
+    expect(controller.activeConversation?.id).toBe(second.id);
+    expect(backend.released).toEqual([
+      { conversationId: first.id, purpose: "view", reason: "inactive" },
+    ]);
+  });
+
+  it("does not wait for a pending view release before completing navigation", async () => {
+    const first = conversation("release-pending-a");
+    const second = conversation("release-pending-b");
+    const backend = new FakeBackend();
+    let finishRelease!: (delivered: boolean) => void;
+    backend.releaseHandler = () =>
+      new Promise<boolean>((resolve) => {
+        finishRelease = resolve;
+      });
+    const controller = await createController(new FakeStore([first, second]), backend, first.id);
+
+    await expect(controller.selectConversation(second.id)).resolves.toBeUndefined();
+    expect(controller.activeConversation?.id).toBe(second.id);
+
+    finishRelease(true);
+    await Promise.resolve();
+  });
+
+  it("does not release the active view lease during controller disposal", async () => {
+    const active = conversation("release-dispose");
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([active]), backend, active.id);
+
+    await controller.dispose();
+
+    expect(backend.released).toEqual([]);
   });
 
   it("coalesces same-source New requests and keeps the source attachment isolated", async () => {
@@ -436,7 +626,7 @@ describe("Ask2GPTController", () => {
     expect(captureSelection).toHaveBeenCalledOnce();
   });
 
-  it("prewarms a blank new draft without promoting it to local history", async () => {
+  it("keeps consecutive blank new drafts lazy without losing source contexts", async () => {
     const initial = conversation("new-retry-source");
     const store = new FakeStore([initial]);
     const backend = new FakeBackend();
@@ -445,17 +635,27 @@ describe("Ask2GPTController", () => {
     const modelRequestsBefore = backend.modelRequests.length;
     const created = await controller.newConversation(initial.id);
 
-    expect(controller.activeConversation?.id).toBe(created.id);
-    expect(controller.getState().conversations).toHaveLength(2);
-    expect(backend.prepared.at(-1)).toEqual({
-      conversationId: created.id,
-      remoteUrl: undefined,
-    });
+    controller.attachSelection(created.id);
+    const next = await controller.newConversation(created.id);
+
+    expect(controller.activeConversation?.id).toBe(next.id);
+    expect(controller.getState().conversations).toHaveLength(3);
+    expect(backend.prepared).toEqual([]);
     expect(backend.modelRequests).toHaveLength(modelRequestsBefore);
     expect(store.saved.slice(savesBefore).some((item) => item.id === created.id)).toBe(false);
+    expect(store.saved.slice(savesBefore).some((item) => item.id === next.id)).toBe(false);
+
+    await controller.selectConversation(created.id);
+    expect(controller.getState().pendingContexts).toEqual([explicitContext()]);
+    expect(backend.prepared).toEqual([]);
+
+    await controller.selectConversation(next.id);
+    expect(controller.getState().pendingContexts).toEqual([]);
+    expect(backend.prepared).toEqual([]);
 
     await controller.dispose();
     expect(store.saved.slice(savesBefore).some((item) => item.id === created.id)).toBe(false);
+    expect(store.saved.slice(savesBefore).some((item) => item.id === next.id)).toBe(false);
   });
 
   it("routes an editor-menu selection to its click-time conversation", async () => {
@@ -482,6 +682,39 @@ describe("Ask2GPTController", () => {
     await controller.selectConversation(first.id);
     expect(controller.getState().pendingContexts).toEqual([explicitContext()]);
     expect(captureSelection).toHaveBeenCalledOnce();
+  });
+
+  it("keeps identical ranges from two selected notebook cells distinct", async () => {
+    const initial = conversation("notebook-cells");
+    const references = [notebookReference(0), notebookReference(1)];
+    const captureNotebookCells = vi.fn((received?: readonly NotebookCellReference[]) => {
+      expect(received).toEqual(references);
+      return [notebookContext(0), notebookContext(1)];
+    });
+    const controller = await createController(
+      new FakeStore([initial]),
+      new FakeBackend(),
+      initial.id,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      captureNotebookCells,
+    );
+
+    await expect(controller.attachNotebookCellsToActiveConversation(references)).resolves.toBe(
+      true,
+    );
+
+    expect(controller.getState().pendingContexts).toHaveLength(2);
+    expect(
+      controller
+        .getState()
+        .pendingContexts.map((context) =>
+          context.sourceAnchor?.formatVersion === 2 ? context.sourceAnchor.cellIndex : undefined,
+        ),
+    ).toEqual([0, 1]);
+    expect(captureNotebookCells).toHaveBeenCalledOnce();
   });
 
   it("leaves the existing draft untouched when a tracked selection is stale", async () => {
@@ -823,6 +1056,64 @@ describe("Ask2GPTController", () => {
     });
   });
 
+  it("builds transcript proofs with each context transport version", async () => {
+    const initial = conversation("versioned-context-proof");
+    initial.remoteUrl = "https://chatgpt.com/c/versioned-context-proof";
+    const context = explicitContext();
+    const legacyQuestion = "LEGACY_[TURN] & <one>";
+    const packagedQuestion = "PACKAGED_[TURN] & <two>";
+    initial.messages = [
+      {
+        id: "legacy-user",
+        role: "user",
+        markdown: legacyQuestion,
+        status: "complete",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        contexts: [context],
+      },
+      {
+        id: "legacy-answer",
+        role: "assistant",
+        markdown: "LEGACY_ANSWER",
+        status: "complete",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      },
+      {
+        id: "packaged-user",
+        role: "user",
+        markdown: packagedQuestion,
+        status: "complete",
+        createdAt: "2026-01-01T00:00:02.000Z",
+        contexts: [context],
+        contextTransportVersion: 2,
+      },
+      {
+        id: "packaged-answer",
+        role: "assistant",
+        markdown: "PACKAGED_ANSWER",
+        status: "complete",
+        createdAt: "2026-01-01T00:00:03.000Z",
+      },
+    ];
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([initial]), backend, initial.id);
+
+    await controller.send("NEXT_TURN");
+
+    const expectedMessages = [
+      ["user", promptInlinePresentationV1(buildLegacyVisiblePrompt(legacyQuestion, [context]))],
+      ["assistant", "LEGACY_ANSWER"],
+      ["user", promptInlinePresentationV1(packagedQuestion)],
+      ["assistant", "PACKAGED_ANSWER"],
+    ] as const;
+    expect(backend.sent[0]?.transcriptProof?.messageHashes).toEqual(
+      expectedMessages.map(([role, markdown]) => ({
+        role,
+        sha256: sha256(JSON.stringify([role, markdown])),
+      })),
+    );
+  });
+
   it("deduplicates, removes, stores, and clears explicit attachment bundles", async () => {
     const store = new FakeStore([conversation("contexts")]);
     const backend = new FakeBackend();
@@ -847,8 +1138,14 @@ describe("Ask2GPTController", () => {
     expect(
       controller.activeConversation?.messages[0]?.contexts?.map((context) => context.id),
     ).toEqual(["context-1", "context-2"]);
-    expect(backend.sent[0]?.prompt).toContain("Context 1/2:");
-    expect(backend.sent[0]?.prompt).toContain("Context 2/2:");
+    expect(backend.sent[0]?.prompt).toBe("解释这些代码");
+    expect(backend.sent[0]?.attachments).toEqual([
+      expect.objectContaining({ id: "context-1", fileName: "index.L1-L1.ts" }),
+      expect.objectContaining({ id: "context-2", fileName: "other.ts" }),
+    ]);
+    expect(controller.activeConversation?.messages[0]).toMatchObject({
+      contextTransportVersion: 2,
+    });
   });
 
   it("deduplicates repeated snapshots by content identity instead of generated id", async () => {
@@ -958,9 +1255,17 @@ describe("Ask2GPTController", () => {
     await controller.send(question);
 
     expect(backend.sent).toHaveLength(1);
-    expect(backend.sent[0]?.prompt).toContain(`Question:\n${question}`);
+    expect(backend.sent[0]?.prompt).toBe(question);
+    expect(backend.sent[0]?.attachments).toEqual([
+      expect.objectContaining({ id: "context-1", fileName: "index.L1-L1.ts" }),
+    ]);
     expect(controller.activeConversation?.messages).toEqual([
-      expect.objectContaining({ role: "user", markdown: question, contexts: [explicitContext()] }),
+      expect.objectContaining({
+        role: "user",
+        markdown: question,
+        contexts: [explicitContext()],
+        contextTransportVersion: 2,
+      }),
       expect.objectContaining({ role: "assistant", status: "streaming" }),
     ]);
     expect(
@@ -1070,6 +1375,13 @@ describe("Ask2GPTController", () => {
   it("restores the selected ChatGPT mode for each local conversation", async () => {
     const local = conversation("stored-model");
     local.selectedModelId = "visible-thinking";
+    local.messages.push({
+      id: "stored-model-user-message",
+      role: "user",
+      markdown: "Keep this persisted model selection",
+      status: "complete",
+      createdAt: local.createdAt,
+    });
     const backend = new FakeBackend();
     backend.modelOptions = [
       { id: "visible-fast", label: "GPT Fast", selected: true },
@@ -2052,12 +2364,13 @@ describe("Ask2GPTController", () => {
     const local = conversation("history-rebuild");
     local.remoteUrl = "https://chatgpt.com/c/remote-history";
     const context = explicitContext();
+    const question = "解释 [user_name] *tag* `x` & <safe>";
     const createdAt = local.createdAt;
     local.messages = [
       {
         id: "local-user",
         role: "user",
-        markdown: "解释这段代码",
+        markdown: question,
         status: "complete",
         createdAt,
         contexts: [context],
@@ -2097,7 +2410,7 @@ describe("Ask2GPTController", () => {
       messages: [
         {
           role: "user",
-          markdown: buildVisiblePrompt("解释这段代码", [context]),
+          markdown: promptInlinePresentationV1(buildLegacyVisiblePrompt(question, [context])),
         },
         { role: "assistant", markdown: "新回答" },
       ],
@@ -2116,7 +2429,7 @@ describe("Ask2GPTController", () => {
       expect.objectContaining({
         id: "local-user",
         role: "user",
-        markdown: "解释这段代码",
+        markdown: question,
         contexts: [context],
       }),
       expect.objectContaining({
@@ -2135,6 +2448,104 @@ describe("Ask2GPTController", () => {
       "local-assistant",
       "local-notice",
     ]);
+  });
+
+  it("keeps version-2 attachment cards compact when ChatGPT decorates the user turn", async () => {
+    const local = conversation("packaged-attachment-history");
+    local.remoteUrl = "https://chatgpt.com/c/packaged-attachment-history";
+    const context = explicitContext();
+    const question = "Review [user_name] & <safe>";
+    local.messages = [
+      {
+        id: "packaged-local-user",
+        role: "user",
+        markdown: question,
+        status: "complete",
+        createdAt: local.createdAt,
+        contexts: [context],
+        contextTransportVersion: 2,
+      },
+      {
+        id: "packaged-local-assistant",
+        role: "assistant",
+        markdown: "Old answer",
+        status: "complete",
+        createdAt: local.createdAt,
+      },
+    ];
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([local]), backend, local.id);
+
+    backend.emit({
+      type: "history",
+      conversationId: local.id,
+      remoteUrl: local.remoteUrl,
+      messages: [
+        {
+          role: "user",
+          markdown: promptInlinePresentationV1(`${question}\n\nindex.L1-L1.ts`),
+        },
+        { role: "assistant", markdown: "New answer" },
+      ],
+      observedAt: new Date().toISOString(),
+      complete: true,
+    });
+
+    await vi.waitFor(() => expect(controller.activeConversation?.syncStatus).toBe("synced"));
+    expect(controller.activeConversation?.messages[0]).toMatchObject({
+      id: "packaged-local-user",
+      markdown: question,
+      contexts: [context],
+      contextTransportVersion: 2,
+    });
+  });
+
+  it("does not fold a remote attachment decoration with a different filename", async () => {
+    const local = conversation("mismatched-attachment-history");
+    local.remoteUrl = "https://chatgpt.com/c/mismatched-attachment-history";
+    const context = explicitContext();
+    const question = "Review this selection";
+    local.messages = [
+      {
+        id: "mismatched-local-user",
+        role: "user",
+        markdown: question,
+        status: "complete",
+        createdAt: local.createdAt,
+        contexts: [context],
+        contextTransportVersion: 2,
+      },
+      {
+        id: "mismatched-local-assistant",
+        role: "assistant",
+        markdown: "Old answer",
+        status: "complete",
+        createdAt: local.createdAt,
+      },
+    ];
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([local]), backend, local.id);
+    const mismatchedRemote = promptInlinePresentationV1(`${question}\n\nindex.L1-L2.ts`);
+
+    backend.emit({
+      type: "history",
+      conversationId: local.id,
+      remoteUrl: local.remoteUrl,
+      messages: [
+        { role: "user", markdown: mismatchedRemote },
+        { role: "assistant", markdown: "New answer" },
+      ],
+      observedAt: new Date().toISOString(),
+      complete: true,
+    });
+
+    await vi.waitFor(() => expect(controller.activeConversation?.syncStatus).toBe("synced"));
+    expect(controller.activeConversation?.messages[0]).toMatchObject({
+      role: "user",
+      markdown: mismatchedRemote,
+    });
+    expect(controller.activeConversation?.messages[0]?.id).not.toBe("mismatched-local-user");
+    expect(controller.activeConversation?.messages[0]?.contexts).toBeUndefined();
   });
 
   it("merges incomplete remote history without deleting local messages", async () => {
@@ -2404,7 +2815,9 @@ describe("Ask2GPTController", () => {
     };
     const backend = new FakeBackend();
     const controller = await createController(new FakeStore([local]), backend, local.id);
-    const foldedPrompt = buildVisiblePrompt("解释这段代码", [context]).replace(/\n/gu, " ");
+    const foldedPrompt = promptInlinePresentationV1(
+      buildLegacyVisiblePrompt("解释这段代码", [context]),
+    );
 
     backend.emit({
       type: "history",
@@ -2667,7 +3080,7 @@ describe("Ask2GPTController", () => {
     expect(controller.activeConversation?.lastSyncedAt).toBe("2026-07-26T10:00:00.000Z");
   });
 
-  it("prepares the Fast model mapping after an idle connection is confirmed", async () => {
+  it("keeps a blank conversation lazy after an idle connection is confirmed", async () => {
     const backend = new FakeBackend();
     backend.status = {
       connected: false,
@@ -2701,8 +3114,10 @@ describe("Ask2GPTController", () => {
       },
     });
 
-    await vi.waitFor(() => expect(backend.modelRequests).toHaveLength(modelRequestsBefore + 1));
+    await vi.waitFor(() => expect(controller.getState().backend.connection.phase).toBe("ready"));
     expect(controller.activeConversation?.id).toBe(ready.id);
+    expect(backend.prepared).toEqual([]);
+    expect(backend.modelRequests).toHaveLength(modelRequestsBefore);
   });
 
   it("clears an expired restored run instead of leaving the conversation permanently busy", async () => {
@@ -3711,6 +4126,19 @@ class FakeBackend implements ChatBackend {
     promotion: PendingRemotePromotion,
   ) => Promise<ConversationCanonicalizationResultPayload>;
   closeDelivered = true;
+  releaseDelivered = true;
+  releaseFailure?: Error;
+  releaseHandler?: (
+    conversationId: string,
+    purpose: ConversationLeasePurpose,
+    reason: ConversationReleaseReason,
+  ) => Promise<boolean>;
+  prepareHandler?: (
+    conversationId: string,
+    remoteUrl?: string,
+    transcriptProof?: ConversationTranscriptProof,
+    dispatchIntent?: boolean,
+  ) => Promise<void>;
   status: BackendStatus = {
     connected: true,
     authenticated: true,
@@ -3733,6 +4161,11 @@ class FakeBackend implements ChatBackend {
   readonly regenerated: Array<{ conversationId: string; messageId: string; runId: string }> = [];
   readonly stopped: Array<{ conversationId: string; runId: string }> = [];
   readonly closed: string[] = [];
+  readonly released: Array<{
+    conversationId: string;
+    purpose: ConversationLeasePurpose;
+    reason: ConversationReleaseReason;
+  }> = [];
   readonly terminalAcknowledgements: Array<{
     conversationId: string;
     runId: string;
@@ -3782,6 +4215,9 @@ class FakeBackend implements ChatBackend {
       remoteUrl,
       ...(transcriptProof ? { transcriptProof } : {}),
     });
+    if (this.prepareHandler) {
+      return this.prepareHandler(conversationId, remoteUrl, transcriptProof, dispatchIntent);
+    }
     return Promise.resolve();
   }
 
@@ -3852,6 +4288,17 @@ class FakeBackend implements ChatBackend {
     return Promise.resolve(this.closeDelivered);
   }
 
+  releaseConversation(
+    conversationId: string,
+    purpose: ConversationLeasePurpose = "view",
+    reason: ConversationReleaseReason = "inactive",
+  ) {
+    this.released.push({ conversationId, purpose, reason });
+    if (this.releaseHandler) return this.releaseHandler(conversationId, purpose, reason);
+    if (this.releaseFailure) return Promise.reject(this.releaseFailure);
+    return Promise.resolve(this.releaseDelivered);
+  }
+
   acknowledgeTerminal(conversationId: string, runId: string, eventId: string) {
     this.terminalAcknowledgements.push({ conversationId, runId, eventId });
     return Promise.resolve();
@@ -3899,6 +4346,9 @@ async function createController(
     workspaceState.set(key, value);
     return Promise.resolve();
   },
+  captureNotebookCells: (
+    references?: readonly NotebookCellReference[],
+  ) => ContextSnapshot[] = () => [],
 ) {
   if (activeConversationId) {
     workspaceState.set("ask2gpt.activeConversationId", activeConversationId);
@@ -3913,6 +4363,7 @@ async function createController(
     captureSelection,
     captureCurrentFile: () => explicitContext(),
     captureFiles,
+    captureNotebookCells,
   };
   const logger = {
     info: vi.fn(),
@@ -3985,6 +4436,16 @@ function sha256(value: string) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function promptInlinePresentationV1(value: string) {
+  return value
+    .replace(/\s+/gu, " ")
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/([\\`[\]*_])/gu, "\\$1")
+    .trim();
+}
+
 function transcriptSha256(messages: readonly { role: "user" | "assistant"; markdown: string }[]) {
   return sha256(JSON.stringify(messages.map((message) => [message.role, message.markdown])));
 }
@@ -4012,5 +4473,60 @@ function selectionReference(): SelectionReference {
     startCharacter: 0,
     endLine: 0,
     endCharacter: 18,
+  };
+}
+
+function notebookReference(cellIndex: number): NotebookCellReference {
+  const contentHash = sha256("pass");
+  return {
+    type: "notebook-cell",
+    notebookUri: "file:///analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 4,
+    cellUri: `vscode-notebook-cell:/analysis.ipynb#${cellIndex}`,
+    cellIndex,
+    cellKind: "code",
+    cellLanguage: "python",
+    cellDocumentVersion: 3,
+    cellContentSha256: contentHash,
+    normalizedCellContentSha256: contentHash,
+    scope: "cell",
+    startLine: 0,
+    startCharacter: 0,
+    endLine: 0,
+    endCharacter: 0,
+  };
+}
+
+function notebookContext(cellIndex: number): ContextSnapshot {
+  const content = "pass";
+  const contentHash = sha256(content);
+  return {
+    id: `notebook-context-${cellIndex}`,
+    kind: "selection",
+    fileName: "analysis.ipynb",
+    uri: "file:///analysis.ipynb",
+    language: "python",
+    startLine: 1,
+    endLine: 1,
+    content,
+    charCount: content.length,
+    unsaved: false,
+    sourceAnchor: {
+      formatVersion: 2,
+      notebookUri: "file:///analysis.ipynb",
+      notebookType: "jupyter-notebook",
+      notebookVersion: 4,
+      cellIndex,
+      cellKind: "code",
+      cellLanguage: "python",
+      scope: "cell",
+      documentVersion: 3,
+      range: { startLine: 0, startCharacter: 0, endLine: 0, endCharacter: 4 },
+      contentSha256: contentHash,
+      normalizedContentSha256: contentHash,
+      cellContentSha256: contentHash,
+      normalizedCellContentSha256: contentHash,
+    },
   };
 }

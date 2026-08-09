@@ -1,4 +1,5 @@
-import { composerTextMatchesPrompt, setComposerText } from "./composer-input";
+import { composerTextMatchesPrompt, readComposerText, setComposerText } from "./composer-input";
+import { decideContentIdle } from "./content-idle-policy";
 import { serializeAssistant } from "./markdown";
 import {
   PROMPT_INLINE_PRESENTATION_VERSION,
@@ -357,6 +358,10 @@ chrome.runtime.onMessage.addListener(
       });
       return false;
     }
+    if (isInspectIdleStateCommand(message)) {
+      sendResponse(inspectIdleState());
+      return false;
+    }
     if (isInspectConversationSnapshotCommand(message)) {
       void Promise.resolve()
         .then(inspectConversationSnapshot)
@@ -495,6 +500,43 @@ chrome.runtime.onMessage.addListener(
     return true;
   },
 );
+
+function inspectIdleState() {
+  const composers = findRawComposerElements();
+  const composer = composers.length === 1 ? composers[0] : undefined;
+  const ownership = composer ? composerOwnership(composer) : undefined;
+  const scope = ownership?.scope;
+  const attachmentPresent = Boolean(
+    scope &&
+    ([...scope.querySelectorAll<HTMLInputElement>('input[type="file"]')].some(
+      (input) => (input.files?.length ?? 0) > 0,
+    ) ||
+      [...scope.querySelectorAll<HTMLButtonElement>("button")].some((button) => {
+        const label = accessibleLabel(button);
+        return isVisible(button) && /remove|delete|移除|删除/iu.test(label);
+      })),
+  );
+  const modalPresent = [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].some(
+    (dialog) => dialog.getAttribute("aria-modal") === "true" && isVisible(dialog),
+  );
+  const decision = decideContentIdle({
+    activeRun: activeRun !== undefined,
+    attachmentPresent,
+    composerCount: composers.length,
+    composerReady: Boolean(
+      composer && ownership && isVisible(composer) && isWritableComposer(composer),
+    ),
+    composerText: composer ? readComposerText(composer) : "",
+    modalPresent,
+    responseControlPresent: findRenderedControlEvidence(selectors.stop).length > 0,
+  });
+  return {
+    ok: true,
+    ...decision,
+    pageUrl: location.href,
+    selectorVersion: SELECTOR_VERSION,
+  };
+}
 
 async function inspectVisibleProject(allowDirectoryRefresh: boolean) {
   const currentRoute = parseContentProjectPageUrl(location.href);
@@ -4124,6 +4166,14 @@ function isInspectConversationSnapshotCommand(value: unknown) {
   return (
     isContentRecord(value) &&
     value.type === "content.inspectConversation" &&
+    Object.keys(value).length === 1
+  );
+}
+
+function isInspectIdleStateCommand(value: unknown) {
+  return (
+    isContentRecord(value) &&
+    value.type === "content.inspectIdleState" &&
     Object.keys(value).length === 1
   );
 }

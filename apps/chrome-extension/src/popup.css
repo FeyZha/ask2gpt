@@ -697,6 +697,162 @@ main {
   border-top: 1px solid var(--line);
 }
 
+.tab-pool {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px 0;
+  border-block: 1px solid var(--line);
+}
+
+.tab-pool__heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tab-pool__heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.tab-pool__heading strong {
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.pool-capacity {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 9px;
+}
+
+.tab-pool__summary,
+.tab-pool__safety,
+.tab-pool__warning p,
+.tab-pool__feedback {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.tab-pool__metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-raised) 36%, transparent);
+}
+
+.tab-pool__metrics > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 6px 3px 5px;
+  text-align: center;
+}
+
+.tab-pool__metrics > div + div {
+  border-left: 1px solid var(--line);
+}
+
+.tab-pool__metrics dt {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-pool__metrics dd {
+  margin: 0;
+  color: var(--text);
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 680;
+  line-height: 1.15;
+}
+
+.tab-pool__metrics > div:nth-child(2) dd {
+  color: var(--warning);
+}
+
+.tab-pool__metrics > div:nth-child(3) dd {
+  color: var(--success);
+}
+
+.tab-pool__metrics > div:last-child dd {
+  color: var(--danger);
+}
+
+.tab-pool[data-ready="false"] .tab-pool__metrics dd {
+  color: var(--faint);
+}
+
+.tab-pool__action {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--success) 54%, var(--line-strong));
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--success) 7%, transparent);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.tab-pool__action:hover:not(:disabled) {
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 13%, var(--surface-raised));
+}
+
+.tab-pool__action:disabled {
+  cursor: not-allowed;
+}
+
+.tab-pool[data-pending="true"] .tab-pool__action:disabled {
+  cursor: wait;
+}
+
+.tab-pool__safety {
+  margin-top: -3px;
+}
+
+.tab-pool__warning {
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border-left: 2px solid var(--warning);
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
+}
+
+.tab-pool__warning strong {
+  color: var(--warning);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.tab-pool__feedback {
+  padding: 6px 7px;
+  border-left: 2px solid var(--success);
+  background: color-mix(in srgb, var(--success) 7%, transparent);
+}
+
+.tab-pool__feedback[data-kind="error"] {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, transparent);
+  color: var(--danger);
+}
+
 .section-heading {
   display: flex;
   min-height: 28px;
@@ -871,7 +1027,17 @@ code {
   .project-section,
   .primary-button,
   .reload-button,
-  .maintenance-button {
+  .maintenance-button,
+  .tab-pool,
+  .pool-capacity,
+  .tab-pool__metrics,
+  .tab-pool__action,
+  .tab-pool__warning,
+  .tab-pool__feedback {
     border-color: CanvasText;
+  }
+
+  .tab-pool__metrics > div + div {
+    border-left-color: CanvasText;
   }
 }

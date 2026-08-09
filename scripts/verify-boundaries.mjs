@@ -18,6 +18,7 @@ const productionSources = [
   (file) =>
     /\.(?:ts|tsx)$/.test(file) && !/\.test\.(?:ts|tsx)$/.test(file) && !file.endsWith(".d.ts"),
 );
+let productionCodeActionConstructions = 0;
 
 const forbiddenRuntimePatterns = [
   [/\b(?:node:)?child_process\b/, "child_process"],
@@ -35,6 +36,7 @@ const forbiddenRuntimePatterns = [
 for (const file of productionSources) {
   const source = await readFile(file, "utf8");
   const relative = normalize(path.relative(root, file));
+  productionCodeActionConstructions += source.match(/new vscode\.CodeAction\s*\(/gu)?.length ?? 0;
 
   for (const [pattern, label] of forbiddenRuntimePatterns) {
     if (
@@ -60,6 +62,7 @@ for (const file of productionSources) {
     "setContext",
     "workbench.view.extension.ask2gptContainer",
     "ask2gpt.sidebar.focus",
+    "vscode.executeDocumentSymbolProvider",
   ]);
   for (const match of source.matchAll(/\bcommands\.executeCommand\s*\(\s*(["'`])([^"'`]+)\1/g)) {
     if (!approvedExecuteCommands.has(match[2])) {
@@ -99,8 +102,10 @@ const protocolPackage = await readJson(path.join(root, "packages", "protocol", "
 const expectedCommands = [
   "ask2gpt.attachCurrentFile",
   "ask2gpt.attachFiles",
+  "ask2gpt.attachNotebookCell",
   "ask2gpt.attachSelection",
   "ask2gpt.copyDiagnostics",
+  "ask2gpt.findRelatedTurn",
   "ask2gpt.newConversation",
   "ask2gpt.open",
   "ask2gpt.retryConnection",
@@ -126,6 +131,11 @@ if (
   failures.push("VS Code commands do not preserve the Ask2GPT brand and legacy command namespace");
 }
 const attachSelectionCommand = "ask2gpt.attachSelection";
+const attachNotebookCellCommand = "ask2gpt.attachNotebookCell";
+const findRelatedTurnCommand = "ask2gpt.findRelatedTurn";
+const attachSelectionWhen =
+  "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/";
+const attachSelectionViewWhen = "view == ask2gpt.sidebar";
 const visibleAttachSelectionMenus = Object.entries(vscodePackage.contributes.menus ?? {}).flatMap(
   ([menu, entries]) =>
     entries
@@ -138,19 +148,92 @@ const editorShortcutMenus = Object.keys(vscodePackage.contributes.menus ?? {}).f
 const attachSelectionContribution = vscodePackage.contributes.commands.find(
   (entry) => entry.command === attachSelectionCommand,
 );
-const hiddenPaletteEntry = vscodePackage.contributes.menus.commandPalette?.find(
+const paletteEntry = vscodePackage.contributes.menus.commandPalette?.find(
   (entry) => entry.command === attachSelectionCommand,
 );
 if (
   attachSelectionContribution?.enablement !== undefined ||
-  attachSelectionContribution?.icon !== undefined ||
+  attachSelectionContribution?.icon !== "$(comment-discussion)" ||
   !vscodePackage.activationEvents.includes(`onCommand:${attachSelectionCommand}`) ||
-  hiddenPaletteEntry?.when !== "false" ||
-  editorShortcutMenus.length !== 0 ||
-  visibleAttachSelectionMenus.length !== 0 ||
+  paletteEntry?.when !== attachSelectionWhen ||
+  JSON.stringify(editorShortcutMenus) !== JSON.stringify(["editor/title", "editor/context"]) ||
+  visibleAttachSelectionMenus.length !== 4 ||
+  !visibleAttachSelectionMenus.every(({ menu, entry }) =>
+    menu === "view/title"
+      ? entry.when === attachSelectionViewWhen
+      : entry.when === attachSelectionWhen,
+  ) ||
+  vscodePackage.contributes.menus["editor/title"]?.[0]?.group !== "navigation@1" ||
+  vscodePackage.contributes.menus["editor/context"]?.[0]?.group !== "navigation@10" ||
+  vscodePackage.contributes.menus["view/title"]?.[0]?.group !== "navigation@1" ||
   vscodePackage.contributes.keybindings !== undefined
 ) {
-  failures.push("VS Code selected-code surface must be reserved for one runtime lightbulb action");
+  failures.push("VS Code selected-code surface must use the reviewed editor and view actions");
+}
+const attachNotebookCellContribution = vscodePackage.contributes.commands.find(
+  (entry) => entry.command === attachNotebookCellCommand,
+);
+const visibleAttachNotebookCellMenus = Object.entries(
+  vscodePackage.contributes.menus ?? {},
+).flatMap(([menu, entries]) =>
+  entries
+    .filter((entry) => entry.command === attachNotebookCellCommand && entry.when !== "false")
+    .map((entry) => ({ menu, entry })),
+);
+const expectedAttachNotebookCellMenus = [
+  { menu: "commandPalette", group: undefined },
+  { menu: "notebook/cell/title", group: "inline/cell@1" },
+  { menu: "notebook/toolbar", group: "navigation@1" },
+];
+if (
+  attachNotebookCellContribution?.enablement !== undefined ||
+  attachNotebookCellContribution?.icon !== "$(notebook)" ||
+  !vscodePackage.activationEvents.includes(`onCommand:${attachNotebookCellCommand}`) ||
+  visibleAttachNotebookCellMenus.length !== expectedAttachNotebookCellMenus.length ||
+  !expectedAttachNotebookCellMenus.every(({ menu, group }) =>
+    visibleAttachNotebookCellMenus.some(
+      (candidate) =>
+        candidate.menu === menu &&
+        candidate.entry.when === undefined &&
+        candidate.entry.group === group,
+    ),
+  )
+) {
+  failures.push(
+    "VS Code Notebook source capture must stay on the reviewed Cell title, Notebook toolbar, and palette surfaces",
+  );
+}
+const findRelatedTurnContribution = vscodePackage.contributes.commands.find(
+  (entry) => entry.command === findRelatedTurnCommand,
+);
+const visibleFindRelatedTurnMenus = Object.entries(vscodePackage.contributes.menus ?? {}).flatMap(
+  ([menu, entries]) =>
+    entries
+      .filter((entry) => entry.command === findRelatedTurnCommand && entry.when !== "false")
+      .map((entry) => ({ menu, entry })),
+);
+const expectedFindRelatedTurnMenus = [
+  { menu: "commandPalette", group: undefined, when: attachSelectionWhen },
+  { menu: "editor/title", group: "navigation@2", when: attachSelectionWhen },
+  { menu: "editor/context", group: "navigation@11", when: attachSelectionWhen },
+  { menu: "notebook/cell/title", group: "inline/cell@2", when: undefined },
+];
+if (
+  findRelatedTurnContribution?.enablement !== undefined ||
+  findRelatedTurnContribution?.icon !== "$(references)" ||
+  !vscodePackage.activationEvents.includes(`onCommand:${findRelatedTurnCommand}`) ||
+  visibleFindRelatedTurnMenus.length !== expectedFindRelatedTurnMenus.length ||
+  !expectedFindRelatedTurnMenus.every(({ menu, group, when }) =>
+    visibleFindRelatedTurnMenus.some(
+      (candidate) =>
+        candidate.menu === menu && candidate.entry.when === when && candidate.entry.group === group,
+    ),
+  ) ||
+  visibleFindRelatedTurnMenus.some(({ menu }) => menu === "view/title")
+) {
+  failures.push(
+    "VS Code related-turn command must stay on the reviewed text-selection and Notebook Cell surfaces",
+  );
 }
 const selectionHandoffSource = await readFile(
   path.join(vscodeSourceRoot, "selection-handoff.ts"),
@@ -161,18 +244,176 @@ const selectionCodeActionSource = await readFile(
   "utf8",
 );
 const extensionSource = await readFile(path.join(vscodeSourceRoot, "extension.ts"), "utf8");
+const sourceTraceIndexSource = await readFile(
+  path.join(vscodeSourceRoot, "source-trace-index.ts"),
+  "utf8",
+);
+const webviewProviderSource = await readFile(
+  path.join(vscodeSourceRoot, "webview-provider.ts"),
+  "utf8",
+);
+const contextServiceSource = await readFile(
+  path.join(vscodeSourceRoot, "services", "context-service.ts"),
+  "utf8",
+);
+const promptBuilderSource = await readFile(
+  path.join(vscodeSourceRoot, "services", "prompt-builder.ts"),
+  "utf8",
+);
+const selectionReferenceSource = await readFile(
+  path.join(vscodeSourceRoot, "selection-reference.ts"),
+  "utf8",
+);
+const notebookSourceNavigationSource = await readFile(
+  path.join(vscodeSourceRoot, "notebook-source-navigation.ts"),
+  "utf8",
+);
+const contextNavigationSource = await readFile(
+  path.join(vscodeSourceRoot, "context-navigation.ts"),
+  "utf8",
+);
+const sourceTraceSource = await readFile(path.join(vscodeSourceRoot, "source-trace.ts"), "utf8");
+const conversationTraceSource = await readFile(
+  path.join(vscodeSourceRoot, "conversation-trace.ts"),
+  "utf8",
+);
+const conversationStoreSource = await readFile(
+  path.join(vscodeSourceRoot, "services", "conversation-store.ts"),
+  "utf8",
+);
+const controllerSource = await readFile(path.join(vscodeSourceRoot, "controller.ts"), "utf8");
+const browserChatBackendSource = await readFile(
+  path.join(vscodeSourceRoot, "services", "browser-chat-backend.ts"),
+  "utf8",
+);
+const sourceAnchorSource = await readFile(path.join(vscodeSourceRoot, "source-anchor.ts"), "utf8");
+const protocolSource = await readFile(
+  path.join(root, "packages", "protocol", "src", "index.ts"),
+  "utf8",
+);
+const protocolRuntimeContractSource = await readFile(
+  path.join(root, "packages", "protocol", "src", "runtime-contract.mjs"),
+  "utf8",
+);
+const relayStateSource = await readFile(path.join(chromeSourceRoot, "relay-state.ts"), "utf8");
+const tabLeasePolicySource = await readFile(
+  path.join(chromeSourceRoot, "tab-lease-policy.ts"),
+  "utf8",
+);
+const contentIdlePolicySource = await readFile(
+  path.join(chromeSourceRoot, "content-idle-policy.ts"),
+  "utf8",
+);
+const chromePopupSource = await readFile(path.join(chromeSourceRoot, "popup.ts"), "utf8");
+const allocateConversationTabSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function allocateConversationTab(",
+  "async function selectReusableManagedTabCandidate(",
+);
+const inspectManagedTabCandidateSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function inspectManagedTabCandidate(",
+  "function managedTabCandidate(",
+);
+const handleReleaseSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function handleRelease(",
+  "function markConversationReleaseRequested(",
+);
+const tryMarkManagedTabIdleSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function tryMarkManagedTabIdle(",
+  "async function settleReleasedManagedTabs(",
+);
+const managedTabGcSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function runManagedTabGc()",
+  "async function closeManagedTabLease(",
+);
+const closeManagedTabLeaseSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function closeManagedTabLease(",
+  "async function removeOwnedTab(",
+);
+const removeOwnedTabSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function removeOwnedTab(",
+  "async function handleTabRemoved(",
+);
+const popupManagedTabCleanupSource = boundedSourceSlice(
+  chromeServiceWorker,
+  "async function cleanupManagedTabsFromPopup()",
+  "async function handlePopupMessage(",
+);
+const notebookAnchorContractSource = boundedSourceSlice(
+  protocolSource,
+  "export interface NotebookSourceAnchorV2 {",
+  "export type SourceAnchor =",
+);
+const notebookCaptureSource = boundedSourceSlice(
+  contextServiceSource,
+  "captureNotebookCells(",
+  "async captureFiles(",
+);
+const notebookSnapshotSource = boundedSourceSlice(
+  contextServiceSource,
+  "function notebookSnapshot(",
+  "function notebookSourceAnchor(",
+);
+const activeEditorSource = boundedSourceSlice(
+  contextServiceSource,
+  "function activeEditor()",
+  "function baseSnapshot(",
+);
+const captureSelectionSource = boundedSourceSlice(
+  contextServiceSource,
+  "captureSelection(",
+  "captureCurrentFile(",
+);
+const captureCurrentFileSource = boundedSourceSlice(
+  contextServiceSource,
+  "captureCurrentFile(",
+  "captureNotebookCells(",
+);
+const captureFilesSource = boundedSourceSlice(
+  contextServiceSource,
+  "async captureFiles(",
+  "function notebookSnapshot(",
+);
+const typesSource = await readFile(path.join(vscodeSourceRoot, "types.ts"), "utf8");
+const webviewMessageValidationSource = await readFile(
+  path.join(vscodeSourceRoot, "webview-message-validation.ts"),
+  "utf8",
+);
+const openSourceReferenceStart = webviewMessageValidationSource.indexOf(
+  'case "openSourceReference":',
+);
+const openSourceReferenceEnd = webviewMessageValidationSource.indexOf(
+  'case "selectConversation":',
+  openSourceReferenceStart,
+);
+const openSourceReferenceValidation =
+  openSourceReferenceStart >= 0 && openSourceReferenceEnd > openSourceReferenceStart
+    ? webviewMessageValidationSource.slice(openSourceReferenceStart, openSourceReferenceEnd)
+    : "";
 if (
   !extensionSource.includes("registerSelectionCodeActionProvider()") ||
   !selectionCodeActionSource.includes("registerCodeActionsProvider") ||
   !selectionCodeActionSource.includes('QuickFix.append("ask2gpt.selection")') ||
-  !selectionCodeActionSource.includes(`command: ATTACH_SELECTION_COMMAND`) ||
+  !selectionCodeActionSource.includes(
+    "command: notebookCell ? ATTACH_NOTEBOOK_CELL_COMMAND : ATTACH_SELECTION_COMMAND",
+  ) ||
+  !selectionCodeActionSource.includes('{ notebookType: "*" }') ||
+  !selectionCodeActionSource.includes(
+    'createNotebookCellReference(notebookCell, "range", range)',
+  ) ||
   !selectionCodeActionSource.includes("vscode.window.activeTextEditor") ||
   (selectionCodeActionSource.match(/new vscode\.CodeAction\(/gu)?.length ?? 0) !== 1 ||
+  productionCodeActionConstructions !== 1 ||
   selectionCodeActionSource.includes("isPreferred = true") ||
   !productionSources.some((file) => normalize(file).endsWith("/selection-code-action.ts")) ||
   productionSources.some((file) => normalize(file).endsWith("/selection-context.ts")) ||
   vscodePackage.contributes.codeLens !== undefined ||
-  vscodePackage.contributes.menus["editor/context"] !== undefined ||
   vscodePackage.contributes.menus["chat/editor/inlineGutter"] !== undefined ||
   vscodePackage.contributes.menus["editor/content"] !== undefined ||
   selectionHandoffSource.includes("workbench.action.chat.attachSelection") ||
@@ -181,7 +422,298 @@ if (
   extensionSource.includes("NATIVE_SELECTION_AFFORDANCE_CONTEXT")
 ) {
   failures.push(
-    "VS Code selected-code handoff must avoid duplicate surfaces and private workbench commands",
+    "VS Code selected-code handoff must support reviewed text/Notebook Quick Fix surfaces without private workbench commands",
+  );
+}
+if (
+  !/hasOnlyKeys\(\s*value,\s*\[\s*"type"\s*,\s*"conversationId"\s*,\s*"messageId"\s*,\s*"kind"\s*,\s*"reference"\s*\]\s*\)/u.test(
+    openSourceReferenceValidation,
+  ) ||
+  /\buri\b/u.test(openSourceReferenceValidation)
+) {
+  failures.push(
+    "Webview source-reference navigation must send bounded references, never a URI or path authority",
+  );
+}
+if (
+  (webviewProviderSource.match(/withSourceTraceHints\(/gu)?.length ?? 0) < 3 ||
+  !sourceTraceIndexSource.includes("nearestTraceContexts") ||
+  !sourceTraceIndexSource.includes('message.status === "streaming"') ||
+  !sourceTraceIndexSource.includes("candidate.id === state.activeConversationId") ||
+  !sourceTraceIndexSource.includes("MAX_HINTED_ASSISTANT_MESSAGES = 200") ||
+  !sourceTraceIndexSource.includes("MAX_SOURCE_FILE_REFERENCES = 1_000") ||
+  !sourceTraceIndexSource.includes("MAX_SOURCE_SYMBOLS = 4_096") ||
+  !sourceTraceIndexSource.includes("delete decorated.sourceTraceHints") ||
+  !sourceTraceIndexSource.includes(
+    "source-trace-policy:active-only;assistant=200;file-references=1000;symbols=4096",
+  ) ||
+  /from\s+["']vscode["']/u.test(sourceTraceIndexSource) ||
+  !/interface SourceTraceHint\s*\{\s*\/\*[\s\S]*?fileReferences:\s*string\[\];[\s\S]*?sourceSymbols:\s*string\[\];\s*\}/u.test(
+    typesSource,
+  )
+) {
+  failures.push(
+    "Source affordances must be host-derived, terminal-only, URI-free hints scoped to the nearest user turn",
+  );
+}
+if (
+  !protocolSource.includes("interface SourceAnchorV1") ||
+  !protocolSource.includes("normalizedContentSha256: string") ||
+  !contextServiceSource.includes("sourceAnchor: sourceAnchor(") ||
+  (contextServiceSource.match(/\.\.\.baseSnapshot\(/gu)?.length ?? 0) !== 3 ||
+  !contextServiceSource.includes("sourceAnchorSha256") ||
+  !conversationStoreSource.includes("normalizeSourceAnchor(") ||
+  !conversationStoreSource.includes("value.sourceAnchor,") ||
+  !conversationStoreSource.includes("value.content,") ||
+  !conversationStoreSource.includes("sourceAnchorSha256") ||
+  !sourceAnchorSource.includes("normalizeSourceAnchorContent") ||
+  !sourceAnchorSource.includes("sourceAnchorMatchesContent") ||
+  conversationStoreSource.includes("sourceTraceHints") ||
+  controllerSource.includes("sourceTraceHints")
+) {
+  failures.push(
+    "SourceAnchor V1 must be captured and strictly restored while derived trace hints remain non-persistent",
+  );
+}
+const notebookAnchorV2Fields = [
+  "formatVersion: 2",
+  "notebookUri: string",
+  "notebookType: string",
+  "notebookVersion: number",
+  "cellIndex: number",
+  'cellKind: "code" | "markup"',
+  "cellLanguage: string",
+  'scope: "range" | "cell"',
+  "documentVersion: number",
+  "range: NotebookCellTextRangeV2",
+  "contentSha256: string",
+  "normalizedContentSha256: string",
+  "cellContentSha256: string",
+  "normalizedCellContentSha256: string",
+  "beforeCellSha256?: string",
+  "afterCellSha256?: string",
+  "workspaceRelativePath?: string",
+];
+if (
+  notebookAnchorV2Fields.some((field) => !notebookAnchorContractSource.includes(field)) ||
+  !protocolSource.includes("SourceAnchorV1 | NotebookSourceAnchorV2") ||
+  !conversationStoreSource.includes("normalizeNotebookSourceAnchor(") ||
+  !conversationStoreSource.includes("value.notebookUri !== contextUri") ||
+  !conversationStoreSource.includes("isAllowedNotebookContainerUri(value.notebookUri)") ||
+  !conversationStoreSource.includes("value.formatVersion !== 2") ||
+  !conversationStoreSource.includes("Object.keys(value).some((key) => !allowedKeys.has(key))") ||
+  !conversationStoreSource.includes("/^(?:file|untitled|vscode-remote):/u.test(value)") ||
+  !protocolSource.includes("A `vscode-notebook-cell:` URI is intentionally not persisted")
+) {
+  failures.push(
+    "NotebookSourceAnchorV2 must remain a strict container-URI, cell/range, content, and neighbor-fingerprint contract",
+  );
+}
+if (
+  !selectionReferenceSource.includes('type: "notebook-cell"') ||
+  !selectionReferenceSource.includes("notebookCellReferencesFromEditor(") ||
+  !selectionReferenceSource.includes('new Set(["file", "untitled", "vscode-remote"])') ||
+  !notebookCaptureSource.includes("MAX_CONTEXT_ATTACHMENTS") ||
+  !notebookCaptureSource.includes("assertAllowedContextBundle(snapshots)") ||
+  !notebookSnapshotSource.includes("const cellContent = cell.document.getText()") ||
+  !notebookSnapshotSource.includes("cell.document.getText(range)") ||
+  !notebookSnapshotSource.includes("assertAllowedContext(fileName, content)") ||
+  /(?:\.outputs\b|\.metadata\b|\.executionSummary\b|JSON\.stringify\s*\()/u.test(
+    notebookSnapshotSource,
+  )
+) {
+  failures.push(
+    "Notebook capture must use only explicit Cell TextDocument source and the shared 8/40k/60k context limits",
+  );
+}
+if (
+  !selectionReferenceSource.includes("resolveNotebookCellCommandTarget(") ||
+  !selectionReferenceSource.includes("candidate === value") ||
+  !selectionReferenceSource.includes("allowedNotebookSchemes.has(notebook.uri.scheme)") ||
+  !selectionReferenceSource.includes(
+    'createNotebookCellReference(cell, exactRange ? "range" : "cell", exactRange)',
+  ) ||
+  !selectionReferenceSource.includes("isClaimedNotebookCellCommandTarget(") ||
+  !selectionReferenceSource.includes("isOpenNotebookDocumentCommandTarget(") ||
+  (extensionSource.match(/resolveNotebookCellCommandTarget\(/gu)?.length ?? 0) < 2 ||
+  !extensionSource.includes("resolvedTarget\n          ? [resolvedTarget.reference]") ||
+  !extensionSource.includes("candidate === undefined ||") ||
+  !extensionSource.includes(
+    "isOpenNotebookDocumentCommandTarget(candidate, vscode.workspace.notebookDocuments)",
+  ) ||
+  !extensionSource.includes("isClaimedNotebookCellCommandTarget(candidate) && !resolvedTarget") ||
+  !extensionSource.includes("notebookTraceSelection(resolvedTarget.cell, resolvedTarget.reference)")
+) {
+  failures.push(
+    "Notebook Cell-title commands must bind the clicked host-owned Cell by object identity and never fall back from a forged Cell target",
+  );
+}
+if (
+  !contextServiceSource.includes('editor.document.uri.scheme === "vscode-notebook-cell"') ||
+  !activeEditorSource.includes("isRawNotebookTextDocument(editor.document)") ||
+  !activeEditorSource.includes("throw rawNotebookFileError()") ||
+  activeEditorSource.indexOf("isRawNotebookTextDocument(editor.document)") >
+    activeEditorSource.indexOf("return editor") ||
+  captureSelectionSource.indexOf("activeEditor()") < 0 ||
+  captureSelectionSource.indexOf("activeEditor()") > captureSelectionSource.indexOf(".getText(") ||
+  captureCurrentFileSource.indexOf("activeEditor()") < 0 ||
+  captureCurrentFileSource.indexOf("activeEditor()") >
+    captureCurrentFileSource.indexOf(".getText(") ||
+  captureFilesSource.indexOf('endsWith(".ipynb")') < 0 ||
+  captureFilesSource.indexOf('endsWith(".ipynb")') >
+    captureFilesSource.indexOf("openTextDocument(uri)") ||
+  !contextServiceSource.includes('endsWith(".ipynb")') ||
+  !contextServiceSource.includes('"NOTEBOOK_FILE_REQUIRES_NOTEBOOK_API"') ||
+  !promptBuilderSource.includes('"NOTEBOOK_RAW_CONTEXT_UNSUPPORTED"') ||
+  !promptBuilderSource.includes("/\\.ipynb(?:$|[\\p{Cc}\\p{Cf}])/iu") ||
+  !promptBuilderSource.includes("content: context.content") ||
+  !promptBuilderSource.includes("`${base}.cell-${cellNumber}${range}.${format.extension}`")
+) {
+  failures.push(
+    "Raw ipynb transport must fail closed while Notebook source uses bounded synthetic per-Cell attachments",
+  );
+}
+if (
+  !notebookSourceNavigationSource.includes("resolveNotebookContextCell") ||
+  !notebookSourceNavigationSource.includes("resolveNotebookCell") ||
+  !notebookSourceNavigationSource.includes("showNotebookContextRange") ||
+  !notebookSourceNavigationSource.includes("vscode.workspace.openNotebookDocument(containerUri)") ||
+  !notebookSourceNavigationSource.includes("vscode.window.showNotebookDocument") ||
+  !notebookSourceNavigationSource.includes("new vscode.NotebookRange") ||
+  !notebookSourceNavigationSource.includes("editor.revealRange") ||
+  !notebookSourceNavigationSource.includes('return { status: "ambiguous" }') ||
+  !notebookSourceNavigationSource.includes('return { status: "missing" }') ||
+  !contextNavigationSource.includes("resolveNotebookContextCell(context)") ||
+  !contextNavigationSource.includes("showNotebookContextRange(resolution)") ||
+  !sourceTraceSource.includes("trustedNotebookResolution") ||
+  !sourceTraceSource.includes("notebookContextIdentity") ||
+  !conversationTraceSource.includes("notebookReferenceMatchesAnchor") ||
+  !conversationTraceSource.includes("notebookRangeMatches") ||
+  !extensionSource.includes("registerCommand(ATTACH_NOTEBOOK_CELL_COMMAND")
+) {
+  failures.push(
+    "Notebook cards, answer lines, symbols, and reverse traces must share fail-closed host-authoritative Cell navigation",
+  );
+}
+if (
+  !controllerSource.includes("const SAFE_CONVERSATION_ID") ||
+  !controllerSource.includes("SAFE_CONVERSATION_ID.test(storedActive)") ||
+  !controllerSource.includes("this.createConversation(storedActive)") ||
+  !controllerSource.includes(
+    "!conversation.remoteUrl && !hasVisibleConversationMessages(conversation)",
+  ) ||
+  !controllerSource.includes("prepareConversationForDispatch(conversationId: string)") ||
+  !controllerSource.includes("buildConversationTranscriptProof(conversation),\n        true,") ||
+  !controllerSource.includes("releaseInactiveConversation(conversationId: string)")
+) {
+  failures.push(
+    "Blank drafts must keep a stable reload identity, stay lazy before dispatch, and release inactive views best-effort",
+  );
+}
+if (
+  !browserChatBackendSource.includes(
+    "const TAB_LEASE_MINIMUM_RELAY_VERSION = [0, 1, 2] as const",
+  ) ||
+  !browserChatBackendSource.includes("private supportsTabLeases()") ||
+  !browserChatBackendSource.includes(
+    '...(supportsTabLeases ? { purpose: dispatchIntent ? "dispatch" : "view" } : {})',
+  ) ||
+  !browserChatBackendSource.includes("!this.supportsTabLeases()") ||
+  !browserChatBackendSource.includes(
+    "version[0] === minimum[0] && version[1] === minimum[1] && version[2]! >= minimum[2]",
+  ) ||
+  !browserChatBackendSource.includes('type: "conversation.release"') ||
+  !protocolSource.includes('type: z.literal("conversation.release")') ||
+  !protocolSource.includes('type: z.literal("conversation.released")') ||
+  !protocolRuntimeContractSource.includes("export const PROTOCOL_VERSION = 15")
+) {
+  failures.push(
+    "Protocol v15 tab leases must stay optional and gated to Relay product version 0.1.2 or newer",
+  );
+}
+if (
+  !relayStateSource.includes(
+    'export type TabProvenance = "created" | "borrowed" | "legacy-unknown"',
+  ) ||
+  !relayStateSource.includes('value.provenance === undefined ? "legacy-unknown"') ||
+  !relayStateSource.includes("owned: boolean;") ||
+  !relayStateSource.includes('provenance === "borrowed" ? value.owned !== false') ||
+  !relayStateSource.includes('owned: provenance !== "borrowed"') ||
+  !relayStateSource.includes("leaseEpoch") ||
+  !relayStateSource.includes("releaseRequestedAt") ||
+  !relayStateSource.includes("userClaimedAt") ||
+  !tabLeasePolicySource.includes("MANAGED_TAB_CAPACITY = MAX_CONCURRENT_RUNS") ||
+  !protocolSource.includes("export const MAX_CONCURRENT_RUNS = 3") ||
+  !tabLeasePolicySource.includes("selectReusableManagedTab") ||
+  !tabLeasePolicySource.includes("isManagedTabCloseCandidate") ||
+  !tabLeasePolicySource.includes('record.provenance ?? "legacy-unknown"') ||
+  !chromeServiceWorker.includes("async function withTabAllocator") ||
+  !chromeServiceWorker.includes('provenance: "borrowed"') ||
+  !chromeServiceWorker.includes("owned: false") ||
+  !chromeServiceWorker.includes('provenance: "created"') ||
+  !chromeServiceWorker.includes("MANAGED_TAB_SURPLUS_IDLE_MS = 10 * 60_000") ||
+  !chromeServiceWorker.includes("MANAGED_TAB_DISCONNECTED_IDLE_MS = 30 * 60_000") ||
+  !chromeServiceWorker.includes('const MANAGED_TAB_GC_ALARM = "relay-managed-tab-gc"') ||
+  !chromeServiceWorker.includes("runManagedTabGc") ||
+  !chromeServiceWorker.includes("managedTabCandidateIsAuthoritative") ||
+  !chromeServiceWorker.includes("releaseRequestedAt") ||
+  !chromeServiceWorker.includes("markManagedTabUserClaimed") ||
+  !chromeServiceWorker.includes("cleanupManagedTabsFromPopup") ||
+  !allocateConversationTabSource.includes("return withTabAllocator(async () => {") ||
+  !allocateConversationTabSource.includes("owned: false") ||
+  !allocateConversationTabSource.includes('provenance: "borrowed"') ||
+  allocateConversationTabSource.indexOf("owned: false") >
+    allocateConversationTabSource.indexOf('provenance: "borrowed"') ||
+  (allocateConversationTabSource.match(/await persistSession\(\)/gu)?.length ?? 0) < 3 ||
+  (allocateConversationTabSource.match(/conversationTabs\.delete\(input\.key\)/gu)?.length ?? 0) <
+    3 ||
+  !allocateConversationTabSource.includes(
+    "restoreConversationTabLeaseState(oldKey, previousLeaseState)",
+  ) ||
+  !allocateConversationTabSource.includes("await chrome.tabs.remove(tab.id)") ||
+  !inspectManagedTabCandidateSource.includes("const latestTab = await chrome.tabs.get") ||
+  !inspectManagedTabCandidateSource.includes(
+    "managedTabCandidateIsAuthoritative(authoritativeCandidate)",
+  ) ||
+  !inspectManagedTabCandidateSource.includes(
+    "selectReusableManagedTab([authoritativeCandidate]) === authoritativeCandidate",
+  ) ||
+  !handleReleaseSource.includes("const previousReleaseRequestedAt") ||
+  !handleReleaseSource.includes("record.leaseEpoch === expectedLeaseEpoch") ||
+  !handleReleaseSource.includes("delete record.releaseRequestedAt") ||
+  !handleReleaseSource.includes("the tab remains leased") ||
+  !tryMarkManagedTabIdleSource.includes("const previousIdleSince") ||
+  !tryMarkManagedTabIdleSource.includes("record.leaseEpoch === expectedEpoch") ||
+  !tryMarkManagedTabIdleSource.includes("releasedConversationKeys.add(key)") ||
+  !managedTabGcSource.includes('tabProvenance(entry[1]) !== "created"') ||
+  !managedTabGcSource.includes("MANAGED_TAB_DISCONNECTED_IDLE_MS") ||
+  !managedTabGcSource.includes("MANAGED_TAB_SURPLUS_IDLE_MS") ||
+  !closeManagedTabLeaseSource.includes("inspectContentIdleState(key, record") ||
+  !closeManagedTabLeaseSource.includes("conversationTabs.delete(key)") ||
+  !closeManagedTabLeaseSource.includes("chrome.tabs.remove(record.tabId)") ||
+  closeManagedTabLeaseSource.indexOf("conversationTabs.delete(key)") >
+    closeManagedTabLeaseSource.indexOf("chrome.tabs.remove(record.tabId)") ||
+  !removeOwnedTabSource.includes('tabProvenance(record) !== "created"') ||
+  !removeOwnedTabSource.includes('return "left-open"') ||
+  !popupManagedTabCleanupSource.includes('tabProvenance(entry[1]) !== "created"') ||
+  !popupManagedTabCleanupSource.includes("inspectManagedTabCandidate") ||
+  !popupManagedTabCleanupSource.includes("closeManagedTabLease")
+) {
+  failures.push(
+    "Relay managed tabs must preserve provenance, exclusive leases, soft capacity, LRU reuse, user claims, and conservative GC",
+  );
+}
+if (
+  !chromeContentScript.includes('"content.inspectIdleState"') ||
+  !chromeContentScript.includes("function inspectIdleState()") ||
+  !contentIdlePolicySource.includes('"ambiguous-composer"') ||
+  !contentIdlePolicySource.includes('"composer-not-empty"') ||
+  !contentIdlePolicySource.includes('"attachments-present"') ||
+  !contentIdlePolicySource.includes('"response-control-present"') ||
+  !contentIdlePolicySource.includes('"modal-present"')
+) {
+  failures.push(
+    "Managed-tab reuse must require fail-closed page idle attestation with composer, attachment, response-control, and modal checks",
   );
 }
 if (vscodePackage.scripts.package !== "node ../../scripts/package-vscode.mjs") {
@@ -347,6 +879,17 @@ const chromePopup = await readFile(
 if (!chromePopup.includes("<title>Ask2GPT Relay</title>")) {
   failures.push("Chrome popup title is not branded as Ask2GPT Relay");
 }
+if (
+  !chromePopup.includes('id="tab-pool-section"') ||
+  !chromePopup.includes('id="cleanup-managed-tabs"') ||
+  !chromePopupSource.includes('type: "popup.cleanupManagedTabs"') ||
+  !chromePopupSource.includes('"legacyCandidates"') ||
+  !chromePopupSource.includes('"cleanupEligible"')
+) {
+  failures.push(
+    "Chrome popup must expose managed-pool status and a provenance-safe idle-page cleanup action",
+  );
+}
 const chromePackageScript = await readFile(
   path.join(root, "scripts", "package-chrome.mjs"),
   "utf8",
@@ -433,6 +976,12 @@ async function readJson(file) {
 
 function normalize(file) {
   return file.split(path.sep).join("/");
+}
+
+function boundedSourceSlice(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, Math.max(0, start + startMarker.length));
+  return start >= 0 && end > start ? source.slice(start, end) : "";
 }
 
 function chromeExtensionId(key) {

@@ -18,6 +18,9 @@ import {
   type ConversationCanonicalizationCheckPayload,
   type ConversationCanonicalizationResultPayload,
   type ConversationOpenPayload,
+  type ConversationLeasePurpose,
+  type ConversationReleasePayload,
+  type ConversationReleasedPayload,
   type ConversationSendPayload,
   type ConversationSnapshotPayload,
   type ConversationTranscriptProof,
@@ -94,6 +97,17 @@ import {
   preDispatchPageMatches,
   sameChatGptConversationIdentity,
 } from "./tab-navigation-policy";
+import {
+  MANAGED_TAB_CAPACITY,
+  NO_TAB_LIFECYCLE_BLOCKERS,
+  countManagedTabs,
+  isManagedTabCloseCandidate,
+  nextTabLeaseEpoch,
+  selectReusableManagedTab,
+  tabProvenance,
+  type ManagedTabPolicyInput,
+  type TabLifecycleBlockers,
+} from "./tab-lease-policy";
 
 type RelayTransportState = "connecting" | "open" | "authenticated" | "error";
 type ProjectSetupReason =
@@ -148,6 +162,9 @@ interface ContentResponse extends Record<string, unknown> {
   scope?: string;
   name?: string;
   runLifecycle?: unknown;
+  idle?: boolean;
+  blocker?: string;
+  pageUrl?: string;
 }
 
 interface VisibleConversationSnapshot extends ConversationSnapshotPayload {
@@ -270,6 +287,7 @@ type RelayVisibilityMode = "background" | "foreground";
 const RELAY_VISIBILITY_MODE: RelayVisibilityMode = "background";
 const RECONNECT_ALARM = "relay-reconnect";
 const TERMINAL_HISTORY_RECOVERY_ALARM = "relay-terminal-history-recovery";
+const MANAGED_TAB_GC_ALARM = "relay-managed-tab-gc";
 const PROJECT_BINDING_STORAGE_KEY = "projectBindingV6";
 const LEGACY_PROJECT_BINDING_STORAGE_KEY = "projectBindingV5";
 const PROJECT_BINDING_VERIFICATION_STORAGE_KEY = "projectBindingVerificationV1";
@@ -327,6 +345,9 @@ const TERMINAL_EVENT_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000] as const;
 const TAB_NAVIGATION_LEASE_MS = 30_000;
 const MODEL_CATALOG_TTL_MS = 10 * 60_000;
 const PROMPT_INLINE_PRESENTATION_VERSION = 1 as const;
+const MANAGED_TAB_GC_PERIOD_MINUTES = 1;
+const MANAGED_TAB_SURPLUS_IDLE_MS = 10 * 60_000;
+const MANAGED_TAB_DISCONNECTED_IDLE_MS = 30 * 60_000;
 
 interface EnhancedDebuggerCapture {
   key: string;
@@ -381,10 +402,6 @@ const PARKED_WINDOW_HEIGHT = 760;
 const PARKED_WINDOW_MAX_POSITION_ADJUSTMENT = 256;
 const DISPATCH_INTENT_PREWARM_HOLD_MS = 10_000;
 const DISPATCH_INTENT_PREWARM_POLL_MS = 50;
-// A minimized home window is restored only at these safe off-screen bounds,
-// without taking OS focus, then returned to its original bounds and state.
-const PARKED_WINDOW_BOUNDS = { height: 100, left: -16_000, top: -16_000, width: 100 } as const;
-const PARKED_WINDOW_SAFE_EDGE = -8_000;
 const MAIN_WORLD_SEND_ATTRIBUTE = "data-ask2gpt-main-world-send";
 const MAIN_WORLD_COMPOSER_ATTRIBUTE = "data-ask2gpt-main-world-composer";
 const MAIN_WORLD_SCOPE_ATTRIBUTE = "data-ask2gpt-main-world-scope";
@@ -415,6 +432,8 @@ let enhancedBackgroundEnabled = false;
 let nextExpectedTabActivationToken = 1;
 let workerSuspended = false;
 const conversationTabs = new Map<string, TabRecord>();
+const releasedConversationKeys = new Set<string>();
+const userClaimedTabIds = new Set<number>();
 const activeRuns = new Map<string, ActiveRunRecord>();
 const completedCanonicalizations = new Map<string, CompletedCanonicalizationRecord>();
 const terminalHistoryBarriers = new Map<string, TerminalHistoryBarrierRecord>();
@@ -507,6 +526,8 @@ let relayReloadPreparationActive = false;
 let relayReloadPreparationPromise: Promise<void> | undefined;
 let relayRuntimeReloadScheduled = false;
 let terminalHistoryRecoveryPromise: Promise<void> | undefined;
+let tabAllocationTail: Promise<void> = Promise.resolve();
+let managedTabGcPromise: Promise<void> | undefined;
 
 const ready = initialize().catch((error: unknown) => {
   lastError = error instanceof Error ? error.message : "Chrome relay initialization failed.";
@@ -521,6 +542,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void ready
       .then(recoverTerminalHistoryBarriers)
       .catch(() => recordBackgroundFailure("Terminal history recovery alarm failed."));
+  }
+  if (alarm.name === MANAGED_TAB_GC_ALARM) {
+    void ready
+      .then(runManagedTabGc)
+      .catch(() => recordBackgroundFailure("Managed tab cleanup alarm failed."));
   }
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -562,8 +588,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   const homeWindowId = parkingWindowOwners.get(windowId) ?? windowId;
   const retainedLease = windowVisibilityLeaseStates.get(homeWindowId)?.stack.at(-1);
-  if (!consumeExpectedTabActivation(windowId, tabId) && retainedLease?.tabId !== tabId) {
+  const expected = consumeExpectedTabActivation(windowId, tabId);
+  if (!expected && retainedLease?.tabId !== tabId) {
+    userClaimedTabIds.add(tabId);
     markWindowUserIntervened(windowId, tabId);
+    void ready
+      .then(() => markManagedTabUserClaimed(tabId))
+      .catch(() => recordBackgroundFailure("Managed tab user claim was not persisted."));
   }
   void ready
     .then(() => recoverReloadedTab(tabId))
@@ -573,7 +604,12 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
   // WINDOW_ID_NONE is reported while focus leaves Chrome. Returning to a
   // leased Chrome window is deliberate user interaction even when the active
   // tab does not change, so terminal cleanup must not steal that tab away.
-  if (windowId >= 0) markWindowUserIntervened(windowId);
+  if (windowId >= 0) {
+    markWindowUserIntervened(windowId);
+    void ready
+      .then(() => markWindowActiveManagedTabUserClaimed(windowId))
+      .catch(() => recordBackgroundFailure("Managed tab window claim was not persisted."));
+  }
 });
 
 chromeWithOptionalDebugging.debugger?.onEvent.addListener((source, method, params) => {
@@ -1620,6 +1656,12 @@ async function initialize() {
     conversationTabs,
     parseStoredTabs(session.conversationTabsV2 ?? reloadCheckpoint?.conversationTabs),
   );
+  releasedConversationKeys.clear();
+  for (const [key, record] of conversationTabs) {
+    if (record.releaseRequestedAt && tabProvenance(record) === "created") {
+      releasedConversationKeys.add(key);
+    }
+  }
   replaceMap(activeRuns, parseStoredRuns(session.activeRunsV2 ?? reloadCheckpoint?.activeRuns));
   runPromptFingerprints.clear();
   runDispatchTranscriptBaselines.clear();
@@ -1756,6 +1798,9 @@ async function initialize() {
     }
   }
   await chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 1 });
+  await chrome.alarms.create(MANAGED_TAB_GC_ALARM, {
+    periodInMinutes: MANAGED_TAB_GC_PERIOD_MINUTES,
+  });
   scanPorts();
   if (reloadCheckpoint) await restoreMappedContentRuntimesAfterRelayReload();
   await recoverAllRuns();
@@ -2068,6 +2113,14 @@ async function handleRelayMessage(connection: RelayConnection, raw: string) {
 
   if (envelope.conversationId) {
     const key = conversationKey(connection.instanceId!, envelope.conversationId);
+    if (envelope.type === "conversation.release") {
+      // Record the lease intent before yielding to the per-conversation queue.
+      // Authenticated frames may execute concurrently across conversation keys;
+      // without this ingress marker, a following conversation.open can allocate
+      // a new tab before handleRelease has made the previous lease recyclable.
+      releasedConversationKeys.add(key);
+      dispatchIntentPrewarmDeadlines.delete(key);
+    }
     await withConversationCommand(key, async () => {
       await dispatchAuthenticatedEnvelope(connection, envelope);
     });
@@ -2155,6 +2208,8 @@ async function dispatchAuthenticatedEnvelope(connection: RelayConnection, envelo
     await handleCanonicalizationCheck(connection, envelope);
   } else if (envelope.type === "conversation.send") {
     await handleSend(connection, envelope);
+  } else if (envelope.type === "conversation.release") {
+    await handleRelease(connection, envelope);
   } else if (envelope.type === "generation.stop") {
     await handleStop(connection, envelope);
   } else if (envelope.type === "generation.ack") {
@@ -2231,6 +2286,20 @@ async function handleGenerationAck(connection: RelayConnection, envelope: RelayE
   committedPendingEventKeys.delete(key);
   clearPendingEventRetry(key);
   await persistSession();
+  const conversationStateKey = conversationKey(connection.instanceId!, conversationId);
+  if (
+    !activeRuns.has(conversationStateKey) &&
+    !hasPendingTerminalForConversation(conversationStateKey)
+  ) {
+    void tryMarkManagedTabIdle(conversationStateKey, { ignoreCurrentCommand: true })
+      .then((markedIdle) => {
+        if (!markedIdle) void retryReleasedManagedTabIdle(conversationStateKey);
+      })
+      .catch(() => {
+        recordBackgroundFailure("A settled Relay tab could not be marked idle.");
+        void retryReleasedManagedTabIdle(conversationStateKey);
+      });
+  }
 }
 
 async function handleModelList(connection: RelayConnection, envelope: RelayEnvelope) {
@@ -2496,13 +2565,19 @@ async function handleOpen(connection: RelayConnection, envelope: RelayEnvelope) 
     scheduleSessionPersist();
   }
   try {
+    const leasePurpose = payload.purpose ?? (payload.dispatchIntent ? "dispatch" : "view");
     const tabId = await ensureConversationTab(
       connection.instanceId!,
       conversationId,
       openRemoteUrl,
+      leasePurpose,
     );
     const record = conversationTabs.get(key);
     if (record?.tabId === tabId) {
+      // Reselecting a conversation during its run is a lease renewal only.
+      // `ensureConversationTab` has already durably cleared a pending release;
+      // avoid starting a second history/prewarm read against the active page.
+      if (leasePurpose === "view" && activeRuns.has(key)) return;
       // Capture this before the initial snapshot read. A slow, not-yet-loaded
       // tab must not turn an old idle prewarm into a surprise parking-window
       // migration if the user minimizes Chrome several seconds later.
@@ -2767,7 +2842,12 @@ async function handleSend(connection: RelayConnection, envelope: RelayEnvelope) 
   activeRuns.set(key, run);
   try {
     await persistSession();
-    const tabId = await ensureConversationTab(run.instanceId, conversationId, payload.remoteUrl);
+    const tabId = await ensureConversationTab(
+      run.instanceId,
+      conversationId,
+      payload.remoteUrl,
+      "dispatch",
+    );
     if (activeRuns.get(key) !== run) return;
     if (conversationTabs.get(key)?.tabId !== tabId) {
       throw relayFailure("CHATGPT_REMOTE_UNAVAILABLE", "会话标签页映射已发生变化。", tabId);
@@ -3064,7 +3144,12 @@ async function handleRegenerate(connection: RelayConnection, envelope: RelayEnve
   activeRuns.set(key, run);
   try {
     await persistSession();
-    const tabId = await ensureConversationTab(run.instanceId, conversationId, payload.remoteUrl);
+    const tabId = await ensureConversationTab(
+      run.instanceId,
+      conversationId,
+      payload.remoteUrl,
+      "dispatch",
+    );
     if (activeRuns.get(key) !== run) return;
     if (conversationTabs.get(key)?.tabId !== tabId) {
       throw relayFailure("CHATGPT_REMOTE_UNAVAILABLE", "会话标签页映射已发生变化。", tabId);
@@ -3132,6 +3217,83 @@ async function handleRegenerate(connection: RelayConnection, envelope: RelayEnve
   }
 }
 
+async function handleRelease(connection: RelayConnection, envelope: RelayEnvelope) {
+  const conversationId = requireConversationId(connection, envelope);
+  const payload = parseReleasePayload(envelope.payload);
+  if (!conversationId || !payload) {
+    rejectProtocol(connection, envelope, "Invalid conversation.release payload.");
+    return;
+  }
+
+  const key = conversationKey(connection.instanceId!, conversationId);
+  const record = conversationTabs.get(key);
+  const previousReleaseRequestedAt = record?.releaseRequestedAt;
+  const expectedLeaseEpoch = record?.leaseEpoch;
+  markConversationReleaseRequested(key);
+  const checkpointedReleaseRequestedAt = record?.releaseRequestedAt;
+  // The acknowledgement means the release intent is durable, not merely
+  // present in this service worker's memory. A later MV3 worker can therefore
+  // finish the idle transition after the run terminal has been acknowledged.
+  if (record) {
+    try {
+      await persistSession();
+    } catch {
+      if (
+        conversationTabs.get(key) === record &&
+        record.leaseEpoch === expectedLeaseEpoch &&
+        record.releaseRequestedAt === checkpointedReleaseRequestedAt
+      ) {
+        if (previousReleaseRequestedAt) {
+          record.releaseRequestedAt = previousReleaseRequestedAt;
+          releasedConversationKeys.add(key);
+        } else {
+          delete record.releaseRequestedAt;
+          releasedConversationKeys.delete(key);
+        }
+      }
+      scheduleSessionPersist();
+      sendError(
+        connection,
+        envelope,
+        "INTERNAL_ERROR",
+        "Chrome could not durably checkpoint the tab release; the tab remains leased.",
+      );
+      return;
+    }
+  } else {
+    releasedConversationKeys.delete(key);
+  }
+  const markedIdle = await tryMarkManagedTabIdle(key, { ignoreCurrentCommand: true }).catch(() => {
+    // Release is an optimization, not a destructive operation. A page that
+    // cannot prove idleness simply stays leased and is never reassigned.
+    recordBackgroundFailure("A released Relay tab failed its idle attestation.");
+    return false;
+  });
+  if (!markedIdle) void retryReleasedManagedTabIdle(key);
+  sendConnection(
+    connection,
+    makeEnvelope({
+      type: "conversation.released",
+      instanceId: connection.instanceId!,
+      conversationId,
+      payload: {
+        requestId: envelope.id,
+        purpose: payload.purpose,
+        reason: payload.reason,
+      } satisfies ConversationReleasedPayload,
+    }),
+  );
+}
+
+function markConversationReleaseRequested(key: string) {
+  releasedConversationKeys.add(key);
+  dispatchIntentPrewarmDeadlines.delete(key);
+  const record = conversationTabs.get(key);
+  if (!record || record.releaseRequestedAt) return false;
+  record.releaseRequestedAt = new Date().toISOString();
+  return true;
+}
+
 async function handleClose(connection: RelayConnection, envelope: RelayEnvelope) {
   const conversationId = requireConversationId(connection, envelope);
   const payload = parseClosePayload(envelope.payload);
@@ -3141,11 +3303,16 @@ async function handleClose(connection: RelayConnection, envelope: RelayEnvelope)
   }
 
   const key = conversationKey(connection.instanceId!, conversationId);
+  releasedConversationKeys.delete(key);
   const record = conversationTabs.get(key);
   let tabDisposition: ConversationClosedPayload["tabDisposition"] = "left-open";
   if (payload.closeTab) {
     try {
-      tabDisposition = record ? await removeOwnedTab(record) : "already-absent";
+      tabDisposition = record
+        ? await withTabAllocator(async () =>
+            conversationTabs.get(key) === record ? removeOwnedTab(record) : "left-open",
+          )
+        : "already-absent";
     } catch (error) {
       await sendCaughtError(
         connection,
@@ -3205,38 +3372,50 @@ async function handleClose(connection: RelayConnection, envelope: RelayEnvelope)
   try {
     await persistSession();
   } catch {
-    if (previous.record) conversationTabs.set(key, previous.record);
-    if (previous.modelSelection) {
-      conversationModelSelections.set(key, previous.modelSelection);
-    }
-    if (previous.run) activeRuns.set(key, previous.run);
-    for (const [pendingKey, pending] of previous.pendingEvents) {
-      pendingEvents.set(pendingKey, pending);
-      if (previous.committedPendingEventKeys.has(pendingKey)) {
-        committedPendingEventKeys.add(pendingKey);
+    const tabIrreversiblyGone = tabDisposition === "closed" || tabDisposition === "already-absent";
+    // A successful physical close cannot be rolled back. Keep the in-memory
+    // lease and every tab-bound run/barrier absent instead of resurrecting a
+    // ghost run that points at a tab Chrome has already removed.
+    if (!tabIrreversiblyGone) {
+      if (previous.record) conversationTabs.set(key, previous.record);
+      if (previous.modelSelection) {
+        conversationModelSelections.set(key, previous.modelSelection);
       }
-      if (isTerminalEvent(pending.event)) schedulePendingEventRetry(pendingKey);
-    }
-    if (previous.forwardedSnapshot) {
-      forwardedSnapshots.set(key, previous.forwardedSnapshot);
-    }
-    if (previous.expectedNavigation) {
-      expectedTabNavigations.set(key, previous.expectedNavigation);
-    }
-    if (previous.completedCanonicalization) {
-      completedCanonicalizations.set(key, previous.completedCanonicalization);
-    }
-    if (previous.completedInitialAdoption) {
-      completedInitialAdoptions.set(key, previous.completedInitialAdoption);
-    }
-    if (previous.terminalHistoryBarrier) {
-      terminalHistoryBarriers.set(key, previous.terminalHistoryBarrier);
-    }
-    if (previous.runPromptFingerprint) {
-      runPromptFingerprints.set(key, previous.runPromptFingerprint);
-    }
-    if (previous.runDispatchTranscriptBaseline) {
-      runDispatchTranscriptBaselines.set(key, previous.runDispatchTranscriptBaseline);
+      if (previous.run) activeRuns.set(key, previous.run);
+      for (const [pendingKey, pending] of previous.pendingEvents) {
+        pendingEvents.set(pendingKey, pending);
+        if (previous.committedPendingEventKeys.has(pendingKey)) {
+          committedPendingEventKeys.add(pendingKey);
+        }
+        if (isTerminalEvent(pending.event)) schedulePendingEventRetry(pendingKey);
+      }
+      if (previous.forwardedSnapshot) {
+        forwardedSnapshots.set(key, previous.forwardedSnapshot);
+      }
+      if (previous.expectedNavigation) {
+        expectedTabNavigations.set(key, previous.expectedNavigation);
+      }
+      if (previous.completedCanonicalization) {
+        completedCanonicalizations.set(key, previous.completedCanonicalization);
+      }
+      if (previous.completedInitialAdoption) {
+        completedInitialAdoptions.set(key, previous.completedInitialAdoption);
+      }
+      if (previous.terminalHistoryBarrier) {
+        terminalHistoryBarriers.set(key, previous.terminalHistoryBarrier);
+      }
+      if (previous.runPromptFingerprint) {
+        runPromptFingerprints.set(key, previous.runPromptFingerprint);
+      }
+      if (previous.runDispatchTranscriptBaseline) {
+        runDispatchTranscriptBaselines.set(key, previous.runDispatchTranscriptBaseline);
+      }
+    } else {
+      scheduleSessionPersist();
+      if (previous.run?.tabId !== undefined) {
+        await detachEnhancedDebugger(previous.run.tabId, previous.run.runId);
+      }
+      if (previous.run) await releaseRunVisibilityLease(key, previous.run.runId);
     }
     recordBackgroundFailure("Failed to persist conversation close.");
     sendError(
@@ -4954,6 +5133,7 @@ async function prewarmConversationDispatchState(
 ) {
   if (
     workerSuspended ||
+    releasedConversationKeys.has(key) ||
     activeRuns.has(key) ||
     conversationTabs.get(key) !== record ||
     record.tabId !== tabId
@@ -4961,12 +5141,24 @@ async function prewarmConversationDispatchState(
     return;
   }
   const prepare = async (refreshVisibleSnapshot: boolean) => {
-    if (activeRuns.has(key) || conversationTabs.get(key) !== record) return;
+    if (
+      releasedConversationKeys.has(key) ||
+      activeRuns.has(key) ||
+      conversationTabs.get(key) !== record
+    ) {
+      return;
+    }
     // A complete visible snapshot refreshes the content-free fingerprint and
     // its in-memory attestation. A virtualized non-empty suffix is attested by
     // prepareDispatchTranscriptBaseline against the Host-prewarmed hashes.
     if (refreshVisibleSnapshot) await syncConversationSnapshotFromTab(record, 1);
-    if (activeRuns.has(key) || conversationTabs.get(key) !== record) return;
+    if (
+      releasedConversationKeys.has(key) ||
+      activeRuns.has(key) ||
+      conversationTabs.get(key) !== record
+    ) {
+      return;
+    }
     await prepareDispatchTranscriptBaseline(key, tabId);
   };
 
@@ -4989,6 +5181,7 @@ async function prewarmConversationDispatchState(
         await prepare(true);
         while (
           !workerSuspended &&
+          !releasedConversationKeys.has(key) &&
           !activeRuns.has(key) &&
           conversationTabs.get(key) === record &&
           record.tabId === tabId
@@ -6358,10 +6551,474 @@ async function findReusableUntrackedConversationTab(
   return candidates[0];
 }
 
+interface ConversationTabAllocationInput {
+  allowBorrowed?: boolean;
+  instanceId: string;
+  conversationId: string;
+  key: string;
+  requestedConversationUrl?: string;
+  targetProjectRoute: ProjectRoute;
+  targetUrl: string;
+}
+
+type ConversationTabAllocation =
+  | { kind: "existing" }
+  | { kind: "borrowed"; tabId: number }
+  | { kind: "managed"; tabId: number; navigate: boolean };
+
+interface ManagedTabCandidate extends ManagedTabPolicyInput {
+  expectedLeaseEpoch: number | undefined;
+  key: string;
+}
+
+async function withTabAllocator<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = tabAllocationTail;
+  let release!: () => void;
+  tabAllocationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+async function allocateConversationTab(
+  input: ConversationTabAllocationInput,
+): Promise<ConversationTabAllocation> {
+  return withTabAllocator(async () => {
+    if (conversationTabs.has(input.key)) return { kind: "existing" };
+    const now = new Date().toISOString();
+
+    // Exact adoption after an extension reload is useful, but URL equality
+    // does not prove that Ask2GPT created the page. Borrowed pages are never
+    // navigated, pooled, or closed automatically.
+    const exactTab = await findReusableUntrackedConversationTab(
+      input.requestedConversationUrl,
+      input.targetProjectRoute,
+    );
+    if (input.allowBorrowed !== false && exactTab && input.requestedConversationUrl) {
+      const record: TabRecord = {
+        // Keep this false as a downgrade fence: pre-provenance Relay builds
+        // reject the record instead of treating a user's existing tab as
+        // extension-owned and closing it.
+        owned: false,
+        instanceId: input.instanceId,
+        conversationId: input.conversationId,
+        tabId: exactTab.id,
+        remoteUrl: input.requestedConversationUrl,
+        projectScope: input.targetProjectRoute.scope,
+        createdAt: now,
+        provenance: "borrowed",
+        leaseEpoch: 1,
+        lastUsedAt: now,
+      };
+      conversationTabs.set(input.key, record);
+      try {
+        await persistSession();
+      } catch (error) {
+        if (conversationTabs.get(input.key) === record) conversationTabs.delete(input.key);
+        throw error;
+      }
+      return { kind: "borrowed", tabId: exactTab.id };
+    }
+
+    const reusable = await selectReusableManagedTabCandidate(input.targetProjectRoute);
+    if (reusable) {
+      // Idle proof can overlap a command for the old conversation. Re-read
+      // Chrome's page flags, then synchronously re-check every live blocker.
+      // There is deliberately no await between this check and reassignment.
+      const latestTab = await chrome.tabs.get(reusable.record.tabId).catch(() => undefined);
+      const authoritativeCandidate = latestTab
+        ? managedTabCandidate(
+            reusable.key,
+            reusable.record,
+            reusable.expectedLeaseEpoch,
+            input.targetProjectRoute,
+            latestTab,
+          )
+        : undefined;
+      const leaseEpoch = authoritativeCandidate
+        ? nextTabLeaseEpoch(authoritativeCandidate.record)
+        : undefined;
+      if (
+        authoritativeCandidate &&
+        managedTabCandidateIsAuthoritative(authoritativeCandidate) &&
+        selectReusableManagedTab([authoritativeCandidate]) === authoritativeCandidate &&
+        leaseEpoch !== undefined
+      ) {
+        const oldKey = reusable.key;
+        const previousLeaseState = captureConversationTabLeaseState(oldKey);
+        const record: TabRecord = {
+          ...authoritativeCandidate.record,
+          instanceId: input.instanceId,
+          conversationId: input.conversationId,
+          ...(input.requestedConversationUrl
+            ? { remoteUrl: input.requestedConversationUrl }
+            : { remoteUrl: undefined }),
+          remoteTitle: undefined,
+          projectScope: input.targetProjectRoute.scope,
+          provenance: "created",
+          leaseEpoch,
+          lastUsedAt: now,
+          idleSince: undefined,
+          releaseRequestedAt: undefined,
+          userClaimedAt: undefined,
+        };
+        conversationTabs.delete(oldKey);
+        clearConversationTabLeaseState(oldKey);
+        conversationTabs.set(input.key, record);
+        grantExpectedTabNavigation(input.key, record.tabId);
+        try {
+          await persistSession();
+        } catch (error) {
+          if (conversationTabs.get(input.key) === record) {
+            conversationTabs.delete(input.key);
+            clearConversationTabLeaseState(input.key);
+            conversationTabs.set(oldKey, reusable.record);
+            restoreConversationTabLeaseState(oldKey, previousLeaseState);
+          }
+          throw error;
+        }
+        return { kind: "managed", tabId: record.tabId, navigate: true };
+      }
+    }
+
+    // The capacity is deliberately soft. If every managed page is protected
+    // by a run, terminal barrier, user claim, or failed idle proof, correctness
+    // wins over tab count and a temporary overflow page is created. GC removes
+    // only surplus pages after they later prove safe.
+    const managedCountBeforeCreate = countManagedTabs(conversationTabs.values());
+    const tab = await chrome.tabs.create({ url: input.targetUrl, active: false });
+    if (tab.id === undefined) {
+      throw relayFailure("CHATGPT_REMOTE_UNAVAILABLE", "Chrome 未创建 ChatGPT 标签页。");
+    }
+    const record: TabRecord = {
+      owned: true,
+      instanceId: input.instanceId,
+      conversationId: input.conversationId,
+      tabId: tab.id,
+      ...(input.requestedConversationUrl ? { remoteUrl: input.requestedConversationUrl } : {}),
+      projectScope: input.targetProjectRoute.scope,
+      createdAt: now,
+      provenance: "created",
+      leaseEpoch: 1,
+      lastUsedAt: now,
+    };
+    conversationTabs.set(input.key, record);
+    grantExpectedTabNavigation(input.key, tab.id);
+    try {
+      await persistSession();
+    } catch (error) {
+      if (conversationTabs.get(input.key) === record) {
+        conversationTabs.delete(input.key);
+        clearConversationTabLeaseState(input.key);
+      }
+      closingTabs.add(tab.id);
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch {
+        recordBackgroundFailure("A tab created by a failed allocation could not be closed.");
+      } finally {
+        closingTabs.delete(tab.id);
+      }
+      throw error;
+    }
+    if (managedCountBeforeCreate >= MANAGED_TAB_CAPACITY) {
+      void runManagedTabGc().catch(() =>
+        recordBackgroundFailure("Managed tab overflow cleanup failed."),
+      );
+    }
+    return { kind: "managed", tabId: tab.id, navigate: false };
+  });
+}
+
+async function selectReusableManagedTabCandidate(targetProjectRoute: ProjectRoute) {
+  await settleReleasedManagedTabs(750);
+  const uniqueRecords = new Map<number, [string, TabRecord]>();
+  for (const entry of conversationTabs.entries()) {
+    if (!uniqueRecords.has(entry[1].tabId)) uniqueRecords.set(entry[1].tabId, entry);
+  }
+  const candidates = (
+    await Promise.all(
+      [...uniqueRecords.values()].map(([key, record]) =>
+        inspectManagedTabCandidate(key, record, targetProjectRoute),
+      ),
+    )
+  ).filter((candidate): candidate is ManagedTabCandidate => candidate !== undefined);
+  return selectReusableManagedTab(candidates);
+}
+
+async function inspectManagedTabCandidate(
+  key: string,
+  record: TabRecord,
+  targetProjectRoute: ProjectRoute,
+): Promise<ManagedTabCandidate | undefined> {
+  const expectedLeaseEpoch = record.leaseEpoch;
+  if (!managedTabLeaseIsAuthoritative(key, record, expectedLeaseEpoch)) return undefined;
+  if (userClaimedTabIds.has(record.tabId)) return undefined;
+  const tab = await chrome.tabs.get(record.tabId).catch(() => undefined);
+  if (!tab || !managedTabLeaseIsAuthoritative(key, record, expectedLeaseEpoch)) return undefined;
+  const candidate = managedTabCandidate(key, record, expectedLeaseEpoch, targetProjectRoute, tab);
+  if (!selectReusableManagedTab([candidate])) return undefined;
+  if (!(await inspectContentIdleState(key, record, { knownTab: tab, expectedLeaseEpoch }))) {
+    return undefined;
+  }
+  const latestTab = await chrome.tabs.get(record.tabId).catch(() => undefined);
+  if (!latestTab) return undefined;
+  const authoritativeCandidate = managedTabCandidate(
+    key,
+    record,
+    expectedLeaseEpoch,
+    targetProjectRoute,
+    latestTab,
+  );
+  return managedTabCandidateIsAuthoritative(authoritativeCandidate) &&
+    selectReusableManagedTab([authoritativeCandidate]) === authoritativeCandidate
+    ? authoritativeCandidate
+    : undefined;
+}
+
+function managedTabCandidate(
+  key: string,
+  record: TabRecord,
+  expectedLeaseEpoch: number | undefined,
+  targetProjectRoute: ProjectRoute,
+  tab: chrome.tabs.Tab,
+): ManagedTabCandidate {
+  const currentUrl = normalizeRemoteConversationUrl(tab.url);
+  const currentRoute = currentUrl ? parseProjectPageUrl(currentUrl) : undefined;
+  return {
+    expectedLeaseEpoch,
+    key,
+    record,
+    page: {
+      exists: tab.id !== undefined,
+      projectScopeMatches: Boolean(
+        currentRoute &&
+        projectScopesMatch(currentRoute.scope, targetProjectRoute.scope) &&
+        projectScopesMatch(record.projectScope, targetProjectRoute.scope),
+      ),
+      active: tab.active === true,
+      highlighted: tab.highlighted === true,
+      pinned: tab.pinned === true,
+      audible: tab.audible === true,
+    },
+    blockers: tabLifecycleBlockers(key, record, tab.pendingUrl !== undefined),
+  };
+}
+
+function managedTabLeaseIsAuthoritative(
+  key: string,
+  record: TabRecord,
+  expectedLeaseEpoch: number | undefined,
+) {
+  return (
+    conversationTabs.get(key) === record &&
+    record.leaseEpoch === expectedLeaseEpoch &&
+    !userClaimedTabIds.has(record.tabId)
+  );
+}
+
+function managedTabCandidateIsAuthoritative(candidate: ManagedTabCandidate) {
+  return managedTabLeaseIsAuthoritative(
+    candidate.key,
+    candidate.record,
+    candidate.expectedLeaseEpoch,
+  );
+}
+
+function tabLifecycleBlockers(
+  key: string,
+  record: TabRecord,
+  pendingNavigation = false,
+  ignoreCurrentCommand = false,
+): TabLifecycleBlockers {
+  return {
+    ...NO_TAB_LIFECYCLE_BLOCKERS,
+    activeRun: activeRuns.has(key),
+    pendingTerminal: hasPendingTerminalForConversation(key),
+    historyBarrier: terminalHistoryBarriers.has(key),
+    canonicalization: completedCanonicalizations.has(key) || completedInitialAdoptions.has(key),
+    visibilityLease: [...runVisibilityLeases.values()].some(
+      (lease) => lease.tabId === record.tabId,
+    ),
+    debuggerLease: enhancedDebuggerCaptures.has(record.tabId),
+    navigation:
+      pendingNavigation ||
+      expectedTabNavigations.has(key) ||
+      conversationSnapshotSyncs.has(key) ||
+      dispatchIntentPrewarmTasks.has(key) ||
+      dispatchIntentPrewarmDeadlines.has(key),
+    command: !ignoreCurrentCommand && conversationCommands.has(key),
+  };
+}
+
+function hasPendingTerminalForConversation(key: string) {
+  const record = conversationTabs.get(key);
+  if (!record) return false;
+  return [...pendingEvents.values()].some(
+    (pending) =>
+      pending.instanceId === record.instanceId &&
+      pending.event.conversationId === record.conversationId &&
+      isTerminalEvent(pending.event),
+  );
+}
+
+async function inspectContentIdleState(
+  key: string,
+  record: TabRecord,
+  options: {
+    expectedLeaseEpoch?: number | undefined;
+    ignoreCurrentCommand?: boolean;
+    knownTab?: chrome.tabs.Tab | undefined;
+  } = {},
+) {
+  const expectedLeaseEpoch = options.expectedLeaseEpoch ?? record.leaseEpoch;
+  if (!managedTabLeaseIsAuthoritative(key, record, expectedLeaseEpoch)) return false;
+  const tab = options.knownTab ?? (await chrome.tabs.get(record.tabId).catch(() => undefined));
+  const currentUrl = normalizeRemoteConversationUrl(tab?.url);
+  if (!currentUrl || !projectUrlMatchesRecord(record, currentUrl)) return false;
+  const response = await sendToTab(
+    record.tabId,
+    { type: "content.inspectIdleState" },
+    { totalTimeoutMs: 1_500, responseTimeoutMs: 1_000 },
+  ).catch(() => undefined);
+  if (
+    !isRecord(response) ||
+    response.ok !== true ||
+    response.idle !== true ||
+    !isCompatibleContentRuntime(response.selectorVersion) ||
+    typeof response.pageUrl !== "string"
+  ) {
+    return false;
+  }
+  const attestedUrl = normalizeRemoteConversationUrl(response.pageUrl);
+  const latestTab = await chrome.tabs.get(record.tabId).catch(() => undefined);
+  const latestUrl = normalizeRemoteConversationUrl(latestTab?.url);
+  return Boolean(
+    latestTab?.id !== undefined &&
+    managedTabLeaseIsAuthoritative(key, record, expectedLeaseEpoch) &&
+    !Object.values(
+      tabLifecycleBlockers(
+        key,
+        record,
+        latestTab.pendingUrl !== undefined,
+        options.ignoreCurrentCommand === true,
+      ),
+    ).some(Boolean) &&
+    latestTab.active !== true &&
+    latestTab.highlighted !== true &&
+    latestTab.pinned !== true &&
+    latestTab.audible !== true &&
+    attestedUrl &&
+    attestedUrl === currentUrl &&
+    latestUrl === attestedUrl &&
+    projectUrlMatchesRecord(record, latestUrl),
+  );
+}
+
+async function markTabLeaseActive(record: TabRecord) {
+  const key = conversationKey(record.instanceId, record.conversationId);
+  const wasReleasedInMemory = releasedConversationKeys.has(key);
+  const previousReleaseRequestedAt = record.releaseRequestedAt;
+  const previousLastUsedAt = record.lastUsedAt;
+  const previousIdleSince = record.idleSince;
+  const expectedLeaseEpoch = record.leaseEpoch;
+  const renewedAt = new Date().toISOString();
+  releasedConversationKeys.delete(key);
+  const releaseIntentChanged = previousReleaseRequestedAt !== undefined;
+  const idleAuthorityChanged = previousIdleSince !== undefined;
+  delete record.releaseRequestedAt;
+  record.lastUsedAt = renewedAt;
+  delete record.idleSince;
+  if (releaseIntentChanged || idleAuthorityChanged) {
+    try {
+      await persistSession();
+    } catch (error) {
+      if (
+        conversationTabs.get(key) === record &&
+        record.leaseEpoch === expectedLeaseEpoch &&
+        record.lastUsedAt === renewedAt &&
+        record.releaseRequestedAt === undefined &&
+        record.idleSince === undefined
+      ) {
+        if (previousReleaseRequestedAt) {
+          record.releaseRequestedAt = previousReleaseRequestedAt;
+        } else {
+          delete record.releaseRequestedAt;
+        }
+        if (previousLastUsedAt) {
+          record.lastUsedAt = previousLastUsedAt;
+        } else {
+          delete record.lastUsedAt;
+        }
+        if (previousIdleSince) {
+          record.idleSince = previousIdleSince;
+        } else {
+          delete record.idleSince;
+        }
+        if (wasReleasedInMemory || previousReleaseRequestedAt) {
+          releasedConversationKeys.add(key);
+        }
+      }
+      throw error;
+    }
+  } else {
+    scheduleSessionPersist();
+  }
+}
+
+function captureConversationTabLeaseState(key: string) {
+  return {
+    released: releasedConversationKeys.has(key),
+    modelSelection: conversationModelSelections.get(key),
+    forwardedSnapshot: forwardedSnapshots.get(key),
+    expectedNavigation: expectedTabNavigations.get(key),
+    preparedDispatchTranscriptBaseline: preparedDispatchTranscriptBaselines.get(key),
+    dispatchIntentPrewarmDeadline: dispatchIntentPrewarmDeadlines.get(key),
+  };
+}
+
+function restoreConversationTabLeaseState(
+  key: string,
+  state: ReturnType<typeof captureConversationTabLeaseState>,
+) {
+  if (state.released) releasedConversationKeys.add(key);
+  if (state.modelSelection !== undefined) {
+    conversationModelSelections.set(key, state.modelSelection);
+  }
+  if (state.forwardedSnapshot !== undefined) {
+    forwardedSnapshots.set(key, state.forwardedSnapshot);
+  }
+  if (state.expectedNavigation !== undefined) {
+    expectedTabNavigations.set(key, state.expectedNavigation);
+  }
+  if (state.preparedDispatchTranscriptBaseline !== undefined) {
+    preparedDispatchTranscriptBaselines.set(key, state.preparedDispatchTranscriptBaseline);
+  }
+  if (state.dispatchIntentPrewarmDeadline !== undefined) {
+    dispatchIntentPrewarmDeadlines.set(key, state.dispatchIntentPrewarmDeadline);
+  }
+}
+
+function clearConversationTabLeaseState(key: string) {
+  releasedConversationKeys.delete(key);
+  conversationModelSelections.delete(key);
+  forwardedSnapshots.delete(key);
+  expectedTabNavigations.delete(key);
+  preparedDispatchTranscriptBaselines.delete(key);
+  dispatchIntentPrewarmDeadlines.delete(key);
+}
+
 async function ensureConversationTab(
   instanceId: string,
   conversationId: string,
   remoteUrl?: string,
+  _purpose: ConversationLeasePurpose = "view",
+  allowBorrowed = true,
 ) {
   const normalizedRemoteUrl =
     remoteUrl === undefined ? undefined : normalizeRemoteConversationUrl(remoteUrl);
@@ -6389,6 +7046,7 @@ async function ensureConversationTab(
       ? normalizedRemoteUrl
       : undefined;
   const key = conversationKey(instanceId, conversationId);
+  releasedConversationKeys.delete(key);
   const existing = conversationTabs.get(key);
   if (existing) {
     if (existing.remoteUrl) {
@@ -6411,7 +7069,57 @@ async function ensureConversationTab(
       1_000,
       "Chrome tab inspection timed out.",
     ).catch(() => undefined);
+    if (tabProvenance(existing) !== "created") {
+      const mappedConversationUrl = existing.remoteUrl ?? requestedConversationUrl;
+      const mappedTargetUrl = mappedConversationUrl ?? targetProjectRoute.projectUrl;
+      const currentUrl = normalizeRemoteConversationUrl(tab?.url);
+      const currentConversationUrl =
+        currentUrl && isRemoteConversationPage(currentUrl) ? currentUrl : undefined;
+      const currentProjectUrl = currentUrl
+        ? normalizeProjectScopedUrl(currentUrl, targetProjectRoute)
+        : undefined;
+      const mappingStillMatches = Boolean(
+        tab?.id !== undefined &&
+        currentUrl &&
+        currentProjectUrl &&
+        ((currentConversationUrl &&
+          mappedConversationUrl &&
+          sameChatGptConversationIdentity(currentConversationUrl, mappedConversationUrl)) ||
+          (!mappedConversationUrl && currentUrl === mappedTargetUrl)),
+      );
+      if (!mappingStillMatches) {
+        const blockers = tabLifecycleBlockers(key, existing, tab?.pendingUrl !== undefined, true);
+        if (Object.values(blockers).some(Boolean)) {
+          throw relayFailure(
+            "CHATGPT_REMOTE_UNAVAILABLE",
+            "用户标签页已离开当前映射；仍有运行或终态同步，已保留页面与原映射且未导航。",
+            existing.tabId,
+          );
+        }
+        const previousLeaseState = captureConversationTabLeaseState(key);
+        conversationTabs.delete(key);
+        clearConversationTabLeaseState(key);
+        try {
+          await persistSession();
+        } catch (error) {
+          if (!conversationTabs.has(key)) {
+            conversationTabs.set(key, existing);
+            restoreConversationTabLeaseState(key, previousLeaseState);
+          }
+          throw error;
+        }
+        return ensureConversationTab(instanceId, conversationId, remoteUrl, _purpose, false);
+      }
+      if (tab?.discarded) {
+        throw relayFailure(
+          "CHATGPT_REMOTE_UNAVAILABLE",
+          "用户标签页已被 Chrome 丢弃；Ask2GPT 不会自动重新加载非 Relay 创建的页面。",
+          existing.tabId,
+        );
+      }
+    }
     if (tab?.id !== undefined && isChatGptPageUrl(tab.url)) {
+      await markTabLeaseActive(existing);
       // A conversation that already has a remote mapping stays pinned to that
       // conversation. The Host can briefly carry an older provisional URL,
       // but a user manually browsing this owned tab to another /c/... page
@@ -6483,61 +7191,40 @@ async function ensureConversationTab(
     await persistSession();
   }
 
-  // chrome://extensions reload clears chrome.storage.session without closing
-  // the Relay's existing ChatGPT pages. Re-adopt an untracked tab only when it
-  // displays the exact requested conversation inside the verified Project.
-  // This preserves lazy startup while avoiding a new cold tab for every manual
-  // extension reload.
-  const reusableTab = await findReusableUntrackedConversationTab(
-    requestedConversationUrl,
-    targetProjectRoute,
-  );
-  if (reusableTab) {
-    conversationTabs.set(key, {
-      owned: true,
-      instanceId,
-      conversationId,
-      tabId: reusableTab.id,
-      remoteUrl: requestedConversationUrl,
-      projectScope: targetProjectRoute.scope,
-      createdAt: new Date().toISOString(),
-    });
-    await persistSession();
-    const readyUrl = await waitForTab(key, reusableTab.id, requestedConversationUrl, true);
-    const record = conversationTabs.get(key);
-    if (record?.tabId === reusableTab.id) await adoptReadyConversationUrl(key, record, readyUrl);
-    await adoptVisibleAsk2GPTProject(reusableTab.id);
-    return reusableTab.id;
-  }
-
-  const tab = await chrome.tabs.create({
-    url: targetUrl,
-    active: false,
-  });
-  if (tab.id === undefined) {
-    throw relayFailure("CHATGPT_REMOTE_UNAVAILABLE", "Chrome 未创建 ChatGPT 标签页。");
-  }
-  conversationTabs.set(key, {
-    owned: true,
+  const allocation = await allocateConversationTab({
+    allowBorrowed,
     instanceId,
     conversationId,
-    tabId: tab.id,
-    ...(requestedConversationUrl ? { remoteUrl: requestedConversationUrl } : {}),
-    projectScope: targetProjectRoute.scope,
-    createdAt: new Date().toISOString(),
+    key,
+    requestedConversationUrl,
+    targetProjectRoute,
+    targetUrl,
   });
-  grantExpectedTabNavigation(key, tab.id);
-  await persistSession();
+  if (allocation.kind === "existing") {
+    return ensureConversationTab(instanceId, conversationId, remoteUrl, _purpose, allowBorrowed);
+  }
+  const { tabId } = allocation;
+  if (allocation.kind === "borrowed") {
+    const readyUrl = await waitForTab(key, tabId, requestedConversationUrl, true);
+    const record = conversationTabs.get(key);
+    if (record?.tabId === tabId) await adoptReadyConversationUrl(key, record, readyUrl);
+    await adoptVisibleAsk2GPTProject(tabId);
+    return tabId;
+  }
+
+  if (allocation.navigate) {
+    await chrome.tabs.update(tabId, { url: targetUrl, active: false });
+  }
   let readyUrl: string;
   try {
-    readyUrl = await waitForTab(key, tab.id, targetUrl, Boolean(requestedConversationUrl));
+    readyUrl = await waitForTab(key, tabId, targetUrl, Boolean(requestedConversationUrl));
   } finally {
-    clearExpectedTabNavigation(key, tab.id);
+    clearExpectedTabNavigation(key, tabId);
   }
   const record = conversationTabs.get(key);
-  if (record?.tabId === tab.id) await adoptReadyConversationUrl(key, record, readyUrl);
-  await adoptVisibleAsk2GPTProject(tab.id);
-  return tab.id;
+  if (record?.tabId === tabId) await adoptReadyConversationUrl(key, record, readyUrl);
+  await adoptVisibleAsk2GPTProject(tabId);
+  return tabId;
 }
 
 async function waitForTab(
@@ -6605,8 +7292,9 @@ async function waitForTab(
       tab.status === "complete"
     ) {
       const currentOwnedTab = await chrome.tabs.get(tabId).catch(() => undefined);
+      const currentRecord = conversationTabs.get(key);
       if (
-        conversationTabs.get(key)?.tabId !== tabId ||
+        currentRecord?.tabId !== tabId ||
         normalizeRemoteConversationUrl(currentOwnedTab?.url) !== currentUrl
       ) {
         throw relayFailure(
@@ -6624,7 +7312,16 @@ async function waitForTab(
       const injected = contentRuntimeUnresponsive
         ? await injectOwnedContentRuntime(key, tabId, currentUrl)
         : false;
-      if (!injected) await refreshOwnedContentRuntime(key, tabId, currentUrl);
+      if (!injected) {
+        if (tabProvenance(currentRecord) !== "created") {
+          throw relayFailure(
+            "CHATGPT_REMOTE_UNAVAILABLE",
+            "非 Relay 创建的 ChatGPT 页面运行时不可用；已保留页面且未自动重新加载。",
+            tabId,
+          );
+        }
+        await refreshOwnedContentRuntime(key, tabId, currentUrl);
+      }
       retryDelay = 50;
       contentRuntimeMissingSince = undefined;
       continue;
@@ -6758,6 +7455,14 @@ async function injectOwnedContentRuntime(key: string, tabId: number, expectedUrl
 
 async function refreshOwnedContentRuntime(key: string, tabId: number, expectedUrl: string) {
   const reloadAndAwaitFreshRuntime = async () => {
+    const record = conversationTabs.get(key);
+    if (record?.tabId !== tabId || tabProvenance(record) !== "created") {
+      throw relayFailure(
+        "CHATGPT_REMOTE_UNAVAILABLE",
+        "Ask2GPT 拒绝自动重新加载非 Relay 创建的 ChatGPT 页面。",
+        tabId,
+      );
+    }
     await promiseWithTimeout(
       chrome.tabs.reload(tabId),
       5_000,
@@ -7502,8 +8207,9 @@ async function withComposerReadyForDispatch<T>(
   // its document timers and React submission path are frozen. When the content
   // runtime reports a hidden document (or cannot answer from an inactive tab),
   // select that exact owned tab in its original, non-focused Chrome window.
-  // A minimized window is restored at safe off-screen bounds for the run and
-  // minimized again at terminal cleanup. Neither path focuses the OS window.
+  // A minimized window is restored at Chrome's own valid restore bounds for
+  // the run, then minimized again at terminal cleanup. Neither path focuses
+  // the OS window.
   let enhancedWakeAttempt: Promise<boolean> | undefined;
   const prepareEnhancedRenderer = async () => {
     if (!enhancedBackgroundEnabled) return false;
@@ -8228,9 +8934,9 @@ async function withConversationTabActiveInHomeWindow<T>(
       await parkMinimizedChromeWindow(windowId, tabId, restoreBounds);
       parked = true;
     }
-    // The minimized-send path has already moved the normal window far outside
-    // the virtual desktop. Selecting the exact owned tab now wakes React without
-    // focusing Chrome or exposing the full browsing window.
+    // The minimized-send path has restored the normal window behind the user's
+    // foreground application. Selecting the exact owned tab now wakes React
+    // without focusing Chrome.
     if (!targetWasActive) {
       await updateTabWithInternalActivation(
         windowId,
@@ -8375,28 +9081,10 @@ async function parkMinimizedChromeWindow(
   restoreBounds: ChromeWindowBounds | undefined,
 ) {
   try {
-    // Chrome can leave the promise unresolved when state, focus and bounds are
-    // changed together on an already-minimized native window. Set its restore
-    // bounds while it is still hidden, verify them, then restore only its state.
-    const positionedWindow = await promiseWithTimeout(
-      chrome.windows.update(windowId, PARKED_WINDOW_BOUNDS),
-      1_500,
-      "Timed out while positioning the minimized Chrome window off-screen.",
-    );
-    if (
-      positionedWindow.state !== "minimized" ||
-      positionedWindow.left === undefined ||
-      positionedWindow.top === undefined ||
-      positionedWindow.left > PARKED_WINDOW_SAFE_EDGE ||
-      positionedWindow.top > PARKED_WINDOW_SAFE_EDGE
-    ) {
-      throw relayFailure(
-        "CHATGPT_REMOTE_UNAVAILABLE",
-        "Chrome could not prepare the minimized Relay window safely off-screen; the question was not sent.",
-        tabId,
-      );
-    }
-
+    // Chrome rejects extension-provided bounds unless at least half of the
+    // window intersects a current display. Reuse Chrome's own restore bounds
+    // instead of guessing display coordinates, which is also robust when a
+    // monitor is detached while the browser is minimized.
     const parkedWindow = await promiseWithTimeout(
       chrome.windows.update(windowId, {
         drawAttention: false,
@@ -8404,19 +9092,12 @@ async function parkMinimizedChromeWindow(
         state: "normal",
       }),
       1_500,
-      "Timed out while restoring the off-screen Relay window.",
+      "Timed out while restoring the minimized Relay window.",
     );
-    if (
-      parkedWindow.focused !== false ||
-      parkedWindow.state !== "normal" ||
-      parkedWindow.left === undefined ||
-      parkedWindow.top === undefined ||
-      parkedWindow.left > PARKED_WINDOW_SAFE_EDGE ||
-      parkedWindow.top > PARKED_WINDOW_SAFE_EDGE
-    ) {
+    if (parkedWindow.focused !== false || parkedWindow.state !== "normal") {
       throw relayFailure(
         "CHATGPT_REMOTE_UNAVAILABLE",
-        "Chrome could not keep the minimized Relay window safely off-screen; the question was not sent.",
+        "Chrome could not restore the minimized Relay window without taking focus; the question was not sent.",
         tabId,
       );
     }
@@ -8427,7 +9108,12 @@ async function parkMinimizedChromeWindow(
     } else if (restoreBounds) {
       await chrome.windows.update(windowId, restoreBounds).catch(() => undefined);
     }
-    throw error;
+    if (hasRelayFailureCode(error) && error instanceof Error) throw error;
+    throw relayFailure(
+      "CHATGPT_REMOTE_UNAVAILABLE",
+      "Chrome could not safely prepare the minimized Relay window without taking focus. Restore Chrome once, then retry.",
+      tabId,
+    );
   }
 }
 
@@ -9275,6 +9961,20 @@ async function syncConversationSnapshotFromTabUnlocked(sync: ConversationSnapsho
       terminalHistoryBarrierCleared = true;
     }
     if (changed || terminalHistoryBarrierCleared) await persistSession();
+    if (
+      terminalHistoryBarrierCleared &&
+      !activeRuns.has(key) &&
+      !hasPendingTerminalForConversation(key)
+    ) {
+      void tryMarkManagedTabIdle(key, { ignoreCurrentCommand: true })
+        .then((markedIdle) => {
+          if (!markedIdle) void retryReleasedManagedTabIdle(key);
+        })
+        .catch(() => {
+          recordBackgroundFailure("A history-synchronized Relay tab could not be marked idle.");
+          void retryReleasedManagedTabIdle(key);
+        });
+    }
     return delivered;
   }
   // A URL notification commonly arrives before the replacement page and its
@@ -9355,6 +10055,8 @@ function sendConversationSnapshot(
 
 async function focusTab(tabId: number) {
   if (workerSuspended) return;
+  userClaimedTabIds.add(tabId);
+  await markManagedTabUserClaimed(tabId);
   const inspected = await chrome.tabs.get(tabId);
   const windowId = inspected.windowId;
   // Focusing is an explicit user/error-recovery action. Mark it before any
@@ -9371,9 +10073,274 @@ async function focusTab(tabId: number) {
   });
 }
 
-async function removeOwnedTab(record: TabRecord): Promise<"closed" | "already-absent"> {
+async function tryMarkManagedTabIdle(
+  key: string,
+  options: { ignoreCurrentCommand?: boolean } = {},
+) {
+  const record = conversationTabs.get(key);
+  if (!releasedConversationKeys.has(key) && !record?.releaseRequestedAt) return false;
+  if (!record || tabProvenance(record) !== "created" || record.userClaimedAt) return false;
+  const blockers = tabLifecycleBlockers(key, record, false, options.ignoreCurrentCommand === true);
+  if (Object.values(blockers).some(Boolean)) return false;
+  const expectedEpoch = record.leaseEpoch;
+  if (
+    !(await inspectContentIdleState(key, record, {
+      expectedLeaseEpoch: expectedEpoch,
+      ignoreCurrentCommand: options.ignoreCurrentCommand === true,
+    }))
+  ) {
+    return false;
+  }
+  const latestTab = await chrome.tabs.get(record.tabId).catch(() => undefined);
+  const latestUrl = normalizeRemoteConversationUrl(latestTab?.url);
+  if (
+    !managedTabLeaseIsAuthoritative(key, record, expectedEpoch) ||
+    latestTab?.id === undefined ||
+    latestTab.active ||
+    latestTab.highlighted ||
+    latestTab.pinned ||
+    latestTab.audible ||
+    !latestUrl ||
+    !projectUrlMatchesRecord(record, latestUrl) ||
+    Object.values(
+      tabLifecycleBlockers(
+        key,
+        record,
+        latestTab.pendingUrl !== undefined,
+        options.ignoreCurrentCommand === true,
+      ),
+    ).some(Boolean)
+  ) {
+    return false;
+  }
+  const previousIdleSince = record.idleSince;
+  const previousReleaseRequestedAt = record.releaseRequestedAt;
+  const committedIdleSince = new Date().toISOString();
+  record.idleSince = committedIdleSince;
+  delete record.releaseRequestedAt;
+  try {
+    await persistSession();
+  } catch (error) {
+    if (
+      conversationTabs.get(key) === record &&
+      record.leaseEpoch === expectedEpoch &&
+      record.idleSince === committedIdleSince &&
+      record.releaseRequestedAt === undefined
+    ) {
+      if (previousIdleSince) {
+        record.idleSince = previousIdleSince;
+      } else {
+        delete record.idleSince;
+      }
+      if (previousReleaseRequestedAt) {
+        record.releaseRequestedAt = previousReleaseRequestedAt;
+      } else {
+        delete record.releaseRequestedAt;
+      }
+      releasedConversationKeys.add(key);
+    }
+    throw error;
+  }
+  releasedConversationKeys.delete(key);
+  return true;
+}
+
+async function settleReleasedManagedTabs(maxWaitMs: number) {
+  const deadline = Date.now() + Math.max(0, maxWaitMs);
+  do {
+    let transientWork = false;
+    for (const key of [...releasedConversationKeys]) {
+      if (await tryMarkManagedTabIdle(key).catch(() => false)) continue;
+      if (
+        conversationSnapshotSyncs.has(key) ||
+        dispatchIntentPrewarmTasks.has(key) ||
+        dispatchIntentPrewarmDeadlines.has(key) ||
+        conversationCommands.has(key)
+      ) {
+        transientWork = true;
+      }
+    }
+    if (!transientWork || Date.now() >= deadline) return;
+    await delay(Math.min(50, Math.max(0, deadline - Date.now())));
+  } while (Date.now() < deadline);
+}
+
+async function retryReleasedManagedTabIdle(key: string) {
+  const deadline = Date.now() + 5_000;
+  while (releasedConversationKeys.has(key) && Date.now() < deadline) {
+    if (await tryMarkManagedTabIdle(key).catch(() => false)) return;
+    await delay(100);
+  }
+}
+
+async function markManagedTabUserClaimed(tabId: number) {
+  let changed = false;
+  for (const [key, record] of conversationTabs) {
+    if (record.tabId !== tabId || tabProvenance(record) !== "created") continue;
+    if (!record.userClaimedAt) {
+      record.userClaimedAt = new Date().toISOString();
+      record.idleSince = undefined;
+      changed = true;
+    }
+    if (record.releaseRequestedAt) {
+      delete record.releaseRequestedAt;
+      changed = true;
+    }
+    releasedConversationKeys.delete(key);
+  }
+  if (!changed) return;
+  try {
+    await persistSession();
+  } catch (error) {
+    // Never roll a user claim back in memory. A transient session write must
+    // also leave a retry armed so the protection survives the next worker.
+    scheduleSessionPersist();
+    throw error;
+  }
+}
+
+async function markWindowActiveManagedTabUserClaimed(windowId: number) {
+  const active = await chrome.tabs.query({ windowId, active: true }).catch(() => []);
+  const tabId = active[0]?.id;
+  if (tabId === undefined) return;
+  userClaimedTabIds.add(tabId);
+  await markManagedTabUserClaimed(tabId);
+}
+
+async function runManagedTabGc() {
+  if (managedTabGcPromise) return managedTabGcPromise;
+  managedTabGcPromise = withTabAllocator(async () => {
+    for (const key of [...releasedConversationKeys]) {
+      await tryMarkManagedTabIdle(key).catch(() => undefined);
+    }
+    const authenticatedInstances = new Set(
+      [...connections.values()]
+        .filter(
+          (connection) =>
+            connection.authenticated &&
+            connection.instanceId &&
+            connection.socket.readyState === WebSocket.OPEN,
+        )
+        .map((connection) => connection.instanceId!),
+    );
+    const uniqueRecords = new Map<number, [string, TabRecord]>();
+    for (const entry of conversationTabs.entries()) {
+      if (tabProvenance(entry[1]) !== "created" || uniqueRecords.has(entry[1].tabId)) continue;
+      uniqueRecords.set(entry[1].tabId, entry);
+    }
+    let remainingManagedTabs = uniqueRecords.size;
+    const now = Date.now();
+    const ordered = [...uniqueRecords.values()].sort(
+      (left, right) =>
+        Date.parse(left[1].idleSince ?? left[1].lastUsedAt ?? left[1].createdAt) -
+        Date.parse(right[1].idleSince ?? right[1].lastUsedAt ?? right[1].createdAt),
+    );
+    for (const [key, record] of ordered) {
+      const instanceConnected = authenticatedInstances.has(record.instanceId);
+      const shouldTrimWarmPool = instanceConnected && remainingManagedTabs > 1;
+      const lastUsedAt = Date.parse(record.lastUsedAt ?? record.createdAt);
+      if (
+        !instanceConnected &&
+        (!Number.isFinite(lastUsedAt) || now - lastUsedAt < MANAGED_TAB_DISCONNECTED_IDLE_MS)
+      ) {
+        continue;
+      }
+      if (!shouldTrimWarmPool && instanceConnected) continue;
+      if (!instanceConnected && !record.idleSince) {
+        releasedConversationKeys.add(key);
+        await tryMarkManagedTabIdle(key).catch(() => false);
+      }
+      const minimumIdleMs = instanceConnected ? MANAGED_TAB_SURPLUS_IDLE_MS : 0;
+      const route = projectRouteForRecord(record);
+      if (!route) continue;
+      const candidate = await inspectManagedTabCandidate(key, record, route);
+      if (
+        !candidate ||
+        !isManagedTabCloseCandidate(candidate, now, minimumIdleMs) ||
+        userClaimedTabIds.has(record.tabId)
+      ) {
+        continue;
+      }
+      if (await closeManagedTabLease(key, record, candidate)) remainingManagedTabs -= 1;
+    }
+  }).finally(() => {
+    managedTabGcPromise = undefined;
+  });
+  return managedTabGcPromise;
+}
+
+async function closeManagedTabLease(
+  key: string,
+  record: TabRecord,
+  candidate: ManagedTabPolicyInput,
+) {
+  const expectedLeaseEpoch = record.leaseEpoch;
+  const route = projectRouteForRecord(record);
+  if (
+    !route ||
+    !managedTabLeaseIsAuthoritative(key, record, expectedLeaseEpoch) ||
+    !isManagedTabCloseCandidate(candidate, Date.now(), 0) ||
+    !(await inspectContentIdleState(key, record, { expectedLeaseEpoch }))
+  ) {
+    return false;
+  }
+  const tab = await chrome.tabs.get(record.tabId).catch(() => undefined);
+  const authoritativeCandidate =
+    tab && route ? managedTabCandidate(key, record, expectedLeaseEpoch, route, tab) : undefined;
+  if (
+    !authoritativeCandidate ||
+    !managedTabCandidateIsAuthoritative(authoritativeCandidate) ||
+    !isManagedTabCloseCandidate(authoritativeCandidate, Date.now(), 0)
+  ) {
+    return false;
+  }
+  // Retire the lease synchronously before the irreversible Chrome call. A
+  // concurrent send will then queue a fresh allocation behind the allocator
+  // instead of observing a tab that is already being removed.
+  const previousLeaseState = captureConversationTabLeaseState(key);
+  conversationTabs.delete(key);
+  clearConversationTabLeaseState(key);
+  closingTabs.add(record.tabId);
+  try {
+    await chrome.tabs.remove(record.tabId);
+    try {
+      await persistSession();
+    } catch {
+      // Chrome already completed the irreversible close. Keep the live map
+      // consistent with the browser and let the next session checkpoint (or
+      // startup reconciliation) remove the now-stale durable record.
+      recordBackgroundFailure("A closed managed tab mapping could not be persisted.");
+      scheduleSessionPersist();
+    }
+    return true;
+  } catch {
+    const tabStillExists = await chrome.tabs.get(record.tabId).catch(() => undefined);
+    if (tabStillExists?.id === record.tabId && !conversationTabs.has(key)) {
+      conversationTabs.set(key, record);
+      restoreConversationTabLeaseState(key, previousLeaseState);
+      recordBackgroundFailure("Chrome did not close a safely idle Relay tab.");
+      return false;
+    }
+    // Treat a rejected remove whose tab is nevertheless gone as a completed
+    // close; restoring its lease would resurrect an unusable mapping.
+    try {
+      await persistSession();
+    } catch {
+      scheduleSessionPersist();
+    }
+    recordBackgroundFailure("Chrome did not close a safely idle Relay tab.");
+    return true;
+  } finally {
+    closingTabs.delete(record.tabId);
+  }
+}
+
+async function removeOwnedTab(
+  record: TabRecord,
+): Promise<"closed" | "already-absent" | "left-open"> {
   const tab = await chrome.tabs.get(record.tabId).catch(() => undefined);
   if (tab?.id === undefined) return "already-absent";
+  if (tabProvenance(record) !== "created") return "left-open";
   if (!isChatGptPageUrl(tab.url)) {
     throw relayFailure(
       "CHATGPT_REMOTE_UNAVAILABLE",
@@ -9397,6 +10364,7 @@ async function removeOwnedTab(record: TabRecord): Promise<"closed" | "already-ab
 }
 
 async function handleTabRemoved(tabId: number) {
+  userClaimedTabIds.delete(tabId);
   projectDiscoveryExpectedProjectNavigations.delete(tabId);
   if (projectDiscoveryTabId === tabId) {
     projectDiscoveryTabId = undefined;
@@ -9413,6 +10381,7 @@ async function handleTabRemoved(tabId: number) {
   for (const [key, record] of records) {
     if (!mappingStillOwnsTab(conversationTabs.get(key), record, tabId)) continue;
     conversationTabs.delete(key);
+    releasedConversationKeys.delete(key);
     preparedDispatchTranscriptBaselines.delete(key);
     terminalHistoryBarriers.delete(key);
     const run = activeRuns.get(key);
@@ -9694,6 +10663,91 @@ async function reconcileStoredState() {
   if (changed) await persistSession();
 }
 
+async function managedTabPoolStatus() {
+  const uniqueRecords = new Map<number, [string, TabRecord]>();
+  for (const entry of conversationTabs.entries()) {
+    if (!uniqueRecords.has(entry[1].tabId)) uniqueRecords.set(entry[1].tabId, entry);
+  }
+  let managed = 0;
+  let active = 0;
+  let reusable = 0;
+  let borrowed = 0;
+  let mappedLegacy = 0;
+  for (const [key, record] of uniqueRecords.values()) {
+    const provenance = tabProvenance(record);
+    if (provenance === "borrowed") {
+      borrowed += 1;
+      continue;
+    }
+    if (provenance !== "created") {
+      mappedLegacy += 1;
+      continue;
+    }
+    managed += 1;
+    if (activeRuns.has(key)) active += 1;
+    const blockers = tabLifecycleBlockers(key, record);
+    if (
+      record.idleSince &&
+      !record.userClaimedAt &&
+      !userClaimedTabIds.has(record.tabId) &&
+      !Object.values(blockers).some(Boolean)
+    ) {
+      reusable += 1;
+    }
+  }
+  const untrackedLegacy = await countPossibleLegacyProjectRootTabs(new Set(uniqueRecords.keys()));
+  return {
+    managed,
+    active,
+    reusable,
+    protected: Math.max(0, managed - reusable),
+    borrowed,
+    legacyCandidates: mappedLegacy + untrackedLegacy,
+    cleanupEligible: reusable,
+    capacity: MANAGED_TAB_CAPACITY,
+  };
+}
+
+async function countPossibleLegacyProjectRootTabs(reservedTabIds: Set<number>) {
+  if (!projectBinding || !projectBindingTrusted) return 0;
+  const boundRoute = parseProjectRootUrl(projectBinding.projectUrl);
+  if (!boundRoute) return 0;
+  if (projectDiscoveryTabId !== undefined) reservedTabIds.add(projectDiscoveryTabId);
+  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" }).catch(() => []);
+  return tabs.filter((tab) => {
+    if (tab.id === undefined || reservedTabIds.has(tab.id)) return false;
+    const currentUrl = normalizeRemoteConversationUrl(tab.url);
+    const route = currentUrl ? parseProjectRootUrl(currentUrl) : undefined;
+    return Boolean(route && projectScopesMatch(route.scope, boundRoute.scope));
+  }).length;
+}
+
+async function cleanupManagedTabsFromPopup() {
+  let closed = 0;
+  let skipped = 0;
+  await withTabAllocator(async () => {
+    const uniqueRecords = new Map<number, [string, TabRecord]>();
+    for (const entry of conversationTabs.entries()) {
+      if (tabProvenance(entry[1]) !== "created" || uniqueRecords.has(entry[1].tabId)) continue;
+      uniqueRecords.set(entry[1].tabId, entry);
+    }
+    for (const [key, record] of uniqueRecords.values()) {
+      const route = projectRouteForRecord(record);
+      const candidate = route ? await inspectManagedTabCandidate(key, record, route) : undefined;
+      if (
+        !candidate ||
+        !isManagedTabCloseCandidate(candidate, Date.now(), 0) ||
+        !(await closeManagedTabLease(key, record, candidate))
+      ) {
+        skipped += 1;
+        continue;
+      }
+      closed += 1;
+    }
+  });
+  return { closed, skipped };
+}
+
 async function handlePopupMessage(message: Record<string, unknown>) {
   if (message.type === "popup.status") {
     // Opening or polling the popup is an explicit user recovery signal. Bypass
@@ -9718,6 +10772,7 @@ async function handlePopupMessage(message: Record<string, unknown>) {
         enhancedEnabled: enhancedBackgroundEnabled,
         permissionGranted: await hasDebuggerPermission(),
       },
+      tabPool: await managedTabPoolStatus(),
       lastError,
       servers: [...connections.values()]
         .filter((connection) => connection.socket.readyState === WebSocket.OPEN)
@@ -9733,6 +10788,10 @@ async function handlePopupMessage(message: Record<string, unknown>) {
   if (message.type === "popup.rescan") {
     rescanPortsNow();
     return { ok: true };
+  }
+  if (message.type === "popup.cleanupManagedTabs") {
+    const result = await cleanupManagedTabsFromPopup();
+    return { ok: true, ...result, tabPool: await managedTabPoolStatus() };
   }
   if (message.type === "popup.setEnhancedBackground") {
     if (typeof message.enabled !== "boolean") return { ok: false };
@@ -9965,7 +11024,9 @@ function parseOpenPayload(value: unknown): ConversationOpenPayload | undefined {
   if (
     !isRecord(value) ||
     (value.active !== undefined && typeof value.active !== "boolean") ||
-    (value.dispatchIntent !== undefined && typeof value.dispatchIntent !== "boolean")
+    (value.dispatchIntent !== undefined && typeof value.dispatchIntent !== "boolean") ||
+    (value.purpose !== undefined && value.purpose !== "view" && value.purpose !== "dispatch") ||
+    (value.purpose === "view" && value.dispatchIntent === true)
   ) {
     return undefined;
   }
@@ -9983,6 +11044,7 @@ function parseOpenPayload(value: unknown): ConversationOpenPayload | undefined {
     ...(remoteUrl ? { remoteUrl } : {}),
     ...(value.active === undefined ? {} : { active: value.active }),
     ...(value.dispatchIntent === undefined ? {} : { dispatchIntent: value.dispatchIntent }),
+    ...(value.purpose === undefined ? {} : { purpose: value.purpose }),
     ...(transcriptProof ? { transcriptProof } : {}),
   };
 }
@@ -10173,6 +11235,17 @@ function parseClosePayload(value: unknown): ConversationClosePayload | undefined
   return isRecord(value) && typeof value.closeTab === "boolean"
     ? { closeTab: value.closeTab }
     : undefined;
+}
+
+function parseReleasePayload(value: unknown): ConversationReleasePayload | undefined {
+  if (
+    !isRecord(value) ||
+    (value.purpose !== "view" && value.purpose !== "dispatch") ||
+    (value.reason !== "inactive" && value.reason !== "settled" && value.reason !== "host-dispose")
+  ) {
+    return undefined;
+  }
+  return { purpose: value.purpose, reason: value.reason };
 }
 
 function parseOptionalRemoteUrl(value: Record<string, unknown>): string | false | undefined {
@@ -10451,6 +11524,7 @@ function isPopupMessage(value: unknown): value is Record<string, unknown> {
     [
       "popup.status",
       "popup.rescan",
+      "popup.cleanupManagedTabs",
       "popup.setEnhancedBackground",
       "popup.listProjects",
       "popup.prepareReload",

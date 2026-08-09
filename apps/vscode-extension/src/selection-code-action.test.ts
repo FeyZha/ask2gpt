@@ -40,6 +40,7 @@ const vscodeMock = vi.hoisted(() => {
       Refactor: new FakeCodeActionKind("refactor"),
     },
     activeTextEditor: undefined as unknown,
+    notebookDocuments: [] as unknown[],
     language: "zh-cn",
     registerCodeActionsProvider: vi.fn(() => ({ dispose: vi.fn() })),
   };
@@ -56,6 +57,11 @@ vi.mock("vscode", () => ({
   languages: {
     registerCodeActionsProvider: vscodeMock.registerCodeActionsProvider,
   },
+  workspace: {
+    get notebookDocuments() {
+      return vscodeMock.notebookDocuments;
+    },
+  },
   window: {
     get activeTextEditor() {
       return vscodeMock.activeTextEditor;
@@ -64,6 +70,7 @@ vi.mock("vscode", () => ({
 }));
 
 import {
+  ATTACH_NOTEBOOK_CELL_COMMAND,
   ASK_SELECTION_ACTION_KIND,
   registerSelectionCodeActionProvider,
   SelectionCodeActionProvider,
@@ -73,6 +80,7 @@ import { ATTACH_SELECTION_COMMAND } from "./selection-handoff";
 describe("SelectionCodeActionProvider", () => {
   beforeEach(() => {
     vscodeMock.activeTextEditor = undefined;
+    vscodeMock.notebookDocuments = [];
     vscodeMock.language = "zh-cn";
     vscodeMock.registerCodeActionsProvider.mockClear();
   });
@@ -81,8 +89,15 @@ describe("SelectionCodeActionProvider", () => {
     const disposable = registerSelectionCodeActionProvider();
 
     expect(vscodeMock.registerCodeActionsProvider).toHaveBeenCalledOnce();
+    // Notebook cell documents are selected through their notebook type,
+    // never by trusting the virtual cell URI as a durable source.
     expect(vscodeMock.registerCodeActionsProvider).toHaveBeenCalledWith(
-      [{ scheme: "file" }, { scheme: "untitled" }, { scheme: "vscode-remote" }],
+      [
+        { scheme: "file" },
+        { scheme: "untitled" },
+        { scheme: "vscode-remote" },
+        { notebookType: "*" },
+      ],
       expect.any(SelectionCodeActionProvider),
       { providedCodeActionKinds: [ASK_SELECTION_ACTION_KIND] },
     );
@@ -123,6 +138,55 @@ describe("SelectionCodeActionProvider", () => {
     expect(actions[0]?.isPreferred).toBeUndefined();
     expect(actions[0]?.edit).toBeUndefined();
     expect(actions[0]?.diagnostics).toBeUndefined();
+  });
+
+  it("uses a click-time notebook cell reference for notebook selections", () => {
+    const provider = new SelectionCodeActionProvider();
+    const activeRange = range();
+    const cellDocument = {
+      ...document("vscode-notebook-cell", "vscode-notebook-cell:/repo/analysis.ipynb#0"),
+      languageId: "python",
+      getText: () => "answer = 42",
+    } as unknown as vscode.TextDocument;
+    const cell = {
+      index: 0,
+      notebook: undefined as unknown,
+      kind: 2,
+      document: cellDocument,
+    };
+    const notebook = {
+      uri: { scheme: "file", toString: () => "file:///repo/analysis.ipynb" },
+      notebookType: "jupyter-notebook",
+      version: 10,
+      cellCount: 1,
+      cellAt: () => cell,
+      getCells: () => [cell],
+    };
+    cell.notebook = notebook;
+    vscodeMock.notebookDocuments = [notebook];
+    vscodeMock.activeTextEditor = { document: cellDocument, selection: activeRange };
+
+    const actions = provider.provideCodeActions(
+      cellDocument,
+      activeRange,
+      codeActionContext(),
+      cancellationToken(),
+    );
+
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.command).toMatchObject({
+      command: ATTACH_NOTEBOOK_CELL_COMMAND,
+      arguments: [
+        expect.objectContaining({
+          type: "notebook-cell",
+          notebookUri: "file:///repo/analysis.ipynb",
+          cellIndex: 0,
+          scope: "range",
+          startLine: 3,
+          endLine: 8,
+        }),
+      ],
+    });
   });
 
   it.each(["file", "untitled", "vscode-remote"])(

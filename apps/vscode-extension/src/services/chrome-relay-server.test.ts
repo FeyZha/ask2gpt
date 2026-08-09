@@ -17,7 +17,7 @@ import { ChromeRelayServer } from "./chrome-relay-server";
 
 const logger = { info: vi.fn(), error: vi.fn() };
 const servers: ChromeRelayServer[] = [];
-const HOST_EXTENSION_VERSION = "0.0.1";
+const HOST_EXTENSION_VERSION = "0.1.0";
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.dispose()));
@@ -356,13 +356,13 @@ describe("ChromeRelayServer zero-setup connection", () => {
     const inbox = await connect(port);
     const ready = await inbox.next();
 
-    await announce(inbox, ready.instanceId, true, "0.0.2");
+    await announce(inbox, ready.instanceId, true, "0.1.1");
 
     await waitFor(() => server.connected);
     expect(server.connectionState).toMatchObject({
       phase: "syncing",
       hostVersion: HOST_EXTENSION_VERSION,
-      relayVersion: "0.0.2",
+      relayVersion: "0.1.1",
       protocolVersion: PROTOCOL_VERSION,
       detectedProtocol: RELAY_WEBSOCKET_PROTOCOL,
     });
@@ -381,7 +381,7 @@ describe("ChromeRelayServer zero-setup connection", () => {
     const inbox = await connect(port);
     const ready = await inbox.next();
 
-    await announce(inbox, ready.instanceId, true, "0.0.0");
+    await announce(inbox, ready.instanceId, true, "0.0.1");
 
     expect(errorCode(await inbox.next())).toBe("PROTOCOL_MISMATCH");
     await expect(inbox.closed()).resolves.toMatchObject({ code: 1008 });
@@ -389,24 +389,24 @@ describe("ChromeRelayServer zero-setup connection", () => {
     expect(server.connectionState).toMatchObject({
       phase: "version-mismatch",
       hostVersion: HOST_EXTENSION_VERSION,
-      relayVersion: "0.0.0",
+      relayVersion: "0.0.1",
     });
   });
 
-  it("accepts a 0.0.2 Relay when the 0.0.1 Host is already running", async () => {
-    const server = new ChromeRelayServer("window-a", "Test VS Code", "0.0.1", logger as never);
+  it("accepts a 0.1.1 Relay when the 0.1.0 Host is already running", async () => {
+    const server = new ChromeRelayServer("window-a", "Test VS Code", "0.1.0", logger as never);
     servers.push(server);
     const port = await server.start();
     const inbox = await connect(port);
     const ready = await inbox.next();
 
-    await announce(inbox, ready.instanceId, true, "0.0.2");
+    await announce(inbox, ready.instanceId, true, "0.1.1");
 
     await waitFor(() => server.connected);
     expect(server.connectionState).toMatchObject({
       phase: "syncing",
-      hostVersion: "0.0.1",
-      relayVersion: "0.0.2",
+      hostVersion: "0.1.0",
+      relayVersion: "0.1.1",
       protocolVersion: PROTOCOL_VERSION,
       detectedProtocol: RELAY_WEBSOCKET_PROTOCOL,
     });
