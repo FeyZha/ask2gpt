@@ -21,6 +21,7 @@ interface FakeStatus {
     enhancedEnabled: boolean;
     permissionGranted: boolean;
   };
+  tabPool?: FakeTabPoolStatus;
   servers: Array<{
     port: number;
     instanceId: string;
@@ -28,6 +29,17 @@ interface FakeStatus {
     label: string;
     transportState: string;
   }>;
+}
+
+interface FakeTabPoolStatus {
+  managed: number;
+  active: number;
+  reusable: number;
+  protected: number;
+  borrowed: number;
+  legacyCandidates: number;
+  cleanupEligible: number;
+  capacity: number;
 }
 
 const popupHtmlPath = resolve(process.cwd(), "popup.html");
@@ -76,6 +88,141 @@ describe("Chrome popup automatic multi-window feedback", () => {
     expect(document.querySelector("#background-reception-detail")?.textContent).toContain(
       "完成后会立即断开",
     );
+  });
+
+  it("renders bounded page-pool counters and keeps legacy pages outside automatic cleanup", async () => {
+    let status: FakeStatus = {
+      connected: true,
+      tabPool: tabPool({
+        managed: 3,
+        active: 1,
+        reusable: 1,
+        protected: 2,
+        borrowed: 4,
+        legacyCandidates: 2,
+        cleanupEligible: 1,
+      }),
+      servers: [server(32_171, "工作区 A", true, "authenticated")],
+    };
+    installChromeMock(async (message) => (message.type === "popup.status" ? status : { ok: true }));
+
+    await import("./popup");
+    await flushPromises();
+
+    expect(document.querySelector("#tab-pool-managed")?.textContent).toBe("3");
+    expect(document.querySelector("#tab-pool-active")?.textContent).toBe("1");
+    expect(document.querySelector("#tab-pool-reusable")?.textContent).toBe("1");
+    expect(document.querySelector("#tab-pool-protected")?.textContent).toBe("2");
+    expect(document.querySelector("#tab-pool-legacy")?.textContent).toBe("2");
+    expect(document.querySelector("#tab-pool-capacity")?.textContent).toBe("上限 3");
+    expect(document.querySelector("#tab-pool-summary")?.textContent).toContain("最多并行使用 3 个");
+    expect(document.querySelector("#tab-pool-safety")?.textContent).toContain("4 个借用页受保护");
+    expect(document.querySelector<HTMLElement>("#tab-pool-legacy-warning")?.hidden).toBe(false);
+    expect(document.querySelector("#tab-pool-legacy-warning")?.textContent).toContain(
+      "不会自动删除",
+    );
+    expect(document.querySelector<HTMLButtonElement>("#cleanup-managed-tabs")?.disabled).toBe(
+      false,
+    );
+
+    status = {
+      ...status,
+      tabPool: tabPool({ managed: 3, protected: 3, cleanupEligible: 0 }),
+    };
+    await vi.advanceTimersByTimeAsync(2_600);
+    await flushPromises();
+
+    expect(document.querySelector<HTMLButtonElement>("#cleanup-managed-tabs")?.disabled).toBe(true);
+    expect(document.querySelector<HTMLElement>("#tab-pool-legacy-warning")?.hidden).toBe(true);
+  });
+
+  it("announces closed and skipped counts after a successful safe cleanup", async () => {
+    const status: FakeStatus = {
+      connected: true,
+      tabPool: tabPool({ managed: 3, reusable: 2, protected: 1, cleanupEligible: 2 }),
+      servers: [server(32_171, "工作区 A", true, "authenticated")],
+    };
+    const sendMessage = installChromeMock(async (message) => {
+      if (message.type === "popup.status") return status;
+      if (message.type === "popup.cleanupManagedTabs") {
+        return {
+          ok: true,
+          closed: 2,
+          skipped: 1,
+          tabPool: tabPool({ managed: 1, protected: 1 }),
+        };
+      }
+      return { ok: true };
+    });
+
+    await import("./popup");
+    await flushPromises();
+    document.querySelector<HTMLButtonElement>("#cleanup-managed-tabs")!.click();
+    await flushPromises();
+
+    expect(sendMessage).toHaveBeenCalledWith({ type: "popup.cleanupManagedTabs" });
+    expect(document.querySelector("#tab-pool-managed")?.textContent).toBe("1");
+    expect(document.querySelector<HTMLButtonElement>("#cleanup-managed-tabs")?.disabled).toBe(true);
+    const feedback = document.querySelector<HTMLElement>("#tab-pool-feedback")!;
+    expect(feedback.hidden).toBe(false);
+    expect(feedback.getAttribute("aria-live")).toBe("polite");
+    expect(feedback.textContent).toContain("已关闭 2 个安全闲置页");
+    expect(feedback.textContent).toContain("跳过 1 个受保护页面");
+  });
+
+  it("restores the cleanup action after the Relay rejects a safe cleanup", async () => {
+    const status: FakeStatus = {
+      connected: true,
+      tabPool: tabPool({ managed: 1, reusable: 1, cleanupEligible: 1 }),
+      servers: [server(32_171, "工作区 A", true, "authenticated")],
+    };
+    installChromeMock(async (message) => {
+      if (message.type === "popup.status") return status;
+      if (message.type === "popup.cleanupManagedTabs") {
+        return { ok: false, closed: 0, skipped: 1, error: "当前页面仍受保护。" };
+      }
+      return { ok: true };
+    });
+
+    await import("./popup");
+    await flushPromises();
+    const cleanupButton = document.querySelector<HTMLButtonElement>("#cleanup-managed-tabs")!;
+    cleanupButton.click();
+    await flushPromises();
+
+    expect(cleanupButton.disabled).toBe(false);
+    expect(cleanupButton.textContent).toContain("清理安全闲置页");
+    expect(document.querySelector("#tab-pool-feedback")?.textContent).toContain("仍受保护");
+    expect(document.querySelector("#tab-pool-feedback")?.getAttribute("data-kind")).toBe("error");
+  });
+
+  it("restores the cleanup action after a bounded timeout", async () => {
+    const status: FakeStatus = {
+      connected: true,
+      tabPool: tabPool({ managed: 1, reusable: 1, cleanupEligible: 1 }),
+      servers: [server(32_171, "工作区 A", true, "authenticated")],
+    };
+    installChromeMock(async (message) => {
+      if (message.type === "popup.status") return status;
+      if (message.type === "popup.cleanupManagedTabs") {
+        return await new Promise(() => undefined);
+      }
+      return { ok: true };
+    });
+
+    await import("./popup");
+    await flushPromises();
+    const cleanupButton = document.querySelector<HTMLButtonElement>("#cleanup-managed-tabs")!;
+    cleanupButton.click();
+    expect(cleanupButton.disabled).toBe(true);
+    expect(cleanupButton.textContent).toBe("正在安全清理…");
+
+    await vi.advanceTimersByTimeAsync(8_100);
+    await flushPromises();
+
+    expect(cleanupButton.disabled).toBe(false);
+    expect(cleanupButton.textContent).toContain("清理安全闲置页");
+    expect(document.querySelector("#tab-pool-feedback")?.textContent).toContain("请求超时");
   });
 
   it("shows only contextual actions for a partial connection without a Project", async () => {
@@ -569,6 +716,20 @@ function server(port: number, label: string, authenticated: boolean, transportSt
     authenticated,
     label,
     transportState,
+  };
+}
+
+function tabPool(overrides: Partial<FakeTabPoolStatus> = {}): FakeTabPoolStatus {
+  return {
+    managed: 0,
+    active: 0,
+    reusable: 0,
+    protected: 0,
+    borrowed: 0,
+    legacyCandidates: 0,
+    cleanupEligible: 0,
+    capacity: 3,
+    ...overrides,
   };
 }
 

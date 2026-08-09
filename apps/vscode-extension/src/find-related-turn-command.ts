@@ -1,9 +1,9 @@
 import { findConversationTraceMatches, type ConversationTraceMatch } from "./conversation-trace";
-import type { SelectionReference } from "./selection-reference";
+import type { NotebookCellReference, SelectionReference } from "./selection-reference";
 import type { AppState } from "./types";
 
 export interface ActiveTraceSelection {
-  reference: SelectionReference;
+  reference: SelectionReference | NotebookCellReference;
   selectedContent: string;
   /** Restores the exact editor after a first-time sidebar reveal takes focus. */
   restoreFocus?(): Promise<void>;
@@ -23,7 +23,7 @@ export interface RelatedTurnQuickPickOptions {
 }
 
 export interface FindRelatedTurnCommandDependencies {
-  getActiveSelection(): ActiveTraceSelection | undefined;
+  getActiveSelection(commandTarget?: unknown): ActiveTraceSelection | undefined;
   getState(): Pick<AppState, "conversations">;
   isZh(): boolean;
   showWarningMessage(message: string): unknown;
@@ -32,7 +32,7 @@ export interface FindRelatedTurnCommandDependencies {
     items: RelatedTurnQuickPickItem[],
     options: RelatedTurnQuickPickOptions,
   ): PromiseLike<RelatedTurnQuickPickItem | undefined>;
-  attachSelectionAndOpen(reference: SelectionReference): Promise<void>;
+  attachSelectionAndOpen(reference: SelectionReference | NotebookCellReference): Promise<void>;
   selectConversation(conversationId: string): Promise<void>;
   unarchiveConversation(conversationId: string, activate: boolean): Promise<void>;
   revealTurn(conversationId: string, messageId: string, contextId: string): Promise<void>;
@@ -44,8 +44,8 @@ export interface FindRelatedTurnCommandDependencies {
  * can be verified without activating sockets, storage, or a Webview.
  */
 export function createFindRelatedTurnCommand(deps: FindRelatedTurnCommandDependencies) {
-  return async () => {
-    const activeSelection = deps.getActiveSelection();
+  return async (commandTarget?: unknown) => {
+    const activeSelection = deps.getActiveSelection(commandTarget);
     const isZh = deps.isZh();
     if (!activeSelection) {
       void deps.showWarningMessage(

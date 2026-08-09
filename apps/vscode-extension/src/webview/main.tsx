@@ -764,11 +764,97 @@ function contextKey(context: ContextSnapshot) {
 }
 
 function contextChipTitle(context: ContextSnapshot) {
+  const notebook = notebookContextMetadata(context);
+  if (notebook) {
+    return `${notebook.fileName} · Cell ${notebook.cellNumber} · ${notebook.languageLabel} · L${context.startLine}–${context.endLine}`;
+  }
   if (context.kind !== "selection") return context.fileName;
   const compact = context.content.replace(/\s+/gu, " ").trim();
   if (!compact) return context.fileName;
   const excerpt = compact.length > 96 ? `${compact.slice(0, 95)}…` : compact;
   return `“${excerpt}”`;
+}
+
+interface NotebookContextMetadata {
+  cellKind: "code" | "markup";
+  cellNumber: number;
+  fileName: string;
+  languageLabel: string;
+}
+
+function notebookContextMetadata(context: ContextSnapshot): NotebookContextMetadata | undefined {
+  const value = context.sourceAnchor as unknown;
+  if (!value || typeof value !== "object") return undefined;
+  const anchor = value as Record<string, unknown>;
+  if (
+    anchor.formatVersion !== 2 ||
+    !Number.isInteger(anchor.cellIndex) ||
+    (anchor.cellIndex as number) < 0 ||
+    (anchor.cellKind !== "code" && anchor.cellKind !== "markup") ||
+    typeof anchor.cellLanguage !== "string"
+  ) {
+    return undefined;
+  }
+  const rawFileName = context.fileName.split(/[\\/]/u).at(-1)?.trim() || context.fileName;
+  return {
+    cellKind: anchor.cellKind,
+    cellNumber: (anchor.cellIndex as number) + 1,
+    fileName: rawFileName,
+    languageLabel: notebookLanguageLabel(anchor.cellLanguage),
+  };
+}
+
+function notebookLanguageLabel(language: string) {
+  const normalized = language
+    .replace(/[\r\n\u2028\u2029]+/gu, " ")
+    .trim()
+    .toLocaleLowerCase();
+  const known: Readonly<Record<string, string>> = {
+    csharp: "C#",
+    cpp: "C++",
+    javascript: "JavaScript",
+    javascriptreact: "JSX",
+    json: "JSON",
+    jsonc: "JSONC",
+    markdown: "Markdown",
+    powershell: "PowerShell",
+    python: "Python",
+    shellscript: "Shell",
+    sql: "SQL",
+    typescript: "TypeScript",
+    typescriptreact: "TSX",
+  };
+  if (known[normalized]) return known[normalized];
+  return normalized ? `${normalized[0]?.toLocaleUpperCase()}${normalized.slice(1)}` : "Text";
+}
+
+function contextPresentation(context: ContextSnapshot, locale: AppState["locale"]) {
+  const notebook = notebookContextMetadata(context);
+  const range = `L${context.startLine}–${context.endLine}`;
+  if (!notebook) {
+    return {
+      detailLabel: range,
+      fullLabel: `${context.fileName}, ${range}`,
+      mainLabel: context.fileName,
+      notebook: false,
+      rowDetailLabel: `${context.language} · ${range}`,
+    } as const;
+  }
+  const t = strings[locale];
+  const mainLabel = `${notebook.fileName} · ${t.notebookCell} ${notebook.cellNumber} · ${notebook.languageLabel}`;
+  const detailLabel = `${range} · ${t.notebookOutputsExcluded}`;
+  return {
+    detailLabel,
+    fullLabel: `${mainLabel} · ${detailLabel}`,
+    mainLabel,
+    notebook: true,
+    rowDetailLabel: detailLabel,
+  } as const;
+}
+
+function supportsCodeTaskActions(context: ContextSnapshot) {
+  if (context.kind !== "selection") return false;
+  return notebookContextMetadata(context)?.cellKind !== "markup";
 }
 
 function Header({
@@ -2558,16 +2644,17 @@ function ContextBadge({
   const [expanded, setExpanded] = useState(false);
   const t = strings[locale];
   const previewId = useId();
+  const presentation = contextPresentation(context, locale);
   return (
     <div
-      className={`sent-context ${traceTarget ? "sent-context--trace-target" : ""}`}
+      className={`sent-context ${presentation.notebook ? "sent-context--notebook" : ""} ${traceTarget ? "sent-context--trace-target" : ""}`}
       data-context-id={contextKey(context)}
     >
       <div className="sent-context__header">
         <button
           aria-current={traceTarget ? "location" : undefined}
-          aria-label={`${t.openContext}: ${context.fileName}, L${context.startLine}–${context.endLine}`}
-          className="sent-context__open"
+          aria-label={`${t.openContext}: ${presentation.fullLabel}`}
+          className={`sent-context__open ${presentation.notebook ? "sent-context__open--notebook" : ""}`}
           onClick={() =>
             postMessage({
               type: "openContext",
@@ -2578,9 +2665,9 @@ function ContextBadge({
           type="button"
         >
           {context.kind === "selection" ? <CodeIcon /> : <FileIcon />}
-          <span>{context.fileName}</span>
-          <small className="sent-context__line-range">
-            L{context.startLine}–{context.endLine}
+          <span title={presentation.mainLabel}>{presentation.mainLabel}</span>
+          <small className="sent-context__line-range" title={presentation.detailLabel}>
+            {presentation.detailLabel}
           </small>
           {traceTarget && <small className="sent-context__trace-label">{t.matchedContext}</small>}
         </button>
@@ -2598,7 +2685,7 @@ function ContextBadge({
       {expanded && (
         <div className="sent-context__details" id={previewId}>
           <small>
-            L{context.startLine}–{context.endLine}
+            {presentation.detailLabel}
             {" · "}
             {context.charCount.toLocaleString()} {t.characters}
             {context.unsaved ? ` · ${t.unsaved}` : ""}
@@ -3295,7 +3382,7 @@ function Composer({
             locale={locale}
           />
         )}
-        {visibleContexts.some((context) => context.kind === "selection") && (
+        {visibleContexts.some(supportsCodeTaskActions) && (
           <CodeTaskQuickActions
             disabled={contextLocked || newConversationPending || submissionReadOnly}
             locale={locale}
@@ -3833,47 +3920,52 @@ function PendingContextList({
   return (
     <section aria-label={t.attachedContexts} className="context-stack">
       <div className="context-stack__chips">
-        {contexts.slice(0, 1).map((context) => (
-          <div className={`context-chip context-chip--${context.kind}`} key={contextKey(context)}>
-            <button
-              aria-label={`${t.openContext}: ${context.fileName}, L${context.startLine}–${context.endLine}`}
-              className="context-chip__main"
-              onClick={() =>
-                postMessage({
-                  type: "openContext",
-                  conversationId,
-                  contextId: contextKey(context),
-                })
-              }
-              type="button"
+        {contexts.slice(0, 1).map((context) => {
+          const presentation = contextPresentation(context, locale);
+          return (
+            <div
+              className={`context-chip context-chip--${context.kind} ${presentation.notebook ? "context-chip--notebook" : ""}`}
+              key={contextKey(context)}
             >
-              <span className="context-chip__icon">
-                {context.kind === "selection" ? <CodeIcon /> : <FileIcon />}
-              </span>
-              <span className="context-chip__copy">
-                <strong title={contextChipTitle(context)}>{context.fileName}</strong>
-                <small>
-                  L{context.startLine}–{context.endLine} · {context.charCount.toLocaleString()}{" "}
-                  {t.characters}
-                  {context.unsaved ? ` · ${t.unsaved}` : ""}
-                </small>
-              </span>
-            </button>
-            <IconButton
-              disabled={locked}
-              label={`${t.removeContext}: ${context.fileName}`}
-              onClick={() =>
-                postMessage({
-                  type: "removeContext",
-                  conversationId,
-                  contextId: contextKey(context),
-                })
-              }
-            >
-              <CloseIcon />
-            </IconButton>
-          </div>
-        ))}
+              <button
+                aria-label={`${t.openContext}: ${presentation.fullLabel}`}
+                className="context-chip__main"
+                onClick={() =>
+                  postMessage({
+                    type: "openContext",
+                    conversationId,
+                    contextId: contextKey(context),
+                  })
+                }
+                type="button"
+              >
+                <span className="context-chip__icon">
+                  {context.kind === "selection" ? <CodeIcon /> : <FileIcon />}
+                </span>
+                <span className="context-chip__copy">
+                  <strong title={contextChipTitle(context)}>{presentation.mainLabel}</strong>
+                  <small title={presentation.detailLabel}>
+                    {presentation.detailLabel} · {context.charCount.toLocaleString()} {t.characters}
+                    {context.unsaved ? ` · ${t.unsaved}` : ""}
+                  </small>
+                </span>
+              </button>
+              <IconButton
+                disabled={locked}
+                label={`${t.removeContext}: ${context.fileName}`}
+                onClick={() =>
+                  postMessage({
+                    type: "removeContext",
+                    conversationId,
+                    contextId: contextKey(context),
+                  })
+                }
+              >
+                <CloseIcon />
+              </IconButton>
+            </div>
+          );
+        })}
         {contexts.length > 1 && (
           <button
             aria-label={`${t.reviewContexts}: +${contexts.length - 1}`}
@@ -3965,10 +4057,14 @@ function PendingContextRow({
   previewId: string;
 }) {
   const t = strings[locale];
+  const presentation = contextPresentation(context, locale);
   return (
-    <div className="context-row" role="listitem">
+    <div
+      className={`context-row ${presentation.notebook ? "context-row--notebook" : ""}`}
+      role="listitem"
+    >
       <button
-        aria-label={`${t.openContext}: ${context.fileName}, L${context.startLine}–${context.endLine}`}
+        aria-label={`${t.openContext}: ${presentation.fullLabel}`}
         className="context-row__main"
         onClick={() =>
           postMessage({
@@ -3983,11 +4079,10 @@ function PendingContextRow({
           {context.kind === "selection" ? <CodeIcon /> : <FileIcon />}
         </span>
         <span className="context-row__copy">
-          <strong>{context.fileName}</strong>
-          <small>
+          <strong title={presentation.mainLabel}>{presentation.mainLabel}</strong>
+          <small title={presentation.rowDetailLabel}>
             {automatic ? `${t.defaultContext} · ` : ""}
-            {context.language} · L{context.startLine}–{context.endLine} ·{" "}
-            {context.charCount.toLocaleString()}
+            {presentation.rowDetailLabel} · {context.charCount.toLocaleString()}
             {context.unsaved ? ` · ${t.unsaved}` : ""}
             {` · ${t.packagedContext}`}
           </small>
@@ -4090,6 +4185,19 @@ function ContextMenu({
         <span>
           <strong>{t.currentSelection}</strong>
           <small>{t.selectionDetail}</small>
+        </span>
+      </button>
+      <button
+        onClick={() => {
+          postMessage({ type: "attachNotebookCell", conversationId });
+          onClose();
+        }}
+        role="menuitem"
+      >
+        <CodeIcon />
+        <span>
+          <strong>{t.currentNotebookCells}</strong>
+          <small>{t.notebookCellsDetail}</small>
         </span>
       </button>
       <button
@@ -4738,6 +4846,8 @@ const strings = {
     openContext: "在编辑器中打开",
     removeContext: "移除上下文",
     unsaved: "未保存",
+    notebookCell: "单元格",
+    notebookOutputsExcluded: "未包含输出",
     composerLabel: "向 Ask2GPT 提问",
     composerKeyboardHint: "按 Enter 发送，Shift+Enter 换行",
     composerKeyboardHintCmdIfMultiline: "单行按 Enter 发送；多行按 Ctrl/Cmd+Enter 发送",
@@ -4767,6 +4877,8 @@ const strings = {
     fileDetail: "读取当前编辑器缓冲区",
     currentSelection: "当前选区",
     selectionDetail: "附加编辑器中选中的代码",
+    currentNotebookCells: "Notebook 单元格",
+    notebookCellsDetail: "附加当前单元格或所选多个单元格",
     chooseFiles: "选择文件…",
     filesDetail: "显式选择并打包多个代码文件",
     context: "上下文",
@@ -4934,6 +5046,8 @@ const strings = {
     openContext: "Open in editor",
     removeContext: "Remove context",
     unsaved: "Unsaved",
+    notebookCell: "Cell",
+    notebookOutputsExcluded: "Outputs excluded",
     composerLabel: "Ask Ask2GPT",
     composerKeyboardHint: "Press Enter to send, Shift+Enter for a new line",
     composerKeyboardHintCmdIfMultiline:
@@ -4964,6 +5078,8 @@ const strings = {
     fileDetail: "Read the active editor buffer",
     currentSelection: "Current selection",
     selectionDetail: "Attach the code selected in the editor",
+    currentNotebookCells: "Notebook cell(s)",
+    notebookCellsDetail: "Attach the current cell or selected cells",
     chooseFiles: "Choose files…",
     filesDetail: "Explicitly select and bundle code files",
     context: "Context",

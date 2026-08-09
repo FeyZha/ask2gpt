@@ -5,6 +5,8 @@ import type {
   Conversation,
   ConversationCanonicalizationResultPayload,
   ConversationMessage,
+  ConversationLeasePurpose,
+  ConversationReleaseReason,
   ConversationSnapshotPayload,
   ConversationTranscriptProof,
   PendingRemotePromotion,
@@ -150,6 +152,12 @@ export interface ChatBackend {
     modelId: string,
     remoteUrl?: string,
   ): Promise<ChatModelOption>;
+  /** Relinquishes an idle page lease without deleting conversation or run state. */
+  releaseConversation?(
+    conversationId: string,
+    purpose?: ConversationLeasePurpose,
+    reason?: ConversationReleaseReason,
+  ): Promise<boolean>;
   closeConversation(conversationId: string): Promise<boolean>;
   acknowledgeTerminal(conversationId: string, runId: string, eventId: string): Promise<void>;
   onEvent(listener: (event: BackendEvent) => void): { dispose(): void };
@@ -228,6 +236,7 @@ export type WebviewToHostMessage =
   | { type: "stop"; conversationId: string; targetRunId: string }
   | { type: "regenerate"; conversationId: string; messageId: string }
   | { type: "attachSelection"; conversationId: string }
+  | { type: "attachNotebookCell"; conversationId: string }
   | { type: "attachCurrentFile"; conversationId: string }
   | { type: "attachFiles"; conversationId: string }
   | { type: "removeContext"; conversationId: string; contextId: string }

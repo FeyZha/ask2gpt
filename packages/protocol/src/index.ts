@@ -49,6 +49,8 @@ export const relayMessageTypes = [
   "conversation.title",
   "conversation.snapshot",
   "conversation.send",
+  "conversation.release",
+  "conversation.released",
   "conversation.close",
   "conversation.closed",
   "model.list",
@@ -72,6 +74,7 @@ export const chromeToHostMessageTypes = [
   "conversation.canonicalization.result",
   "conversation.title",
   "conversation.snapshot",
+  "conversation.released",
   "conversation.closed",
   "model.catalog",
   "model.selected",
@@ -89,6 +92,7 @@ export const hostToChromeMessageTypes = [
   "conversation.open",
   "conversation.canonicalization.check",
   "conversation.send",
+  "conversation.release",
   "conversation.close",
   "model.list",
   "model.select",
@@ -228,9 +232,20 @@ const conversationOpenPayloadSchema = z
     remoteUrl: optionalChatGptUrlSchema,
     active: z.boolean().optional(),
     dispatchIntent: z.boolean().optional(),
+    purpose: z.enum(["view", "dispatch"]).optional(),
     transcriptProof: conversationTranscriptProofSchema.optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (payload) =>
+      payload.purpose === undefined ||
+      payload.dispatchIntent === undefined ||
+      (payload.purpose === "dispatch") === payload.dispatchIntent,
+    {
+      message: "Conversation lease purpose conflicts with dispatch intent.",
+      path: ["purpose"],
+    },
+  );
 const conversationTitlePayloadSchema = z
   .object({
     title: conversationTitleSchema,
@@ -340,6 +355,21 @@ const conversationSendPayloadSchema = z
   })
   .strict();
 const conversationClosePayloadSchema = z.object({ closeTab: z.boolean() }).strict();
+const conversationLeasePurposeSchema = z.enum(["view", "dispatch"]);
+const conversationReleaseReasonSchema = z.enum(["inactive", "settled", "host-dispose"]);
+const conversationReleasePayloadSchema = z
+  .object({
+    purpose: conversationLeasePurposeSchema,
+    reason: conversationReleaseReasonSchema,
+  })
+  .strict();
+const conversationReleasedPayloadSchema = z
+  .object({
+    requestId: identifierSchema,
+    purpose: conversationLeasePurposeSchema,
+    reason: conversationReleaseReasonSchema,
+  })
+  .strict();
 const conversationClosedPayloadSchema = z
   .object({
     requestId: identifierSchema,
@@ -512,6 +542,22 @@ export const relayEnvelopeSchema = z.discriminatedUnion("type", [
     .object({
       ...baseEnvelopeShape,
       ...conversationShape,
+      type: z.literal("conversation.release"),
+      payload: conversationReleasePayloadSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...baseEnvelopeShape,
+      ...conversationShape,
+      type: z.literal("conversation.released"),
+      payload: conversationReleasedPayloadSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...baseEnvelopeShape,
+      ...conversationShape,
       type: z.literal("conversation.close"),
       payload: conversationClosePayloadSchema,
     })
@@ -666,7 +712,22 @@ export interface ConversationOpenPayload {
   remoteUrl?: string;
   active?: boolean;
   dispatchIntent?: boolean;
+  /** Defaults to `view` when both this field and legacy dispatchIntent are absent. */
+  purpose?: ConversationLeasePurpose;
   transcriptProof?: ConversationTranscriptProof;
+}
+
+export type ConversationLeasePurpose = "view" | "dispatch";
+export type ConversationReleaseReason = "inactive" | "settled" | "host-dispose";
+
+export interface ConversationReleasePayload {
+  purpose: ConversationLeasePurpose;
+  reason: ConversationReleaseReason;
+}
+
+export interface ConversationReleasedPayload extends ConversationReleasePayload {
+  /** The id of the conversation.release envelope being acknowledged. */
+  requestId: string;
 }
 
 export interface ConversationTranscriptProof {
@@ -823,6 +884,46 @@ export interface SourceAnchorV1 {
   workspaceRelativePath?: string;
 }
 
+/** An exact text range inside a notebook cell, using zero-based VS Code coordinates. */
+export interface NotebookCellTextRangeV2 {
+  startLine: number;
+  startCharacter: number;
+  endLine: number;
+  endCharacter: number;
+}
+
+/**
+ * Host-authoritative provenance for source captured from a notebook cell.
+ *
+ * The durable identity is the notebook container URI plus versioned cell
+ * fingerprints. A `vscode-notebook-cell:` URI is intentionally not persisted
+ * because it is a virtual, session-local implementation detail.
+ */
+export interface NotebookSourceAnchorV2 {
+  formatVersion: 2;
+  notebookUri: string;
+  notebookType: string;
+  notebookVersion: number;
+  /** Zero-based index at capture time. Content fingerprints survive cell moves. */
+  cellIndex: number;
+  cellKind: "code" | "markup";
+  cellLanguage: string;
+  scope: "range" | "cell";
+  /** Version of the cell's TextDocument at capture time. */
+  documentVersion: number;
+  range: NotebookCellTextRangeV2;
+  contentSha256: string;
+  normalizedContentSha256: string;
+  /** Fingerprints the complete cell source, even when only a range is attached. */
+  cellContentSha256: string;
+  normalizedCellContentSha256: string;
+  beforeCellSha256?: string;
+  afterCellSha256?: string;
+  workspaceRelativePath?: string;
+}
+
+export type SourceAnchor = SourceAnchorV1 | NotebookSourceAnchorV2;
+
 export interface ContextSnapshot {
   id: string;
   kind: ContextKind;
@@ -834,7 +935,7 @@ export interface ContextSnapshot {
   content: string;
   charCount: number;
   unsaved: boolean;
-  sourceAnchor?: SourceAnchorV1;
+  sourceAnchor?: SourceAnchor;
 }
 
 export type MessageRole = "user" | "assistant" | "local-notice";

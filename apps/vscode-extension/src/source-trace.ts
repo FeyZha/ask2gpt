@@ -10,6 +10,13 @@ import {
   findUniqueContextSnapshotRange,
   resolveNonSelectionSnapshotRange,
 } from "./context-navigation";
+import {
+  isNotebookContextSnapshot,
+  notebookContextIdentity,
+  resolveNotebookContextCell,
+  showNotebookContextRange,
+  type NotebookCellResolution,
+} from "./notebook-source-navigation";
 import { assertAllowedContextFile } from "./services/context-policy";
 import { Ask2GPTError } from "./services/errors";
 import { planContextDelivery } from "./services/prompt-builder";
@@ -34,6 +41,7 @@ interface SymbolLocation {
   containerName?: string;
   context: ContextSnapshot;
   document: vscode.TextDocument;
+  notebookResolution?: Extract<NotebookCellResolution, { status: "found" }>;
   range: vscode.Range;
 }
 
@@ -89,7 +97,7 @@ export async function openAnswerSymbolFromState(
     if (locations.length > 0) {
       const selected = await chooseSymbolLocation(locations, requested, state.locale);
       if (!selected) return;
-      await showRange(selected.document, selected.range);
+      await showSymbolLocation(selected);
       return;
     }
   }
@@ -212,7 +220,7 @@ function isWithinContextLines(location: ResolvedSourceLocation, context: Context
 function deduplicateSourceLocations<T extends ResolvedSourceLocation>(locations: T[]) {
   const seen = new Set<string>();
   return locations.filter((location) => {
-    const key = `${location.context.uri}:${location.startLine}:${location.endLine}`;
+    const key = `${notebookContextIdentity(location.context)}:${location.startLine}:${location.endLine}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -240,6 +248,13 @@ async function chooseSourceLocation(
 }
 
 async function openLineLocation(location: ResolvedSourceLocation, locale: AppState["locale"]) {
+  if (isNotebookContextSnapshot(location.context)) {
+    const resolution = await trustedNotebookResolution(location.context, locale);
+    const range = sourceLineRange(resolution.document, resolution.evidenceRange, location, locale);
+    await showNotebookContextRange(resolution, range);
+    return;
+  }
+
   const uri = trustedContextUri(location.context, locale);
   const document = await vscode.workspace.openTextDocument(uri);
   let startIndex = location.startLine - 1;
@@ -319,9 +334,20 @@ async function resolveSymbolLocations(
   const locations: Array<SymbolLocation & { score: number }> = [];
 
   for (const { context } of contexts) {
-    const uri = trustedContextUri(context, locale);
-    const document = await vscode.workspace.openTextDocument(uri);
-    const evidenceRange = contextEvidenceRange(document, context, locale);
+    let document: vscode.TextDocument;
+    let evidenceRange: vscode.Range;
+    let notebookResolution: Extract<NotebookCellResolution, { status: "found" }> | undefined;
+    let uri: vscode.Uri;
+    if (isNotebookContextSnapshot(context)) {
+      notebookResolution = await trustedNotebookResolution(context, locale);
+      document = notebookResolution.document;
+      evidenceRange = notebookResolution.evidenceRange;
+      uri = document.uri;
+    } else {
+      uri = trustedContextUri(context, locale);
+      document = await vscode.workspace.openTextDocument(uri);
+      evidenceRange = contextEvidenceRange(document, context, locale);
+    }
     let symbols: Array<vscode.DocumentSymbol | vscode.SymbolInformation> = [];
     try {
       symbols =
@@ -346,6 +372,7 @@ async function resolveSymbolLocations(
       locations.push({
         context,
         document,
+        ...(notebookResolution ? { notebookResolution } : {}),
         range: symbol.range,
         containerName: symbol.containerName,
         score: 500,
@@ -370,6 +397,7 @@ async function resolveSymbolLocations(
       locations.push({
         context,
         document,
+        ...(notebookResolution ? { notebookResolution } : {}),
         range,
         score: 250,
       });
@@ -381,7 +409,7 @@ async function resolveSymbolLocations(
   const seen = new Set<string>();
   return locations.filter((location) => {
     if (location.score !== bestScore) return false;
-    const key = `${location.context.uri}:${location.range.start.line}:${location.range.start.character}`;
+    const key = `${notebookContextIdentity(location.context)}:${location.range.start.line}:${location.range.start.character}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -459,6 +487,59 @@ async function showRange(document: vscode.TextDocument, range: vscode.Range) {
   });
   editor.selection = new vscode.Selection(range.start, range.end);
   editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+}
+
+async function showSymbolLocation(location: SymbolLocation) {
+  if (location.notebookResolution) {
+    await showNotebookContextRange(location.notebookResolution, location.range);
+    return;
+  }
+  await showRange(location.document, location.range);
+}
+
+async function trustedNotebookResolution(
+  context: ContextSnapshot & {
+    sourceAnchor: Extract<ContextSnapshot["sourceAnchor"], { formatVersion: 2 }>;
+  },
+  locale: AppState["locale"],
+) {
+  try {
+    const resolution = await resolveNotebookContextCell(context);
+    if (resolution.status === "found") return resolution;
+    throw traceError(
+      locale,
+      resolution.status === "ambiguous" ? "SOURCE_LINE_AMBIGUOUS" : "SOURCE_LINE_STALE",
+    );
+  } catch (error) {
+    if (error instanceof TrustedContextUriError) {
+      throw traceError(locale, "SOURCE_CONTEXT_UNTRUSTED");
+    }
+    throw error;
+  }
+}
+
+function sourceLineRange(
+  document: vscode.TextDocument,
+  evidenceRange: vscode.Range,
+  location: ResolvedSourceLocation,
+  locale: AppState["locale"],
+) {
+  const startOffset = location.startLine - location.context.startLine;
+  const endOffset = location.endLine - location.context.startLine;
+  const evidenceLineCount = location.context.endLine - location.context.startLine + 1;
+  const startIndex = evidenceRange.start.line + startOffset;
+  const endIndex = evidenceRange.start.line + endOffset;
+  if (
+    startOffset < 0 ||
+    endOffset < startOffset ||
+    endOffset >= evidenceLineCount ||
+    startIndex < 0 ||
+    endIndex < startIndex ||
+    endIndex >= document.lineCount
+  ) {
+    throw traceError(locale, "SOURCE_LINE_STALE");
+  }
+  return new vscode.Range(new vscode.Position(startIndex, 0), document.lineAt(endIndex).range.end);
 }
 
 function trustedContextUri(context: ContextSnapshot, locale: AppState["locale"]) {

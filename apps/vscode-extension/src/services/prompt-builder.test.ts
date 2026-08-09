@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import type { ContextSnapshot, NotebookSourceAnchorV2 } from "@ask2gpt/protocol";
+
 import { MAX_QUESTION_CHARS, buildVisiblePrompt, buildVisiblePromptPlan } from "./prompt-builder";
 
 describe("visible prompt", () => {
@@ -162,4 +164,136 @@ describe("visible prompt", () => {
       "three.ts",
     ]);
   });
+
+  it("packages a Notebook range as source-only code with a deterministic cell alias", () => {
+    const plan = buildVisiblePromptPlan("解释这个单元格", [
+      notebookContext({
+        id: "notebook-range",
+        fileName: "notebooks/analysis.ipynb",
+        language: "python",
+        startLine: 3,
+        endLine: 12,
+        content: "def score(rows):\n    return len(rows)",
+        charCount: 37,
+        sourceAnchor: notebookAnchor({
+          cellIndex: 3,
+          cellLanguage: "python",
+          scope: "range",
+        }),
+      }),
+    ]);
+
+    expect(plan.prompt).toBe("解释这个单元格");
+    expect(plan.prompt).not.toContain("def score");
+    expect(plan.attachments).toEqual([
+      {
+        id: "notebook-range",
+        fileName: "analysis.cell-004.L3-L12.py",
+        mimeType: "text/x-python",
+        content: "def score(rows):\n    return len(rows)",
+      },
+    ]);
+    expect(plan.delivery).toEqual([
+      {
+        contextId: "notebook-range",
+        mode: "file",
+        fileName: "analysis.cell-004.L3-L12.py",
+      },
+    ]);
+  });
+
+  it("uses source extensions for full Markdown cells and a safe fallback for unknown kernels", () => {
+    const plan = buildVisiblePromptPlan("Summarize these cells", [
+      notebookContext({
+        id: "markdown-cell",
+        language: "markdown",
+        content: "## Findings",
+        charCount: 11,
+        sourceAnchor: notebookAnchor({
+          cellIndex: 6,
+          cellKind: "markup",
+          cellLanguage: "markdown",
+          scope: "cell",
+        }),
+      }),
+      notebookContext({
+        id: "custom-cell",
+        language: "private-kernel-language",
+        content: "opaque source",
+        charCount: 13,
+        sourceAnchor: notebookAnchor({
+          cellIndex: 7,
+          cellLanguage: "private-kernel-language",
+          scope: "cell",
+        }),
+      }),
+    ]);
+
+    expect(plan.attachments).toEqual([
+      expect.objectContaining({
+        fileName: "analysis.cell-007.md",
+        mimeType: "text/markdown",
+      }),
+      expect.objectContaining({
+        fileName: "analysis.cell-008.txt",
+        mimeType: "text/plain",
+      }),
+    ]);
+  });
+
+  it("fails closed instead of transporting a raw ipynb document", () => {
+    const rawNotebook = {
+      id: "raw-notebook",
+      kind: "file" as const,
+      fileName: "analysis.ipynb",
+      uri: "file:///workspace/analysis.ipynb",
+      language: "json",
+      startLine: 1,
+      endLine: 1,
+      content: '{"cells":[],"outputs":["secret"]}',
+      charCount: 33,
+      unsaved: false,
+    };
+
+    expect(() => buildVisiblePromptPlan("Inspect this", [rawNotebook])).toThrow(
+      "不能发送原始 .ipynb 文件",
+    );
+  });
 });
+
+function notebookContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot {
+  return {
+    id: "notebook-context",
+    kind: "selection",
+    fileName: "analysis.ipynb",
+    uri: "file:///workspace/analysis.ipynb",
+    language: "python",
+    startLine: 1,
+    endLine: 4,
+    content: "answer = 42",
+    charCount: 11,
+    unsaved: false,
+    sourceAnchor: notebookAnchor(),
+    ...overrides,
+  };
+}
+
+function notebookAnchor(overrides: Partial<NotebookSourceAnchorV2> = {}): NotebookSourceAnchorV2 {
+  return {
+    formatVersion: 2,
+    notebookUri: "file:///workspace/analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 5,
+    cellIndex: 3,
+    cellKind: "code",
+    cellLanguage: "python",
+    scope: "range",
+    documentVersion: 2,
+    range: { startLine: 2, startCharacter: 0, endLine: 11, endCharacter: 20 },
+    contentSha256: "a".repeat(64),
+    normalizedContentSha256: "b".repeat(64),
+    cellContentSha256: "c".repeat(64),
+    normalizedCellContentSha256: "d".repeat(64),
+    ...overrides,
+  };
+}

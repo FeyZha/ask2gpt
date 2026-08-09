@@ -3,7 +3,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import type { ContextSnapshot } from "@ask2gpt/protocol";
+import type { ContextSnapshot, NotebookSourceAnchorV2 } from "@ask2gpt/protocol";
 
 import type { AppState, HostToWebviewMessage, WebviewToHostMessage } from "../types";
 
@@ -1001,8 +1001,9 @@ describe("Ask2GPT webview", () => {
     fireEvent.click(trigger);
     const menu = screen.getByRole("menu", { name: "选择上下文" });
     const items = screen.getAllByRole("menuitem");
-    expect(items).toHaveLength(3);
+    expect(items).toHaveLength(4);
     expect(screen.getByRole("menuitem", { name: /当前选区|Current selection/u })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Notebook 单元格|Notebook cell/u })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /当前文件/u })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /选择文件/u })).toBeTruthy();
     expect(document.activeElement).toBe(items[0]);
@@ -1020,6 +1021,13 @@ describe("Ask2GPT webview", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /当前选区|Current selection/u }));
     expect(posted).toContainEqual({
       type: "attachSelection",
+      conversationId: "conversation-1",
+    });
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Notebook 单元格|Notebook cell/u }));
+    expect(posted).toContainEqual({
+      type: "attachNotebookCell",
       conversationId: "conversation-1",
     });
 
@@ -1144,6 +1152,76 @@ describe("Ask2GPT webview", () => {
     expect(composer.value).toBe(
       "Review this code, report issues by severity, and suggest concrete improvements.",
     );
+  });
+
+  it("renders Notebook code cells as compact source-only cards with code task shortcuts", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    const notebookCell = makeNotebookContext({
+      id: "notebook-code-cell",
+      startLine: 3,
+      endLine: 12,
+      sourceAnchor: makeNotebookAnchor({ cellIndex: 3 }),
+    });
+    state.pendingContexts = [notebookCell];
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText("analysis.ipynb · Cell 4 · Python")).toBeTruthy();
+    expect(screen.getByText(/L3–12 · Outputs excluded/u)).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Code task shortcuts" })).toBeTruthy();
+    expect(screen.queryByText(/"outputs"/u)).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open in editor: analysis.ipynb · Cell 4 · Python · L3–12 · Outputs excluded",
+      }),
+    );
+    expect(posted).toContainEqual({
+      type: "openContext",
+      contextId: "notebook-code-cell",
+      conversationId: "conversation-1",
+    });
+
+    const sent = structuredClone(state);
+    sent.pendingContexts = [];
+    sent.conversations[0]!.messages.push({
+      id: "notebook-question",
+      role: "user",
+      markdown: "Explain this cell",
+      status: "complete",
+      createdAt: new Date().toISOString(),
+      contexts: [notebookCell],
+    });
+    sendHostMessage({ type: "state", state: sent });
+    const sentContexts = await screen.findByRole("group", {
+      name: "Code context sent with this question",
+    });
+    expect(within(sentContexts).getByText("analysis.ipynb · Cell 4 · Python")).toBeTruthy();
+    expect(within(sentContexts).getByText("L3–12 · Outputs excluded")).toBeTruthy();
+  });
+
+  it("does not offer code-only shortcuts for a Markdown Notebook cell", async () => {
+    render(<App />);
+    const state = makeState();
+    state.locale = "en";
+    state.pendingContexts = [
+      makeNotebookContext({
+        id: "notebook-markup-cell",
+        language: "markdown",
+        content: "## Experiment notes",
+        sourceAnchor: makeNotebookAnchor({
+          cellIndex: 6,
+          cellKind: "markup",
+          cellLanguage: "markdown",
+          scope: "cell",
+        }),
+      }),
+    ];
+    sendHostMessage({ type: "state", state });
+
+    expect(await screen.findByText("analysis.ipynb · Cell 7 · Markdown")).toBeTruthy();
+    expect(screen.getByText(/Outputs excluded/u)).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Code task shortcuts" })).toBeNull();
   });
 
   it("keeps selection task drafts isolated by conversation", async () => {
@@ -4007,6 +4085,41 @@ function makeContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot 
     content: "export const answer = 42;",
     charCount: 25,
     unsaved: false,
+    ...overrides,
+  };
+}
+
+function makeNotebookContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot {
+  return makeContext({
+    kind: "selection",
+    fileName: "notebooks/analysis.ipynb",
+    uri: "file:///workspace/notebooks/analysis.ipynb",
+    language: "python",
+    content: "def score(rows):\n    return len(rows)",
+    charCount: 37,
+    sourceAnchor: makeNotebookAnchor(),
+    ...overrides,
+  });
+}
+
+function makeNotebookAnchor(
+  overrides: Partial<NotebookSourceAnchorV2> = {},
+): NotebookSourceAnchorV2 {
+  return {
+    formatVersion: 2,
+    notebookUri: "file:///workspace/notebooks/analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 5,
+    cellIndex: 3,
+    cellKind: "code",
+    cellLanguage: "python",
+    scope: "range",
+    documentVersion: 2,
+    range: { startLine: 2, startCharacter: 0, endLine: 11, endCharacter: 20 },
+    contentSha256: "a".repeat(64),
+    normalizedContentSha256: "b".repeat(64),
+    cellContentSha256: "c".repeat(64),
+    normalizedCellContentSha256: "d".repeat(64),
     ...overrides,
   };
 }

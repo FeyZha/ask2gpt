@@ -60,9 +60,17 @@ if (
 }
 const relayServiceWorker = readText(relayArchive, "service-worker.js");
 const relayContentScript = readText(relayArchive, "content-script.js");
+const relayPopupHtml = readText(relayArchive, "popup.html");
+const relayPopupBundle = readText(relayArchive, "popup.js");
 assertProtocolBundle(relayServiceWorker, "Relay service worker");
 assertContentRuntimeBundle(relayServiceWorker, "Relay service worker", contentRuntimeRevision);
 assertContentRuntimeBundle(relayContentScript, "Relay content script", contentRuntimeRevision);
+assertManagedTabLifecycleBundles(
+  relayServiceWorker,
+  relayContentScript,
+  relayPopupHtml,
+  relayPopupBundle,
+);
 assertNoLegacyContent(relayArchive, "Relay ZIP");
 
 const extensionPackage = JSON.parse(readText(vsixArchive, "extension/package.json"));
@@ -82,10 +90,19 @@ assertVSIXShortcutSurface(extensionPackage);
 const extensionBundle = readText(vsixArchive, "extension/dist/extension.cjs");
 const webviewBundle = readText(vsixArchive, "extension/dist/webview/webview.js");
 const webviewStyles = readText(vsixArchive, "extension/dist/webview/webview.css");
+const extensionReadme = readText(vsixArchive, "extension/readme.md");
 assertProtocolBundle(extensionBundle, "VSIX extension host");
-assertSelectionShortcutBundle(extensionBundle, readText(vsixArchive, "extension/readme.md"));
+assertSelectionShortcutBundle(extensionBundle, extensionReadme);
+assertTabLeaseHostBundle(extensionBundle, extensionReadme);
 assertCodeTaskShortcutWebview(webviewBundle, webviewStyles);
 assertTraceabilityBundles(extensionBundle, webviewBundle, webviewStyles);
+assertNotebookSourceBundles(
+  extensionPackage,
+  extensionBundle,
+  webviewBundle,
+  webviewStyles,
+  extensionReadme,
+);
 assertNoLegacyContent(vsixArchive, "VSIX");
 
 process.stdout.write(
@@ -161,8 +178,83 @@ function assertContentRuntimeBundle(bundle, label, expectedRevision) {
   throw new Error(`${label} does not contain content runtime ${expectedRevision}.`);
 }
 
+function assertManagedTabLifecycleBundles(serviceWorker, contentScript, popupHtml, popupBundle) {
+  const serviceWorkerMarkers = [
+    "conversation.release",
+    "conversation.released",
+    "content.inspectIdleState",
+    "created",
+    "borrowed",
+    "legacy-unknown",
+    "leaseEpoch",
+    "releaseRequestedAt",
+    "userClaimedAt",
+    "relay-managed-tab-gc",
+    "popup.cleanupManagedTabs",
+    "6e5",
+    "18e5",
+    "Chrome could not durably checkpoint the tab release; the tab remains leased.",
+    "A tab created by a failed allocation could not be closed.",
+  ];
+  const contentScriptMarkers = [
+    "content.inspectIdleState",
+    "ambiguous-composer",
+    "composer-not-empty",
+    "attachments-present",
+    "response-control-present",
+    "modal-present",
+  ];
+  const popupHtmlMarkers = ["tab-pool-section", "cleanup-managed-tabs", "tab-pool-legacy-warning"];
+  const popupBundleMarkers = ["popup.cleanupManagedTabs", "legacyCandidates", "cleanupEligible"];
+  const missing = [
+    ...serviceWorkerMarkers.filter((marker) => !serviceWorker.includes(marker)),
+    ...contentScriptMarkers.filter((marker) => !contentScript.includes(marker)),
+    ...popupHtmlMarkers.filter((marker) => !popupHtml.includes(marker)),
+    ...popupBundleMarkers.filter((marker) => !popupBundle.includes(marker)),
+  ];
+  if (
+    !/(?:owned:!1.{0,800}provenance:`borrowed`|provenance:`borrowed`.{0,800}owned:!1)/u.test(
+      serviceWorker,
+    )
+  ) {
+    missing.push("borrowed + owned:false");
+  }
+  if (!serviceWorker.includes("capacity:") || !popupBundle.includes("capacity")) {
+    missing.push("managed capacity");
+  }
+  if (missing.length > 0) {
+    throw new Error(`Relay managed-tab lifecycle bundle is stale: missing ${missing.join(", ")}.`);
+  }
+}
+
+function assertTabLeaseHostBundle(bundle, readme) {
+  const bundleMarkers = [
+    "conversation.release",
+    "conversation.released",
+    "TAB_RELEASE_FAILED",
+    "conversation.dispatch-prewarm-dispatched",
+  ];
+  const readmeMarkers = [
+    "empty local draft keeps the same identity",
+    "three-page managed capacity is a",
+    "soft safety target:",
+    "Clicking, focusing, or typing in the Composer can start that",
+    "Popup counts are candidate estimates",
+    "Adjacent patch",
+    "compatibility supports rolling upgrades,",
+  ];
+  const missing = [
+    ...bundleMarkers.filter((marker) => !bundle.includes(marker)),
+    ...readmeMarkers.filter((marker) => !readme.includes(marker)),
+  ];
+  if (missing.length > 0) {
+    throw new Error(`VSIX tab-lease lifecycle bundle is stale: missing ${missing.join(", ")}.`);
+  }
+}
+
 function assertVSIXShortcutSurface(extensionPackage) {
   const selectionCommandId = "ask2gpt.attachSelection";
+  const notebookCommandId = "ask2gpt.attachNotebookCell";
   const findRelatedTurnCommandId = "ask2gpt.findRelatedTurn";
   const selectionWhen = "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/";
   const selectionViewWhen = "view == ask2gpt.sidebar";
@@ -187,6 +279,14 @@ function assertVSIXShortcutSurface(extensionPackage) {
   const findRelatedTurnCommand = commands.find(
     (entry) => entry?.command === findRelatedTurnCommandId,
   );
+  const notebookCommand = commands.find((entry) => entry?.command === notebookCommandId);
+  const notebookMenuEntries = Object.entries(menus).flatMap(([menu, entries]) =>
+    Array.isArray(entries)
+      ? entries
+          .filter((entry) => entry?.command === notebookCommandId && entry.when !== "false")
+          .map((entry) => ({ menu, entry }))
+      : [],
+  );
   const findRelatedTurnMenuEntries = Object.entries(menus).flatMap(([menu, entries]) =>
     Array.isArray(entries)
       ? entries
@@ -197,6 +297,7 @@ function assertVSIXShortcutSurface(extensionPackage) {
   const expectedCommands = [
     "ask2gpt.attachCurrentFile",
     "ask2gpt.attachFiles",
+    notebookCommandId,
     selectionCommandId,
     "ask2gpt.copyDiagnostics",
     findRelatedTurnCommandId,
@@ -214,16 +315,34 @@ function assertVSIXShortcutSurface(extensionPackage) {
     selectionCommand?.icon !== "$(comment-discussion)" ||
     findRelatedTurnCommand?.enablement !== undefined ||
     findRelatedTurnCommand?.icon !== "$(references)" ||
+    notebookCommand?.enablement !== undefined ||
+    notebookCommand?.icon !== "$(notebook)" ||
     selectionCommand?.title !== "问 Ask2GPT（使用当前选区） / Ask About Selection" ||
     !extensionPackage.activationEvents?.includes(`onCommand:${selectionCommandId}`) ||
     !extensionPackage.activationEvents?.includes(`onCommand:${findRelatedTurnCommandId}`) ||
+    !extensionPackage.activationEvents?.includes(`onCommand:${notebookCommandId}`) ||
     paletteEntry?.when !== selectionWhen ||
     JSON.stringify(editorShortcutMenus) !== JSON.stringify(["editor/title", "editor/context"]) ||
     selectionMenuEntries.length !== 4 ||
     !selectionMenuEntries.every(({ menu, entry }) =>
       menu === "view/title" ? entry.when === selectionViewWhen : entry.when === selectionWhen,
     ) ||
-    findRelatedTurnMenuEntries.length !== 3 ||
+    notebookMenuEntries.length !== 3 ||
+    !notebookMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "commandPalette" && entry.when === undefined && entry.group === undefined,
+    ) ||
+    !notebookMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "notebook/cell/title" &&
+        entry.when === undefined &&
+        entry.group === "inline/cell@1",
+    ) ||
+    !notebookMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "notebook/toolbar" && entry.when === undefined && entry.group === "navigation@1",
+    ) ||
+    findRelatedTurnMenuEntries.length !== 4 ||
     !findRelatedTurnMenuEntries.some(
       ({ menu, entry }) =>
         menu === "commandPalette" && entry.when === selectionWhen && entry.group === undefined,
@@ -237,6 +356,12 @@ function assertVSIXShortcutSurface(extensionPackage) {
         menu === "editor/context" &&
         entry.when === selectionWhen &&
         entry.group === "navigation@11",
+    ) ||
+    !findRelatedTurnMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "notebook/cell/title" &&
+        entry.when === undefined &&
+        entry.group === "inline/cell@2",
     ) ||
     findRelatedTurnMenuEntries.some(({ menu }) => menu === "view/title") ||
     contributes.keybindings !== undefined ||
@@ -349,6 +474,69 @@ function assertTraceabilityBundles(extensionBundle, webviewBundle, styles) {
   ];
   if (missing.length > 0) {
     throw new Error(`VSIX traceability bundle is stale: missing ${missing.join(", ")}.`);
+  }
+}
+
+function assertNotebookSourceBundles(
+  extensionPackage,
+  extensionBundle,
+  webviewBundle,
+  styles,
+  readme,
+) {
+  const menus = extensionPackage.contributes?.menus ?? {};
+  const notebookCommand = "ask2gpt.attachNotebookCell";
+  const requiredMenuMarkers = [
+    ["commandPalette", undefined],
+    ["notebook/cell/title", "inline/cell@1"],
+    ["notebook/toolbar", "navigation@1"],
+  ];
+  const missingMenus = requiredMenuMarkers.filter(
+    ([menu, group]) =>
+      !menus[menu]?.some(
+        (entry) =>
+          entry?.command === notebookCommand && entry.when === undefined && entry.group === group,
+      ),
+  );
+  const extensionMarkers = [
+    notebookCommand,
+    "notebookUri",
+    "cellContentSha256",
+    "normalizedCellContentSha256",
+    "beforeCellSha256",
+    "afterCellSha256",
+    "NOTEBOOK_CELL_STALE",
+    "NOTEBOOK_FILE_REQUIRES_NOTEBOOK_API",
+    "NOTEBOOK_RAW_CONTEXT_UNSUPPORTED",
+    "The notebook cell selection is invalid. Select it again and retry.",
+    "vscode-notebook-cell",
+    "notebookDocuments",
+    "openNotebookDocument",
+    "showNotebookDocument",
+    "NotebookRange",
+    "revealRange",
+  ];
+  const webviewMarkers = ["attachNotebookCell", "Notebook cell(s)", "Outputs excluded"];
+  const styleMarkers = [
+    ".context-chip--notebook",
+    ".context-row--notebook",
+    ".sent-context--notebook",
+  ];
+  const readmeMarkers = [
+    "Notebook source remains cell-first and source-only.",
+    "Raw `.ipynb` JSON, outputs, execution",
+    "8 context items, 40,000 characters per item and 60,000 characters in total.",
+    "duplicated, deleted or stale cells fail closed.",
+  ];
+  const missing = [
+    ...missingMenus.map(([menu, group]) => `${menu}:${String(group)}`),
+    ...extensionMarkers.filter((marker) => !extensionBundle.includes(marker)),
+    ...webviewMarkers.filter((marker) => !webviewBundle.includes(marker)),
+    ...styleMarkers.filter((marker) => !styles.includes(marker)),
+    ...readmeMarkers.filter((marker) => !readme.includes(marker)),
+  ];
+  if (missing.length > 0) {
+    throw new Error(`VSIX Notebook Cell source bundle is stale: missing ${missing.join(", ")}.`);
   }
 }
 

@@ -18,6 +18,17 @@ interface ServerStatus {
   transportState?: TransportState;
 }
 
+interface TabPoolStatus {
+  managed: number;
+  active: number;
+  reusable: number;
+  protected: number;
+  borrowed: number;
+  legacyCandidates: number;
+  cleanupEligible: number;
+  capacity: number;
+}
+
 interface PopupStatus {
   servers: ServerStatus[];
   connected?: boolean;
@@ -31,6 +42,7 @@ interface PopupStatus {
     enhancedEnabled: boolean;
     permissionGranted: boolean;
   };
+  tabPool?: TabPoolStatus;
   lastError?: string;
 }
 
@@ -40,6 +52,14 @@ interface OpenChatGptResponse {
   created?: boolean;
   project?: { bound: true; name: string; projectUrl?: string };
   projectSetup?: PopupStatus["projectSetup"];
+}
+
+interface CleanupManagedTabsResponse {
+  ok: boolean;
+  closed: number;
+  skipped: number;
+  tabPool?: TabPoolStatus;
+  error?: string;
 }
 
 const STATUS_POLL_MS = 2_500;
@@ -78,6 +98,20 @@ const lastError = requiredElement<HTMLElement>("#last-error");
 const enhancedBackgroundToggle = requiredElement<HTMLInputElement>("#enhanced-background-toggle");
 const backgroundReceptionBadge = requiredElement<HTMLElement>("#background-reception-badge");
 const backgroundReceptionDetail = requiredElement<HTMLElement>("#background-reception-detail");
+const tabPoolSection = requiredElement<HTMLElement>("#tab-pool-section");
+const tabPoolCapacity = requiredElement<HTMLElement>("#tab-pool-capacity");
+const tabPoolSummary = requiredElement<HTMLElement>("#tab-pool-summary");
+const tabPoolManaged = requiredElement<HTMLElement>("#tab-pool-managed");
+const tabPoolActive = requiredElement<HTMLElement>("#tab-pool-active");
+const tabPoolReusable = requiredElement<HTMLElement>("#tab-pool-reusable");
+const tabPoolProtected = requiredElement<HTMLElement>("#tab-pool-protected");
+const tabPoolLegacy = requiredElement<HTMLElement>("#tab-pool-legacy");
+const cleanupManagedTabsButton = requiredElement<HTMLButtonElement>("#cleanup-managed-tabs");
+const tabPoolSafety = requiredElement<HTMLElement>("#tab-pool-safety");
+const tabPoolLegacyWarning = requiredElement<HTMLElement>("#tab-pool-legacy-warning");
+const tabPoolLegacyCount = requiredElement<HTMLElement>("#tab-pool-legacy-count");
+const tabPoolLegacyDetail = requiredElement<HTMLElement>("#tab-pool-legacy-detail");
+const tabPoolFeedback = requiredElement<HTMLElement>("#tab-pool-feedback");
 
 let refreshInFlight = false;
 let projectBindInFlight = false;
@@ -91,6 +125,8 @@ let projectCandidatesState: ProjectCandidate[] = [];
 let selectedProjectUrl: string | undefined;
 let projectChooserOpen = false;
 let openChatGptInFlight = false;
+let cleanupManagedTabsInFlight = false;
+let tabPoolFeedbackState: { kind: "success" | "error"; message: string } | undefined;
 let lastStatus: PopupStatus | undefined;
 let lastRenderedStatusKey: string | undefined;
 
@@ -145,6 +181,7 @@ function render(status: PopupStatus) {
   renderControls(status, servers, readyCount);
   renderServers(servers);
   renderBackgroundReception(status.backgroundReception);
+  renderTabPool(status.tabPool);
   renderLastError(status.lastError, servers.length === 0 && !status.scanning);
 }
 
@@ -156,6 +193,48 @@ function renderBackgroundReception(status: PopupStatus["backgroundReception"]) {
   backgroundReceptionDetail.textContent = enabled
     ? "仅在回答期间启用，完成后会立即断开调试连接。"
     : "已手动关闭；Chrome 最小化时，流式内容可能延迟。";
+}
+
+function renderTabPool(status: PopupStatus["tabPool"]) {
+  const ready = status !== undefined;
+  tabPoolSection.dataset.ready = String(ready);
+  tabPoolSection.dataset.pending = String(cleanupManagedTabsInFlight);
+  tabPoolSection.setAttribute("aria-busy", String(cleanupManagedTabsInFlight));
+
+  tabPoolCapacity.textContent = `上限 ${status?.capacity ?? 3}`;
+  tabPoolSummary.textContent = status
+    ? `Relay 最多并行使用 ${status.capacity} 个工作页；空闲页会优先复用。`
+    : "正在读取页面池状态…";
+  tabPoolManaged.textContent = poolCountLabel(status?.managed);
+  tabPoolActive.textContent = poolCountLabel(status?.active);
+  tabPoolReusable.textContent = poolCountLabel(status?.reusable);
+  tabPoolProtected.textContent = poolCountLabel(status?.protected);
+  tabPoolLegacy.textContent = poolCountLabel(status?.legacyCandidates);
+
+  cleanupManagedTabsButton.disabled =
+    cleanupManagedTabsInFlight || !status || status.cleanupEligible === 0;
+  cleanupManagedTabsButton.textContent = cleanupManagedTabsInFlight
+    ? "正在安全清理…"
+    : status && status.cleanupEligible > 0
+      ? `清理安全闲置页 · ${status.cleanupEligible}`
+      : "清理安全闲置页";
+  tabPoolSafety.textContent =
+    status && status.borrowed > 0
+      ? `仅关闭由 Relay 创建、确认无任务且可安全复用的闲置页；${status.borrowed} 个借用页受保护。`
+      : "仅关闭由 Relay 创建、确认无任务且可安全复用的闲置页。";
+
+  const legacyCount = status?.legacyCandidates ?? 0;
+  tabPoolLegacyWarning.hidden = legacyCount === 0;
+  tabPoolLegacyCount.textContent = String(legacyCount);
+  tabPoolLegacyDetail.textContent = "旧页面不会自动删除；请在 Chrome 标签栏逐一确认后手动关闭。";
+
+  tabPoolFeedback.hidden = tabPoolFeedbackState === undefined;
+  tabPoolFeedback.dataset.kind = tabPoolFeedbackState?.kind ?? "";
+  tabPoolFeedback.textContent = tabPoolFeedbackState?.message ?? "";
+}
+
+function poolCountLabel(value: number | undefined) {
+  return value === undefined ? "—" : String(value);
 }
 
 function connectedWindowSummary(servers: ServerStatus[]) {
@@ -386,6 +465,7 @@ function renderUnavailable() {
   maintenanceActions.hidden = true;
   rescanButton.hidden = true;
   primaryActions.hidden = true;
+  renderTabPool(undefined);
   hideGuidance();
   showRelayRecovery(true);
 }
@@ -403,6 +483,47 @@ rescanButton.addEventListener("click", () => {
     .catch(renderUnavailable)
     .finally(() => {
       rescanButton.disabled = false;
+    });
+});
+
+cleanupManagedTabsButton.addEventListener("click", () => {
+  const eligible = lastStatus?.tabPool?.cleanupEligible ?? 0;
+  if (cleanupManagedTabsInFlight || eligible === 0) return;
+
+  cleanupManagedTabsInFlight = true;
+  tabPoolFeedbackState = undefined;
+  renderTabPool(lastStatus?.tabPool);
+  void sendRuntimeMessage<unknown>({ type: "popup.cleanupManagedTabs" }, 8_000)
+    .then(async (value) => {
+      if (!isCleanupManagedTabsResponse(value)) {
+        throw new Error("Relay 返回了无法验证的清理结果。");
+      }
+      if (!value.ok) throw new Error(value.error || "Relay 无法完成安全清理。");
+
+      if (value.tabPool && lastStatus) {
+        lastStatus = { ...lastStatus, tabPool: value.tabPool };
+        lastRenderedStatusKey = stableStatusKey(lastStatus);
+      } else {
+        await refresh({ forceRender: true, quiet: true });
+      }
+      tabPoolFeedbackState = {
+        kind: "success",
+        message:
+          value.closed > 0
+            ? `已关闭 ${value.closed} 个安全闲置页；跳过 ${value.skipped} 个受保护页面。`
+            : `没有需要关闭的安全闲置页；跳过 ${value.skipped} 个受保护页面。`,
+      };
+    })
+    .catch((error: unknown) => {
+      tabPoolFeedbackState = {
+        kind: "error",
+        message:
+          error instanceof Error ? cleanFeedback(error.message) : "安全清理失败，请稍后重试。",
+      };
+    })
+    .finally(() => {
+      cleanupManagedTabsInFlight = false;
+      renderTabPool(lastStatus?.tabPool);
     });
 });
 
@@ -730,6 +851,7 @@ function stableStatusKey(status: PopupStatus) {
     project: status.project,
     projectSetup: status.projectSetup,
     backgroundReception: status.backgroundReception,
+    tabPool: status.tabPool,
     lastError: status.lastError,
   });
 }
@@ -813,6 +935,7 @@ function isPopupStatus(value: unknown): value is PopupStatus {
   ) {
     return false;
   }
+  if (value.tabPool !== undefined && !isTabPoolStatus(value.tabPool)) return false;
   if (
     value.lastError !== undefined &&
     (typeof value.lastError !== "string" || value.lastError.length > 1_000)
@@ -831,6 +954,55 @@ function isPopupStatus(value: unknown): value is PopupStatus {
       (server.transportState === undefined ||
         ["connecting", "open", "authenticated", "error"].includes(String(server.transportState))),
   );
+}
+
+function isCleanupManagedTabsResponse(value: unknown): value is CleanupManagedTabsResponse {
+  if (!isRecord(value)) return false;
+  const allowedKeys = new Set(["ok", "closed", "skipped", "tabPool", "error"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
+  if (typeof value.ok !== "boolean") return false;
+  if (!isBoundedCount(value.closed) || !isBoundedCount(value.skipped)) return false;
+  if (value.tabPool !== undefined && !isTabPoolStatus(value.tabPool)) return false;
+  return (
+    value.error === undefined ||
+    (typeof value.error === "string" &&
+      value.error.trim().length >= 1 &&
+      value.error.length <= 1_000)
+  );
+}
+
+function isTabPoolStatus(value: unknown): value is TabPoolStatus {
+  if (!isRecord(value)) return false;
+  const keys = [
+    "managed",
+    "active",
+    "reusable",
+    "protected",
+    "borrowed",
+    "legacyCandidates",
+    "cleanupEligible",
+    "capacity",
+  ] as const;
+  if (
+    Object.keys(value).length !== keys.length ||
+    keys.some((key) => !isBoundedCount(value[key]))
+  ) {
+    return false;
+  }
+  const managed = Number(value.managed);
+  const capacity = Number(value.capacity);
+  return (
+    capacity >= 1 &&
+    capacity <= 32 &&
+    Number(value.active) <= managed &&
+    Number(value.reusable) <= managed &&
+    Number(value.protected) <= managed &&
+    Number(value.cleanupEligible) <= managed
+  );
+}
+
+function isBoundedCount(value: unknown) {
+  return Number.isInteger(value) && Number(value) >= 0 && Number(value) <= 10_000;
 }
 
 function isProjectSetupStatus(value: unknown) {

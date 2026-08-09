@@ -486,6 +486,11 @@ export class FakeChromeRelayHarness {
     this.releaseRestoredTabMessageResponses(tabId);
   }
 
+  emitAlarm(name: string) {
+    this.timeline.push(`alarms.onAlarm:${name}`);
+    this.alarmOnAlarm.emit({ name, scheduledTime: Date.now() });
+  }
+
   outboundEnvelopes(socket: FakeRelayWebSocket) {
     return socket.envelopesFromChrome();
   }
@@ -1188,7 +1193,7 @@ export class FakeChromeRelayHarness {
       windowId: tab.windowId,
       groupId: -1,
       url: tab.url,
-      pendingUrl: tab.url,
+      ...(tab.status === "loading" ? { pendingUrl: tab.url } : {}),
       status: tab.status,
     };
   }

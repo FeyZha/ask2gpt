@@ -3,10 +3,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const vscodeMock = vi.hoisted(() => ({
   documents: new Map<string, unknown>(),
   editors: [] as Array<{ selection?: unknown; revealRange: ReturnType<typeof vi.fn> }>,
+  notebookEditors: [] as Array<{
+    selection?: unknown;
+    selections: unknown[];
+    revealRange: ReturnType<typeof vi.fn>;
+  }>,
+  notebooks: new Map<string, unknown>(),
   executeCommand: vi.fn(),
+  openNotebookDocument: vi.fn(),
   openTextDocument: vi.fn(),
   showQuickPick: vi.fn(),
+  showNotebookDocument: vi.fn(),
   showTextDocument: vi.fn(),
+  visibleTextEditors: [] as unknown[],
 }));
 
 vi.mock("vscode", () => {
@@ -29,6 +38,13 @@ vi.mock("vscode", () => {
 
   class Selection extends Range {}
 
+  class NotebookRange {
+    constructor(
+      readonly start: number,
+      readonly end: number,
+    ) {}
+  }
+
   const parseUri = (value: string) => {
     const scheme = /^([A-Za-z][A-Za-z\d+.-]*):/u.exec(value)?.[1]?.toLowerCase();
     if (!scheme) throw new Error("Invalid URI");
@@ -49,14 +65,24 @@ vi.mock("vscode", () => {
     Position,
     Range,
     Selection,
+    NotebookRange,
+    NotebookCellKind: { Markup: 1, Code: 2 },
+    NotebookEditorRevealType: { InCenterIfOutsideViewport: 2 },
     TextEditorRevealType: { InCenterIfOutsideViewport: 2 },
     Uri: { parse: parseUri },
     commands: { executeCommand: vscodeMock.executeCommand },
     window: {
+      get visibleTextEditors() {
+        return vscodeMock.visibleTextEditors;
+      },
       showQuickPick: vscodeMock.showQuickPick,
+      showNotebookDocument: vscodeMock.showNotebookDocument,
       showTextDocument: vscodeMock.showTextDocument,
     },
-    workspace: { openTextDocument: vscodeMock.openTextDocument },
+    workspace: {
+      openNotebookDocument: vscodeMock.openNotebookDocument,
+      openTextDocument: vscodeMock.openTextDocument,
+    },
   };
 });
 
@@ -65,12 +91,16 @@ import * as vscode from "vscode";
 
 import { createFindRelatedTurnCommand } from "./find-related-turn-command";
 import { openAnswerSourceReferenceFromState, openAnswerSymbolFromState } from "./source-trace";
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "./source-anchor";
 import type { AppState } from "./types";
 
 describe("answer source trace", () => {
   beforeEach(() => {
     vscodeMock.documents.clear();
     vscodeMock.editors.length = 0;
+    vscodeMock.notebookEditors.length = 0;
+    vscodeMock.notebooks.clear();
+    vscodeMock.visibleTextEditors.length = 0;
     vscodeMock.executeCommand.mockReset().mockResolvedValue([]);
     vscodeMock.openTextDocument
       .mockReset()
@@ -79,10 +109,22 @@ describe("answer source trace", () => {
         if (!document) throw new Error(`Missing test document: ${uri.toString()}`);
         return document;
       });
+    vscodeMock.openNotebookDocument
+      .mockReset()
+      .mockImplementation(async (uri: { toString(): string }) => {
+        const notebook = vscodeMock.notebooks.get(uri.toString());
+        if (!notebook) throw new Error(`Missing test notebook: ${uri.toString()}`);
+        return notebook;
+      });
     vscodeMock.showQuickPick.mockReset().mockImplementation(async (items: unknown[]) => items[0]);
     vscodeMock.showTextDocument.mockReset().mockImplementation(async () => {
       const editor = { selection: undefined, revealRange: vi.fn() };
       vscodeMock.editors.push(editor);
+      return editor;
+    });
+    vscodeMock.showNotebookDocument.mockReset().mockImplementation(async () => {
+      const editor = { selection: undefined, selections: [], revealRange: vi.fn() };
+      vscodeMock.notebookEditors.push(editor);
       return editor;
     });
   });
@@ -589,6 +631,65 @@ describe("answer source trace", () => {
     ).rejects.toMatchObject({ code: "SOURCE_CONTEXT_UNTRUSTED" });
     expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
   });
+
+  it("maps a synthetic notebook attachment alias to its cell-local line", async () => {
+    const attached = notebookSourceContext("selected()", {
+      cellIndex: 3,
+      notebookVersion: 4,
+      range: { startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 10 },
+    });
+    registerNotebook(attached.uri, 4, ["one", "two", "three", "before\nother\nselected()"]);
+    const alias = "analysis.cell-004.L3-L3.py";
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", `The relevant call is ${alias}:1.`),
+    ]);
+
+    await openAnswerSourceReferenceFromState(state, "conversation-a", "answer", `${alias}:1`);
+
+    expect(vscodeMock.openNotebookDocument).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "/workspace/analysis.ipynb" }),
+    );
+    expect(vscodeMock.showNotebookDocument).toHaveBeenCalledOnce();
+    expect(lastNotebookEditor().selection).toMatchObject({ start: 3, end: 4 });
+    expect(lastNotebookEditor().revealRange).toHaveBeenCalledWith(
+      expect.objectContaining({ start: 3, end: 4 }),
+      2,
+    );
+    expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
+  });
+
+  it("runs document-symbol lookup on the resolved cell document and reveals the notebook", async () => {
+    const attached = notebookSourceContext("def compute(): pass", {
+      cellIndex: 1,
+      notebookVersion: 2,
+      scope: "cell",
+      range: { startLine: 0, startCharacter: 0, endLine: 0, endCharacter: 19 },
+    });
+    const notebook = registerNotebook(attached.uri, 2, ["before", attached.content]);
+    vscodeMock.executeCommand.mockResolvedValue([
+      { name: "compute", selectionRange: range(0, 4, 0, 11), children: [] },
+    ]);
+    const state = appState([
+      userMessage("question", [attached]),
+      assistantMessage("answer", "Review `compute()` here."),
+    ]);
+
+    await openAnswerSymbolFromState(state, "conversation-a", "answer", "compute()");
+
+    expect(vscodeMock.executeCommand).toHaveBeenCalledWith(
+      "vscode.executeDocumentSymbolProvider",
+      (notebook.cellAt(1).document as ReturnType<typeof notebookTextDocument>).uri,
+    );
+    expect(vscodeMock.showNotebookDocument).toHaveBeenCalledOnce();
+    expect(vscodeMock.showTextDocument).toHaveBeenCalledWith(
+      notebook.cellAt(1).document,
+      expect.objectContaining({
+        preserveFocus: false,
+        selection: range(0, 4, 0, 11),
+      }),
+    );
+  });
 });
 
 function sourceContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot {
@@ -605,6 +706,48 @@ function sourceContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapsho
     charCount: content.length,
     unsaved: false,
     ...overrides,
+  };
+}
+
+function notebookSourceContext(
+  content: string,
+  anchorOverrides: Partial<Extract<ContextSnapshot["sourceAnchor"], { formatVersion: 2 }>>,
+): ContextSnapshot {
+  const cellSource = anchorOverrides.scope === "cell" ? content : `before\nother\n${content}`;
+  const range = anchorOverrides.range ?? {
+    startLine: 0,
+    startCharacter: 0,
+    endLine: 0,
+    endCharacter: content.length,
+  };
+  return {
+    id: "notebook-context",
+    kind: "selection",
+    fileName: "analysis.ipynb",
+    uri: "file:///workspace/analysis.ipynb",
+    language: "python",
+    startLine: range.startLine + 1,
+    endLine: range.endLine + 1,
+    content,
+    charCount: content.length,
+    unsaved: false,
+    sourceAnchor: {
+      formatVersion: 2,
+      notebookUri: "file:///workspace/analysis.ipynb",
+      notebookType: "jupyter-notebook",
+      notebookVersion: 1,
+      cellIndex: 0,
+      cellKind: "code",
+      cellLanguage: "python",
+      scope: "range",
+      documentVersion: 1,
+      range,
+      contentSha256: sourceAnchorSha256(content),
+      normalizedContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(content)),
+      cellContentSha256: sourceAnchorSha256(cellSource),
+      normalizedCellContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(cellSource)),
+      ...anchorOverrides,
+    },
   };
 }
 
@@ -674,6 +817,69 @@ function registerDocument(uri: string, content: string) {
   vscodeMock.documents.set(uri, textDocument(content));
 }
 
+function registerNotebook(uri: string, version: number, sources: string[]) {
+  const notebook = {
+    uri: testUri(uri),
+    notebookType: "jupyter-notebook",
+    version,
+    cellCount: sources.length,
+    cells: [] as Array<{ index: number; notebook: unknown; kind: number; document: unknown }>,
+    cellAt(index: number) {
+      return this.cells[index]!;
+    },
+    getCells() {
+      return this.cells;
+    },
+  };
+  notebook.cells = sources.map((content, index) => ({
+    index,
+    notebook,
+    kind: 2,
+    document: notebookTextDocument(
+      content,
+      `vscode-notebook-cell:///workspace/analysis.ipynb#cell-${index}`,
+    ),
+  }));
+  vscodeMock.notebooks.set(uri, notebook);
+  return notebook;
+}
+
+function notebookTextDocument(content: string, uri: string) {
+  const lines = content.split("\n");
+  const offsets: number[] = [];
+  let next = 0;
+  for (const line of lines) {
+    offsets.push(next);
+    next += line.length + 1;
+  }
+  const offsetAt = (position: { line: number; character: number }) =>
+    Math.min(content.length, offsets[position.line]! + position.character);
+  return {
+    uri: testUri(uri),
+    version: 1,
+    languageId: "python",
+    lineCount: lines.length,
+    lineAt: (line: number) => ({
+      text: lines[line]!,
+      range: range(line, 0, line, lines[line]!.length),
+    }),
+    getText: (selected?: {
+      start: { line: number; character: number };
+      end: { line: number; character: number };
+    }) => (selected ? content.slice(offsetAt(selected.start), offsetAt(selected.end)) : content),
+    positionAt: (offset: number) => {
+      const bounded = Math.max(0, Math.min(offset, content.length));
+      let line = 0;
+      while (line + 1 < offsets.length && offsets[line + 1]! <= bounded) line += 1;
+      return new vscode.Position(line, bounded - offsets[line]!);
+    },
+  };
+}
+
+function testUri(value: string) {
+  return { scheme: value.split(":", 1)[0], path: value, toString: () => value };
+}
+
 function textDocument(content: string) {
   const lines = content.split("\n");
   const lineOffsets: number[] = [];
@@ -720,4 +926,8 @@ function sixLines() {
 
 function lastEditor() {
   return vscodeMock.editors.at(-1)!;
+}
+
+function lastNotebookEditor() {
+  return vscodeMock.notebookEditors.at(-1)!;
 }

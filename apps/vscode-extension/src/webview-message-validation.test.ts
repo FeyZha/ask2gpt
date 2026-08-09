@@ -95,6 +95,9 @@ describe("parseWebviewMessage", () => {
       parseWebviewMessage({ type: "attachSelection", conversationId: "conversation-1" }),
     ).toEqual({ type: "attachSelection", conversationId: "conversation-1" });
     expect(
+      parseWebviewMessage({ type: "attachNotebookCell", conversationId: "conversation-1" }),
+    ).toEqual({ type: "attachNotebookCell", conversationId: "conversation-1" });
+    expect(
       parseWebviewMessage({ type: "archiveConversation", conversationId: "conversation-1" }),
     ).toEqual({ type: "archiveConversation", conversationId: "conversation-1" });
     expect(
@@ -292,6 +295,14 @@ describe("parseWebviewMessage", () => {
     expect(parseWebviewMessage({ type: "copy", text: 42 })).toBeUndefined();
     expect(parseWebviewMessage({ type: "attachFiles" })).toBeUndefined();
     expect(parseWebviewMessage({ type: "attachSelection" })).toBeUndefined();
+    expect(parseWebviewMessage({ type: "attachNotebookCell" })).toBeUndefined();
+    expect(
+      parseWebviewMessage({
+        type: "attachNotebookCell",
+        conversationId: "conversation-1",
+        notebookUri: "vscode-notebook-cell:/forged",
+      }),
+    ).toBeUndefined();
     expect(
       parseWebviewMessage({ type: "attachSelection", conversationId: "../conversation" }),
     ).toBeUndefined();

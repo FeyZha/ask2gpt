@@ -1134,6 +1134,21 @@ a:focus-visible {
   white-space: nowrap;
 }
 
+.sent-context__open--notebook .sent-context__line-range {
+  max-width: 46%;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground, var(--panel-muted));
+  text-overflow: ellipsis;
+}
+
+.sent-context--notebook .sent-context__header {
+  background: color-mix(
+    in srgb,
+    var(--vscode-textLink-foreground, var(--vscode-foreground)) 4%,
+    transparent
+  );
+}
+
 .sent-context__open .sent-context__trace-label {
   flex: none;
   padding: 1px 5px;
@@ -2012,6 +2027,16 @@ a:focus-visible {
   flex: 0 1 min(240px, calc(100vw - 78px));
 }
 
+.context-chip--notebook:first-child {
+  max-width: min(300px, calc(100vw - 78px));
+  flex-basis: min(300px, calc(100vw - 78px));
+  background: color-mix(
+    in srgb,
+    var(--vscode-textLink-foreground, var(--vscode-foreground)) 5%,
+    transparent
+  );
+}
+
 .context-chip:hover,
 .context-chip:focus-within {
   border-color: var(--panel-border-strong);
@@ -2043,6 +2068,16 @@ a:focus-visible {
 
 .context-chip__icon svg {
   width: 14px;
+}
+
+.context-chip--notebook .context-chip__icon,
+.context-row--notebook .context-row__icon {
+  background: color-mix(
+    in srgb,
+    var(--vscode-textLink-foreground, var(--vscode-foreground)) 12%,
+    transparent
+  );
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
 }
 
 .context-chip__copy {
@@ -3017,6 +3052,7 @@ a:focus-visible {
   }
 
   .context-row,
+  .context-chip,
   .sent-context__header,
   .user-copy {
     border: 1px solid CanvasText;

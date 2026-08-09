@@ -1,6 +1,6 @@
-import type { ContextKind } from "@ask2gpt/protocol";
+import type { ContextKind, NotebookSourceAnchorV2 } from "@ask2gpt/protocol";
 
-import type { SelectionReference } from "./selection-reference";
+import type { NotebookCellReference, SelectionReference } from "./selection-reference";
 import type { AppState } from "./types";
 
 const URI_MATCH_SCORE = 1_000;
@@ -59,27 +59,40 @@ export interface ConversationTraceMatch {
  */
 export function findConversationTraceMatches(
   state: Pick<AppState, "conversations">,
-  reference: SelectionReference,
+  reference: SelectionReference | NotebookCellReference,
   selectedContent: string,
 ): ConversationTraceMatch[] {
   if (!isValidSelection(reference) || selectedContent.length === 0) return [];
 
-  const selectedRange = selectionLineRange(reference);
+  const selectedRange = selectionLineRange(reference, selectedContent);
   const matches: ConversationTraceMatch[] = [];
 
   for (const conversation of state.conversations) {
     for (const message of conversation.messages) {
       if (message.role !== "user") continue;
       for (const context of message.contexts ?? []) {
-        if (context.uri !== reference.uri) continue;
+        const notebookAnchor =
+          context.sourceAnchor?.formatVersion === 2 ? context.sourceAnchor : undefined;
+        if (isNotebookCellReference(reference)) {
+          if (
+            !notebookAnchor ||
+            context.uri !== reference.notebookUri ||
+            !notebookReferenceMatchesAnchor(reference, notebookAnchor)
+          ) {
+            continue;
+          }
+        } else if (notebookAnchor || context.uri !== reference.uri) {
+          continue;
+        }
 
         const overlap = lineRangeOverlap(selectedRange, context);
         const contentMatch = classifyContentMatch(context.content, selectedContent);
         if (contentMatch === "none") continue;
 
-        const exactRange =
-          context.startLine === selectedRange.startLine &&
-          context.endLine === selectedRange.endLine;
+        const exactRange = isNotebookCellReference(reference)
+          ? notebookRangeMatches(reference, notebookAnchor!)
+          : context.startLine === selectedRange.startLine &&
+            context.endLine === selectedRange.endLine;
         const score = traceScore(
           context.kind,
           contentMatch,
@@ -119,7 +132,23 @@ export function findConversationTraceMatches(
   return matches.sort(compareTraceMatches);
 }
 
-function isValidSelection(reference: SelectionReference) {
+function isValidSelection(reference: SelectionReference | NotebookCellReference) {
+  if (isNotebookCellReference(reference)) {
+    if (
+      reference.notebookUri.length === 0 ||
+      reference.notebookType.length === 0 ||
+      !Number.isInteger(reference.notebookVersion) ||
+      reference.notebookVersion < 0 ||
+      !Number.isInteger(reference.cellIndex) ||
+      reference.cellIndex < 0 ||
+      reference.cellContentSha256.length === 0 ||
+      reference.normalizedCellContentSha256.length === 0
+    ) {
+      return false;
+    }
+    if (reference.scope === "cell") return true;
+  }
+
   const coordinates = [
     reference.startLine,
     reference.startCharacter,
@@ -127,9 +156,9 @@ function isValidSelection(reference: SelectionReference) {
     reference.endCharacter,
   ];
   if (
-    reference.uri.length === 0 ||
-    !Number.isInteger(reference.documentVersion) ||
-    reference.documentVersion < 0 ||
+    (!isNotebookCellReference(reference) && reference.uri.length === 0) ||
+    (!isNotebookCellReference(reference) &&
+      (!Number.isInteger(reference.documentVersion) || reference.documentVersion < 0)) ||
     coordinates.some((coordinate) => !Number.isInteger(coordinate) || coordinate < 0)
   ) {
     return false;
@@ -140,7 +169,13 @@ function isValidSelection(reference: SelectionReference) {
   );
 }
 
-function selectionLineRange(reference: SelectionReference) {
+function selectionLineRange(
+  reference: SelectionReference | NotebookCellReference,
+  selectedContent: string,
+) {
+  if (isNotebookCellReference(reference) && reference.scope === "cell") {
+    return { startLine: 1, endLine: selectedContent.split(/\r\n?|\n/u).length };
+  }
   return {
     startLine: reference.startLine + 1,
     // Match ContextService's inclusive, one-based snapshot range when a
@@ -150,6 +185,65 @@ function selectionLineRange(reference: SelectionReference) {
         ? reference.endLine
         : reference.endLine + 1,
   };
+}
+
+function isNotebookCellReference(
+  reference: SelectionReference | NotebookCellReference,
+): reference is NotebookCellReference {
+  return "type" in reference && reference.type === "notebook-cell";
+}
+
+function notebookReferenceMatchesAnchor(
+  reference: NotebookCellReference,
+  anchor: NotebookSourceAnchorV2,
+) {
+  if (
+    anchor.notebookUri !== reference.notebookUri ||
+    anchor.notebookType !== reference.notebookType ||
+    anchor.cellKind !== reference.cellKind ||
+    anchor.cellLanguage !== reference.cellLanguage ||
+    (anchor.cellContentSha256 !== reference.cellContentSha256 &&
+      anchor.normalizedCellContentSha256 !== reference.normalizedCellContentSha256)
+  ) {
+    return false;
+  }
+
+  if (
+    anchor.notebookVersion === reference.notebookVersion &&
+    anchor.cellIndex === reference.cellIndex
+  ) {
+    return true;
+  }
+
+  const capturedNeighbors = [
+    [anchor.beforeCellSha256, reference.beforeCellSha256],
+    [anchor.afterCellSha256, reference.afterCellSha256],
+  ].filter(([captured]) => captured !== undefined);
+
+  // Notebook versions also change for edits outside this cell (and for some
+  // provider-managed state). Stable source at the stable index is sufficient
+  // identity for a single-cell notebook. When capture-time neighbors exist,
+  // require them to remain stable so an equal-source duplicate cannot silently
+  // replace the original cell at that index.
+  if (anchor.cellIndex === reference.cellIndex) {
+    return capturedNeighbors.every(([captured, current]) => captured === current);
+  }
+
+  return (
+    capturedNeighbors.length > 0 &&
+    capturedNeighbors.every(([captured, current]) => captured === current)
+  );
+}
+
+function notebookRangeMatches(reference: NotebookCellReference, anchor: NotebookSourceAnchorV2) {
+  return (
+    reference.scope === anchor.scope &&
+    (reference.scope === "cell" ||
+      (reference.startLine === anchor.range.startLine &&
+        reference.startCharacter === anchor.range.startCharacter &&
+        reference.endLine === anchor.range.endLine &&
+        reference.endCharacter === anchor.range.endCharacter))
+  );
 }
 
 function lineRangeOverlap(

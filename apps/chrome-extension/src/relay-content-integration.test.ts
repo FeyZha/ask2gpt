@@ -130,6 +130,1380 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     ).toBe(4);
   }, 12_000);
 
+  describe("managed ChatGPT tab pool", () => {
+    it("releases an attested idle page and reuses that exact tab for the next conversation", async () => {
+      const { harness, socket, tab } = await startRestoredManagedPoolHarness({ idle: true });
+
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      const released = await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+      expect(released.payload).toMatchObject({ purpose: "view", reason: "inactive" });
+      await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+        idleSince: expect.any(String),
+        provenance: "created",
+        tabId: tab.id,
+      });
+
+      const nextConversationId = "conversation-pool-next";
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      await waitUntil(() => harness.tabsById.get(tab.id)?.url === REMOTE_B, 5_000).catch(() => {
+        throw new Error(
+          `Released page was not reused. Tabs: ${JSON.stringify([...harness.tabsById.values()])} Records: ${JSON.stringify(conversationTabRecords(harness))} Timeline: ${JSON.stringify(harness.timeline)}`,
+        );
+      });
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        leaseEpoch: 2,
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: tab.id,
+      });
+
+      expect(
+        [...harness.tabsById.values()].filter((candidate) =>
+          candidate.url.startsWith("https://chatgpt.com/"),
+        ),
+      ).toHaveLength(1);
+      expect(conversationTabRecords(harness)).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ conversationId: CONVERSATION_ID })]),
+      );
+      expect(
+        harness.timeline.some(
+          (entry) => entry === `tabs.sendMessage:request:${tab.id}:content.inspectIdleState`,
+        ),
+      ).toBe(true);
+    }, 15_000);
+
+    it("does not reuse a released page whose composer is dirty", async () => {
+      const { harness, socket, tab } = await startRestoredManagedPoolHarness({
+        idle: false,
+        blocker: "composer-not-empty",
+      });
+
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+      expect(
+        harness.timeline.some(
+          (entry) => entry === `tabs.sendMessage:request:${tab.id}:content.inspectIdleState`,
+        ),
+      ).toBe(true);
+
+      const nextConversationId = "conversation-dirty-overflow";
+      const nextTabPromise = harness.waitForCreatedTab(2);
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      const nextTab = await nextTabPromise;
+      installManagedPoolResponder(harness, nextTab.id, { idle: true });
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: nextTab.id,
+      });
+
+      expect(nextTab.id).not.toBe(tab.id);
+      expect(harness.tabsById.get(tab.id)?.url).toBe(PROJECT_ROOT);
+      expect(conversationTabRecords(harness)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ conversationId: CONVERSATION_ID, tabId: tab.id }),
+          expect.objectContaining({ conversationId: nextConversationId, tabId: nextTab.id }),
+        ]),
+      );
+    }, 15_000);
+
+    it("does not reuse a released page while its run is active", async () => {
+      const { harness, socket, tab } = await startHarness();
+      await chrome.tabs.create({ url: "https://example.test/user-work", active: true });
+      installManagedPoolResponder(harness, tab.id, { idle: true });
+      await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+        provenance: "created",
+        tabId: tab.id,
+      });
+
+      socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+      await waitUntil(
+        () =>
+          (harness.sessionValue("activeRunsV2") as Array<{ runId?: string }> | undefined)?.some(
+            (run) => run.runId === FIRST_RUN_ID,
+          ) === true,
+        8_000,
+      );
+
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+
+      const nextConversationId = "conversation-active-overflow";
+      const nextTabPromise = harness.waitForCreatedTab(2);
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      const nextTab = await nextTabPromise;
+      installManagedPoolResponder(harness, nextTab.id, { idle: true });
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: nextTab.id,
+      });
+
+      expect(nextTab.id).not.toBe(tab.id);
+      expect(
+        (harness.sessionValue("activeRunsV2") as Array<{ runId?: string }> | undefined)?.some(
+          (run) => run.runId === FIRST_RUN_ID,
+        ),
+      ).toBe(true);
+    }, 20_000);
+
+    it("does not reuse a page when a send starts while its idle proof is in flight", async () => {
+      const fixture = await startManagedLifecycleHarness([
+        {
+          conversationId: CONVERSATION_ID,
+          url: PROJECT_ROOT,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 20,
+          lastUsedMinutesAgo: 20,
+        },
+      ]);
+      const socket = fixture.socket!;
+      const previousTab = fixture.tabs.get(CONVERSATION_ID)!;
+      const idleProof = fixture.harness.pauseNextTabMessageResponseWhile(
+        previousTab.id,
+        "hidden",
+        (message) => isMessageType(message, "content.inspectIdleState"),
+      );
+      const nextConversationId = "conversation-proof-race";
+      const nextTabPromise = fixture.harness.waitForCreatedTab(2);
+
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      await idleProof.entered;
+      socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+      await waitUntil(
+        () =>
+          (
+            fixture.harness.sessionValue("activeRunsV2") as Array<{ runId?: string }> | undefined
+          )?.some((run) => run.runId === FIRST_RUN_ID) === true,
+        8_000,
+      );
+      idleProof.resume();
+
+      const nextTab = await nextTabPromise;
+      installManagedPoolResponder(fixture.harness, nextTab.id, { idle: true });
+      await waitForConversationTabRecord(fixture.harness, nextConversationId, {
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: nextTab.id,
+      });
+
+      expect(nextTab.id).not.toBe(previousTab.id);
+      expect(fixture.harness.tabsById.has(previousTab.id)).toBe(true);
+      expect(conversationTabRecords(fixture.harness)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            conversationId: CONVERSATION_ID,
+            leaseEpoch: 1,
+            tabId: previousTab.id,
+          }),
+        ]),
+      );
+    }, 20_000);
+
+    it("does not reuse a page when a terminal commits during final idle revalidation", async () => {
+      const fixture = await startManagedLifecycleHarness([
+        {
+          conversationId: CONVERSATION_ID,
+          url: PROJECT_ROOT,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 20,
+          lastUsedMinutesAgo: 20,
+        },
+      ]);
+      const socket = fixture.socket!;
+      socket.onChromeEnvelope = undefined;
+      const previousTab = fixture.tabs.get(CONVERSATION_ID)!;
+      await fixture.harness.importContentScript(previousTab.id, async () => undefined);
+      let finalPageCheck: { entered: Promise<void>; release: () => void } | undefined;
+      fixture.harness.afterTabMessage = (tabId, message) => {
+        if (
+          !finalPageCheck &&
+          tabId === previousTab.id &&
+          isMessageType(message, "content.inspectIdleState")
+        ) {
+          finalPageCheck = fixture.harness.pauseNextTabGet(previousTab.id);
+        }
+      };
+      const nextConversationId = "conversation-terminal-proof-race";
+      const nextTabPromise = fixture.harness.waitForCreatedTab(2);
+
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      await waitUntil(() => finalPageCheck !== undefined, 5_000);
+      await finalPageCheck!.entered;
+      socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+      await waitUntil(
+        () =>
+          (
+            fixture.harness.sessionValue("activeRunsV2") as
+              Array<{ phase?: string; runId?: string }> | undefined
+          )?.some((run) => run.runId === FIRST_RUN_ID && run.phase === "active") === true,
+        8_000,
+      );
+
+      const terminal = chrome.runtime.sendMessage({
+        type: "content.event",
+        eventType: "error",
+        conversationId: CONVERSATION_ID,
+        runId: FIRST_RUN_ID,
+        error: {
+          code: "SELECTOR_INCOMPATIBLE",
+          message: "Synthetic terminal committed during idle revalidation.",
+          recoverable: true,
+          focusTab: false,
+        },
+      });
+      await fixture.harness.waitForEnvelope(
+        socket,
+        (envelope) => envelope.type === "relay.error" && envelope.runId === FIRST_RUN_ID,
+      );
+      await expect(terminal).resolves.toEqual({ ok: true });
+      await waitUntil(
+        () =>
+          (
+            fixture.harness.sessionValue("pendingEventsV2") as
+              Array<{ event?: { runId?: string } }> | undefined
+          )?.some((pending) => pending.event?.runId === FIRST_RUN_ID) === true,
+        8_000,
+      );
+      finalPageCheck!.release();
+
+      const nextTab = await nextTabPromise;
+      installManagedPoolResponder(fixture.harness, nextTab.id, { idle: true });
+      await waitForConversationTabRecord(fixture.harness, nextConversationId, {
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: nextTab.id,
+      });
+
+      expect(nextTab.id).not.toBe(previousTab.id);
+      expect(fixture.harness.tabsById.has(previousTab.id)).toBe(true);
+      expect(conversationTabRecords(fixture.harness)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            conversationId: CONVERSATION_ID,
+            leaseEpoch: 1,
+            tabId: previousTab.id,
+          }),
+        ]),
+      );
+    }, 20_000);
+
+    it("does not reuse a released page while its terminal event is unacknowledged", async () => {
+      vi.resetModules();
+      const harness = new FakeChromeRelayHarness();
+      harness.installGlobals();
+      seedProjectBinding(harness);
+      const tab = await chrome.tabs.create({ url: REMOTE_A, active: false });
+      if (tab.id === undefined) throw new Error("Fake Chrome did not create a managed tab.");
+      installManagedPoolResponder(harness, tab.id, { idle: true });
+      const restoredAt = "2026-08-09T00:00:00.000Z";
+      harness.seedSessionValue("conversationTabsV2", [
+        {
+          owned: true,
+          instanceId: INSTANCE_ID,
+          conversationId: CONVERSATION_ID,
+          tabId: tab.id,
+          remoteUrl: REMOTE_A,
+          projectScope: PROJECT_SCOPE,
+          createdAt: restoredAt,
+          provenance: "created",
+          leaseEpoch: 1,
+          lastUsedAt: restoredAt,
+        },
+      ]);
+      harness.seedSessionValue("pendingEventsV2", [
+        {
+          eventId: "pool-terminal-unacknowledged",
+          instanceId: INSTANCE_ID,
+          tabId: tab.id,
+          startedAt: restoredAt,
+          event: {
+            type: "content.event",
+            eventType: "complete",
+            conversationId: CONVERSATION_ID,
+            runId: FIRST_RUN_ID,
+            markdown: "Committed answer awaiting Host acknowledgement",
+            remoteUrl: REMOTE_A,
+          },
+        },
+      ]);
+      await harness.importServiceWorker(async () => await import("./service-worker"));
+      const socket = await harness.waitForSocket();
+      await connectFakeVsCodeHost(harness, socket, { acknowledgeTerminals: false });
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) => envelope.type === "generation.complete" && envelope.runId === FIRST_RUN_ID,
+      );
+
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+
+      const nextConversationId = "conversation-terminal-overflow";
+      const nextTabPromise = harness.waitForCreatedTab(1);
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      const nextTab = await nextTabPromise;
+      installManagedPoolResponder(harness, nextTab.id, { idle: true });
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: nextTab.id,
+      });
+
+      expect(nextTab.id).not.toBe(tab.id);
+      expect(
+        (harness.sessionValue("pendingEventsV2") as Array<{ eventId?: string }> | undefined)?.some(
+          (event) => event.eventId === "pool-terminal-unacknowledged",
+        ),
+      ).toBe(true);
+    }, 15_000);
+
+    it("keeps an adopted exact conversation tab open when the logical conversation closes", async () => {
+      vi.resetModules();
+      const harness = new FakeChromeRelayHarness();
+      harness.installGlobals();
+      seedProjectBinding(harness);
+      const adoptedTab = await chrome.tabs.create({ url: REMOTE_A, active: false });
+      if (adoptedTab.id === undefined)
+        throw new Error("Fake Chrome did not create an adopted tab.");
+      installManagedPoolResponder(harness, adoptedTab.id, { idle: true });
+      await harness.importServiceWorker(async () => await import("./service-worker"));
+      const socket = await harness.waitForSocket();
+      await connectFakeVsCodeHost(harness, socket);
+
+      socket.deliverFromHost(openEnvelope(CONVERSATION_ID, REMOTE_A));
+      await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+        owned: false,
+        provenance: "borrowed",
+        remoteUrl: REMOTE_A,
+        tabId: adoptedTab.id,
+      });
+
+      const close = makeEnvelope({
+        type: "conversation.close",
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        payload: { closeTab: true },
+      });
+      socket.deliverFromHost(close);
+      const closed = await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.closed" &&
+          (envelope.payload as { requestId?: string }).requestId === close.id,
+      );
+
+      expect(closed.payload).toMatchObject({ closeTab: true, tabDisposition: "left-open" });
+      expect(harness.tabsById.get(adoptedTab.id)?.url).toBe(REMOTE_A);
+      expect(conversationTabRecords(harness)).toEqual([]);
+    }, 12_000);
+
+    it.each([
+      { label: "borrowed", owned: false, provenance: "borrowed" as const },
+      { label: "legacy-unknown", owned: true, provenance: undefined },
+    ])(
+      "preserves a drifted $label page and reallocates the lease onto a Relay-created page",
+      async ({ owned, provenance }) => {
+        vi.resetModules();
+        const harness = new FakeChromeRelayHarness();
+        harness.installGlobals();
+        seedProjectBinding(harness);
+        const userTab = await chrome.tabs.create({ url: REMOTE_A, active: false });
+        if (userTab.id === undefined) throw new Error("Fake Chrome did not create the user tab.");
+        installManagedPoolResponder(harness, userTab.id, { idle: true });
+        const restoredAt = new Date().toISOString();
+        harness.seedSessionValue("conversationTabsV2", [
+          {
+            owned,
+            instanceId: INSTANCE_ID,
+            conversationId: CONVERSATION_ID,
+            tabId: userTab.id,
+            remoteUrl: REMOTE_A,
+            projectScope: PROJECT_SCOPE,
+            createdAt: restoredAt,
+            ...(provenance ? { provenance } : {}),
+            leaseEpoch: 1,
+            lastUsedAt: restoredAt,
+          },
+        ]);
+        await harness.importServiceWorker(async () => await import("./service-worker"));
+        const socket = await harness.waitForSocket();
+        await connectFakeVsCodeHost(harness, socket);
+        harness.setTabUrl(userTab.id, REMOTE_B);
+        harness.timeline.length = 0;
+
+        const replacementPromise = harness.waitForCreatedTab(1);
+        socket.deliverFromHost(openEnvelope(CONVERSATION_ID, REMOTE_A));
+        const replacement = await replacementPromise;
+        installManagedPoolResponder(harness, replacement.id, { idle: true });
+        await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+          provenance: "created",
+          remoteUrl: REMOTE_A,
+          tabId: replacement.id,
+        });
+
+        expect(replacement.id).not.toBe(userTab.id);
+        expect(harness.tabsById.get(userTab.id)?.url).toBe(REMOTE_B);
+        expect(harness.timeline).not.toContain(`tabs.reload:${userTab.id}`);
+      },
+      15_000,
+    );
+
+    it("keeps three concurrent leases isolated and overflows instead of stealing one", async () => {
+      vi.resetModules();
+      const harness = new FakeChromeRelayHarness();
+      harness.installGlobals();
+      seedProjectBinding(harness);
+      await harness.importServiceWorker(async () => await import("./service-worker"));
+      const socket = await harness.waitForSocket();
+      await connectFakeVsCodeHost(harness, socket);
+
+      const conversations = [
+        ["conversation-concurrent-a", REMOTE_A],
+        ["conversation-concurrent-b", REMOTE_B],
+        ["conversation-concurrent-c", REMOTE_C],
+      ] as const;
+      const installedTabIds = new Set<number>();
+      for (const [conversationId, remoteUrl] of conversations) {
+        socket.deliverFromHost(openEnvelope(conversationId, remoteUrl));
+      }
+      await installManagedPoolRespondersUntil(harness, 3, installedTabIds);
+      await waitUntil(
+        () =>
+          conversations.every(([conversationId]) =>
+            conversationTabRecords(harness).some(
+              (record) => record.conversationId === conversationId,
+            ),
+          ),
+        8_000,
+      );
+
+      const firstThree = conversationTabRecords(harness).filter((record) =>
+        conversations.some(([conversationId]) => conversationId === record.conversationId),
+      );
+      expect(firstThree).toHaveLength(3);
+      expect(new Set(firstThree.map((record) => record.tabId)).size).toBe(3);
+      expect(new Set(firstThree.map((record) => record.remoteUrl))).toEqual(
+        new Set([REMOTE_A, REMOTE_B, REMOTE_C]),
+      );
+
+      const overflowConversationId = "conversation-concurrent-overflow";
+      const overflowRemoteUrl = `${PROJECT_SCOPE}c/remote-overflow`;
+      socket.deliverFromHost(openEnvelope(overflowConversationId, overflowRemoteUrl));
+      await installManagedPoolRespondersUntil(harness, 4, installedTabIds);
+      await waitForConversationTabRecord(harness, overflowConversationId, {
+        provenance: "created",
+        remoteUrl: overflowRemoteUrl,
+      });
+
+      expect(harness.tabsById.size).toBe(4);
+      for (const [conversationId, remoteUrl] of conversations) {
+        expect(conversationTabRecords(harness)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ conversationId, remoteUrl, provenance: "created" }),
+          ]),
+        );
+      }
+    }, 20_000);
+
+    it("reuses a freshly released page after its detached prewarm settles", async () => {
+      const { harness, socket, tab } = await startHarness();
+      await chrome.tabs.create({ url: "https://example.test/user-work", active: true });
+      installManagedPoolResponder(harness, tab.id, { idle: true });
+      await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+        provenance: "created",
+        tabId: tab.id,
+      });
+
+      const release = releaseEnvelope(CONVERSATION_ID);
+      const nextConversationId = "conversation-fast-release-next";
+      const startedAt = performance.now();
+      socket.deliverFromHost(release);
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+
+      await waitUntil(() => harness.tabsById.get(tab.id)?.url === REMOTE_B, 1_500).catch(() => {
+        throw new Error(
+          `Fresh release did not reuse its page. Tabs: ${JSON.stringify([...harness.tabsById.values()])} Records: ${JSON.stringify(conversationTabRecords(harness))} Timeline: ${JSON.stringify(harness.timeline)}`,
+        );
+      });
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        leaseEpoch: 2,
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: tab.id,
+      });
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+      expect(
+        [...harness.tabsById.values()].filter((candidate) =>
+          candidate.url.startsWith("https://chatgpt.com/"),
+        ),
+      ).toHaveLength(1);
+    }, 12_000);
+
+    it("restores a release requested during a run and idles it immediately after terminal ACK", async () => {
+      vi.resetModules();
+      const harness = new FakeChromeRelayHarness();
+      harness.installGlobals();
+      seedProjectBinding(harness);
+      const tab = await chrome.tabs.create({ url: REMOTE_A, active: false });
+      if (tab.id === undefined) throw new Error("Fake Chrome did not create a managed tab.");
+      await chrome.tabs.create({ url: "https://example.test/user-work", active: true });
+      installManagedPoolResponder(harness, tab.id, { idle: true });
+      const restoredAt = "2026-08-09T00:00:00.000Z";
+      const releaseRequestedAt = "2026-08-09T00:01:00.000Z";
+      harness.seedSessionValue("conversationTabsV2", [
+        {
+          owned: true,
+          instanceId: INSTANCE_ID,
+          conversationId: CONVERSATION_ID,
+          tabId: tab.id,
+          remoteUrl: REMOTE_A,
+          projectScope: PROJECT_SCOPE,
+          createdAt: restoredAt,
+          provenance: "created",
+          leaseEpoch: 1,
+          lastUsedAt: restoredAt,
+          releaseRequestedAt,
+        },
+      ]);
+      harness.seedSessionValue("activeRunsV2", [
+        {
+          instanceId: INSTANCE_ID,
+          conversationId: CONVERSATION_ID,
+          runId: FIRST_RUN_ID,
+          tabId: tab.id,
+          phase: "active",
+          remoteAdoptionStage: "locked",
+          startedAt: restoredAt,
+        },
+      ]);
+      harness.seedSessionValue("pendingEventsV2", [
+        {
+          eventId: "released-terminal-after-restart",
+          instanceId: INSTANCE_ID,
+          tabId: tab.id,
+          startedAt: releaseRequestedAt,
+          event: {
+            type: "content.event",
+            eventType: "stopped",
+            conversationId: CONVERSATION_ID,
+            runId: FIRST_RUN_ID,
+            markdown: "Partial answer",
+            remoteUrl: REMOTE_A,
+          },
+        },
+      ]);
+      await harness.importServiceWorker(async () => await import("./service-worker"));
+      const socket = await harness.waitForSocket();
+      await connectFakeVsCodeHost(harness, socket, { acknowledgeTerminals: false });
+      const stopped = await harness.waitForEnvelope(
+        socket,
+        (envelope) => envelope.type === "generation.stopped" && envelope.runId === FIRST_RUN_ID,
+      );
+
+      expect(conversationTabRecords(harness)).toEqual([
+        expect.objectContaining({ releaseRequestedAt }),
+      ]);
+      expect(conversationTabRecords(harness)[0]?.idleSince).toBeUndefined();
+      socket.deliverFromHost(
+        makeEnvelope({
+          type: "generation.ack",
+          instanceId: INSTANCE_ID,
+          conversationId: CONVERSATION_ID,
+          runId: FIRST_RUN_ID,
+          payload: { eventId: stopped.id, acknowledgedAt: new Date().toISOString() },
+        }),
+      );
+      await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+        idleSince: expect.any(String),
+        tabId: tab.id,
+      });
+      expect(conversationTabRecords(harness)[0]?.releaseRequestedAt).toBeUndefined();
+
+      const nextConversationId = "conversation-terminal-reuse";
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        leaseEpoch: 2,
+        remoteUrl: REMOTE_B,
+        tabId: tab.id,
+      });
+    }, 15_000);
+
+    it("does not rebuild A's release intent on B after reuse and a worker restart", async () => {
+      const { harness, socket, tab } = await startRestoredManagedPoolHarness({ idle: true });
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+
+      const conversationB = "conversation-reused-before-restart";
+      socket.deliverFromHost(openEnvelope(conversationB, REMOTE_B));
+      await waitForConversationTabRecord(harness, conversationB, {
+        leaseEpoch: 2,
+        remoteUrl: REMOTE_B,
+        tabId: tab.id,
+      });
+      expect(conversationTabRecords(harness)[0]?.releaseRequestedAt).toBeUndefined();
+
+      vi.resetModules();
+      harness.installGlobals();
+      await harness.importServiceWorker(async () => await import("./service-worker"));
+      const restartedSocket = await harness.waitForSocket();
+      await connectFakeVsCodeHost(harness, restartedSocket);
+      await waitForConversationTabRecord(harness, conversationB, {
+        leaseEpoch: 2,
+        remoteUrl: REMOTE_B,
+        tabId: tab.id,
+      });
+      expect(conversationTabRecords(harness)[0]?.releaseRequestedAt).toBeUndefined();
+
+      const createdAfterRestart = harness.waitForCreatedTab(2);
+      socket.close();
+      restartedSocket.deliverFromHost(
+        openEnvelope("conversation-not-allowed-to-steal-b", REMOTE_C),
+      );
+      const newTab = await createdAfterRestart;
+      installManagedPoolResponder(harness, newTab.id, { idle: true });
+      expect(newTab.id).not.toBe(tab.id);
+    }, 20_000);
+
+    it("rolls back a failed release checkpoint without closing the authenticated socket", async () => {
+      const { harness, socket } = await startRestoredManagedPoolHarness({ idle: true });
+      const sessionWrite = vi
+        .spyOn(chrome.storage.session, "set")
+        .mockRejectedValueOnce(new Error("session write failed"));
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      const error = await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "relay.error" && envelope.conversationId === CONVERSATION_ID,
+      );
+      sessionWrite.mockRestore();
+
+      expect(error.payload).toMatchObject({ code: "INTERNAL_ERROR", recoverable: true });
+      expect(socket.readyState).toBe(FakeRelayWebSocket.OPEN);
+      expect(conversationTabRecords(harness)[0]).not.toHaveProperty("releaseRequestedAt");
+      expect(conversationTabRecords(harness)[0]).not.toHaveProperty("idleSince");
+      expect(
+        harness
+          .outboundEnvelopes(socket)
+          .some(
+            (envelope) =>
+              envelope.type === "conversation.released" &&
+              (envelope.payload as { requestId?: string }).requestId === release.id,
+          ),
+      ).toBe(false);
+    }, 12_000);
+
+    it("popup cleanup closes only idle attested created pages", async () => {
+      const fixture = await startManagedLifecycleHarness(
+        [
+          {
+            conversationId: "cleanup-idle-created",
+            url: PROJECT_ROOT,
+            provenance: "created",
+            idleState: { idle: true },
+            idleMinutesAgo: 20,
+          },
+          {
+            conversationId: "cleanup-dirty-created",
+            url: REMOTE_B,
+            provenance: "created",
+            idleState: { idle: false, blocker: "composer-not-empty" },
+            idleMinutesAgo: 20,
+          },
+          {
+            conversationId: "cleanup-user-claimed",
+            url: REMOTE_C,
+            provenance: "created",
+            idleState: { idle: true },
+            idleMinutesAgo: 20,
+          },
+          {
+            conversationId: "cleanup-borrowed",
+            url: REMOTE_A,
+            provenance: "borrowed",
+            idleState: { idle: true },
+          },
+        ],
+        { connectHost: false },
+      );
+      const claimedTab = fixture.tabs.get("cleanup-user-claimed")!;
+      fixture.harness.emitTabActivated(claimedTab.id);
+      fixture.harness.emitTabActivated(fixture.userTab.id);
+      await waitForConversationTabRecord(fixture.harness, "cleanup-user-claimed", {
+        userClaimedAt: expect.any(String),
+      });
+
+      const response = (await fixture.harness.sendPopupMessage({
+        type: "popup.cleanupManagedTabs",
+      })) as {
+        ok?: boolean;
+        closed?: number;
+        skipped?: number;
+        tabPool?: { borrowed?: number; managed?: number };
+      };
+
+      expect(response).toMatchObject({
+        ok: true,
+        closed: 1,
+        skipped: 2,
+        tabPool: { borrowed: 1, managed: 2 },
+      });
+      expect(fixture.harness.tabsById.has(fixture.tabs.get("cleanup-idle-created")!.id)).toBe(
+        false,
+      );
+      expect(fixture.harness.tabsById.has(fixture.tabs.get("cleanup-dirty-created")!.id)).toBe(
+        true,
+      );
+      expect(fixture.harness.tabsById.has(claimedTab.id)).toBe(true);
+      expect(fixture.harness.tabsById.has(fixture.tabs.get("cleanup-borrowed")!.id)).toBe(true);
+    });
+
+    it("managed-tab GC trims ten-minute connected surplus but keeps one warm page", async () => {
+      const fixture = await startManagedLifecycleHarness([
+        {
+          conversationId: "gc-connected-oldest",
+          url: PROJECT_ROOT,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 20,
+          lastUsedMinutesAgo: 20,
+        },
+        {
+          conversationId: "gc-connected-warm",
+          url: REMOTE_B,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 15,
+          lastUsedMinutesAgo: 15,
+        },
+      ]);
+
+      fixture.harness.emitAlarm("relay-managed-tab-gc");
+      await waitUntil(() => conversationTabRecords(fixture.harness).length === 1, 5_000);
+
+      expect(fixture.harness.tabsById.has(fixture.tabs.get("gc-connected-oldest")!.id)).toBe(false);
+      expect(fixture.harness.tabsById.has(fixture.tabs.get("gc-connected-warm")!.id)).toBe(true);
+      expect(conversationTabRecords(fixture.harness)).toEqual([
+        expect.objectContaining({ conversationId: "gc-connected-warm" }),
+      ]);
+    });
+
+    it("rechecks live blockers before GC closes an idle-attested page", async () => {
+      const fixture = await startManagedLifecycleHarness([
+        {
+          conversationId: CONVERSATION_ID,
+          url: PROJECT_ROOT,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 20,
+          lastUsedMinutesAgo: 20,
+        },
+        {
+          conversationId: "gc-retire-warm",
+          url: REMOTE_B,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 15,
+          lastUsedMinutesAgo: 15,
+        },
+      ]);
+      const socket = fixture.socket!;
+      const closingTab = fixture.tabs.get(CONVERSATION_ID)!;
+      let finalPageCheck: { entered: Promise<void>; release: () => void } | undefined;
+      fixture.harness.afterTabMessage = (tabId, message) => {
+        if (
+          !finalPageCheck &&
+          tabId === closingTab.id &&
+          isMessageType(message, "content.inspectIdleState")
+        ) {
+          finalPageCheck = fixture.harness.pauseNextTabGet(closingTab.id);
+        }
+      };
+
+      fixture.harness.emitAlarm("relay-managed-tab-gc");
+      await waitUntil(() => finalPageCheck !== undefined, 5_000);
+      await finalPageCheck!.entered;
+
+      socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+      await waitUntil(
+        () =>
+          (
+            fixture.harness.sessionValue("activeRunsV2") as Array<{ runId?: string }> | undefined
+          )?.some((run) => run.runId === FIRST_RUN_ID) === true,
+        8_000,
+      );
+      finalPageCheck!.release();
+      await waitUntil(
+        () =>
+          fixture.harness.timeline.some(
+            (entry) => entry === `tabs.sendMessage:request:${closingTab.id}:content.send`,
+          ),
+        8_000,
+      );
+
+      // Cleanup shares the allocator with the alarm pass and therefore forms
+      // a deterministic completion barrier after the final live check resumes.
+      await fixture.harness.sendPopupMessage({ type: "popup.cleanupManagedTabs" });
+
+      expect(fixture.harness.tabsById.has(closingTab.id)).toBe(true);
+      expect(conversationTabRecords(fixture.harness)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            conversationId: CONVERSATION_ID,
+            tabId: closingTab.id,
+          }),
+        ]),
+      );
+    }, 20_000);
+
+    it("managed-tab GC closes a final page after thirty disconnected minutes", async () => {
+      const fixture = await startManagedLifecycleHarness(
+        [
+          {
+            conversationId: "gc-disconnected-final",
+            url: PROJECT_ROOT,
+            provenance: "created",
+            idleState: { idle: true },
+            idleMinutesAgo: 31,
+            lastUsedMinutesAgo: 31,
+          },
+        ],
+        { connectHost: false },
+      );
+
+      fixture.harness.emitAlarm("relay-managed-tab-gc");
+      await waitUntil(
+        () => !fixture.harness.tabsById.has(fixture.tabs.get("gc-disconnected-final")!.id),
+        5_000,
+      );
+      expect(conversationTabRecords(fixture.harness)).toEqual([]);
+    });
+
+    it("never garbage-collects a manually claimed page even after thirty disconnected minutes", async () => {
+      const fixture = await startManagedLifecycleHarness(
+        [
+          {
+            conversationId: "gc-user-claimed",
+            url: PROJECT_ROOT,
+            provenance: "created",
+            idleState: { idle: true },
+            idleMinutesAgo: 31,
+            lastUsedMinutesAgo: 31,
+          },
+        ],
+        { connectHost: false },
+      );
+      const managedTab = fixture.tabs.get("gc-user-claimed")!;
+      fixture.harness.emitTabActivated(managedTab.id);
+      fixture.harness.emitTabActivated(fixture.userTab.id);
+      await waitForConversationTabRecord(fixture.harness, "gc-user-claimed", {
+        userClaimedAt: expect.any(String),
+      });
+
+      fixture.harness.emitAlarm("relay-managed-tab-gc");
+      // The popup cleanup shares the allocator tail with GC, so this response
+      // is a deterministic completion barrier for the alarm-driven pass.
+      await Promise.resolve();
+      const cleanup = await fixture.harness.sendPopupMessage({ type: "popup.cleanupManagedTabs" });
+
+      expect(cleanup).toMatchObject({ ok: true, closed: 0, skipped: 1 });
+      expect(fixture.harness.tabsById.has(managedTab.id)).toBe(true);
+      const records = conversationTabRecords(fixture.harness);
+      expect(records).toEqual([
+        expect.objectContaining({
+          conversationId: "gc-user-claimed",
+        }),
+      ]);
+      expect(typeof records[0]?.userClaimedAt).toBe("string");
+    });
+
+    it("retries a failed user-claim checkpoint and preserves the claim across a worker restart", async () => {
+      const fixture = await startManagedLifecycleHarness(
+        [
+          {
+            conversationId: "user-claim-retry",
+            url: PROJECT_ROOT,
+            provenance: "created",
+            idleState: { idle: true },
+            idleMinutesAgo: 31,
+            lastUsedMinutesAgo: 31,
+          },
+        ],
+        { connectHost: false },
+      );
+      const managedTab = fixture.tabs.get("user-claim-retry")!;
+      const originalSessionSet = chrome.storage.session.set.bind(chrome.storage.session);
+      let rejectedClaim = false;
+      const sessionSet = vi
+        .spyOn(chrome.storage.session, "set")
+        .mockImplementation(async (values) => {
+          const records = (values as { conversationTabsV2?: ConversationTabFixtureRecord[] })
+            .conversationTabsV2;
+          if (!rejectedClaim && records?.some((record) => record.userClaimedAt)) {
+            rejectedClaim = true;
+            throw new Error("user claim checkpoint failed");
+          }
+          await originalSessionSet(values);
+        });
+
+      fixture.harness.emitTabActivated(managedTab.id);
+      fixture.harness.emitTabActivated(fixture.userTab.id);
+      await waitForConversationTabRecord(fixture.harness, "user-claim-retry", {
+        userClaimedAt: expect.any(String),
+      });
+      expect(rejectedClaim).toBe(true);
+      expect(sessionSet.mock.calls.length).toBeGreaterThanOrEqual(2);
+      sessionSet.mockRestore();
+
+      vi.resetModules();
+      fixture.harness.installGlobals();
+      await fixture.harness.importServiceWorker(async () => await import("./service-worker"));
+      await fixture.harness.sendPopupMessage({ type: "popup.status" });
+      const restoredClaimRecords = conversationTabRecords(fixture.harness);
+      expect(restoredClaimRecords).toEqual([
+        expect.objectContaining({ conversationId: "user-claim-retry" }),
+      ]);
+      expect(typeof restoredClaimRecords[0]?.userClaimedAt).toBe("string");
+
+      fixture.harness.emitAlarm("relay-managed-tab-gc");
+      await fixture.harness.sendPopupMessage({ type: "popup.cleanupManagedTabs" });
+      expect(fixture.harness.tabsById.has(managedTab.id)).toBe(true);
+    }, 12_000);
+
+    it("rolls a reusable lease back before navigation when its allocation checkpoint fails", async () => {
+      const { harness, socket, tab } = await startRestoredManagedPoolHarness({ idle: true });
+      const release = releaseEnvelope(CONVERSATION_ID);
+      socket.deliverFromHost(release);
+      await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.released" &&
+          (envelope.payload as { requestId?: string }).requestId === release.id,
+      );
+      const previousLease = conversationTabRecords(harness).find(
+        (record) => record.conversationId === CONVERSATION_ID,
+      );
+      expect(previousLease).toMatchObject({
+        conversationId: CONVERSATION_ID,
+        leaseEpoch: 1,
+        tabId: tab.id,
+      });
+      expect(typeof previousLease?.idleSince).toBe("string");
+
+      const originalSessionSet = chrome.storage.session.set.bind(chrome.storage.session);
+      const nextConversationId = "conversation-reuse-checkpoint-failure";
+      let rejectedAllocation = false;
+      const sessionSet = vi
+        .spyOn(chrome.storage.session, "set")
+        .mockImplementation(async (values) => {
+          const records = (values as { conversationTabsV2?: ConversationTabFixtureRecord[] })
+            .conversationTabsV2;
+          if (
+            !rejectedAllocation &&
+            records?.some((record) => record.conversationId === nextConversationId)
+          ) {
+            rejectedAllocation = true;
+            throw new Error("reusable allocation checkpoint failed");
+          }
+          await originalSessionSet(values);
+        });
+
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      const error = await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "relay.error" && envelope.conversationId === nextConversationId,
+      );
+
+      expect(error.payload).toMatchObject({ recoverable: true });
+      expect(rejectedAllocation).toBe(true);
+      expect(harness.tabsById.get(tab.id)?.url).toBe(PROJECT_ROOT);
+      expect(
+        [...harness.tabsById.values()].filter((candidate) =>
+          candidate.url.startsWith("https://chatgpt.com/"),
+        ),
+      ).toHaveLength(1);
+      expect(conversationTabRecords(harness)).toEqual([previousLease]);
+
+      sessionSet.mockRestore();
+      socket.deliverFromHost(openEnvelope(nextConversationId, REMOTE_B));
+      await waitUntil(() => harness.tabsById.get(tab.id)?.url === REMOTE_B, 5_000);
+      await waitForConversationTabRecord(harness, nextConversationId, {
+        leaseEpoch: 2,
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: tab.id,
+      });
+      expect(conversationTabRecords(harness)).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ conversationId: CONVERSATION_ID })]),
+      );
+      expect(
+        [...harness.tabsById.values()].filter((candidate) =>
+          candidate.url.startsWith("https://chatgpt.com/"),
+        ),
+      ).toHaveLength(1);
+    }, 15_000);
+
+    it("removes a newly created page and mapping when its first checkpoint fails", async () => {
+      const fixture = await startManagedLifecycleHarness([]);
+      const socket = fixture.socket!;
+      const originalSessionSet = chrome.storage.session.set.bind(chrome.storage.session);
+      const conversationId = "conversation-new-checkpoint-failure";
+      let rejectedAllocation = false;
+      const removedTabIds: number[] = [];
+      const originalTabRemove = chrome.tabs.remove.bind(chrome.tabs);
+      const tabRemove = vi.spyOn(chrome.tabs, "remove").mockImplementation(async (tabId) => {
+        removedTabIds.push(...(Array.isArray(tabId) ? tabId : [tabId]));
+        await originalTabRemove(tabId);
+      });
+      const sessionSet = vi
+        .spyOn(chrome.storage.session, "set")
+        .mockImplementation(async (values) => {
+          const records = (values as { conversationTabsV2?: ConversationTabFixtureRecord[] })
+            .conversationTabsV2;
+          if (
+            !rejectedAllocation &&
+            records?.some((record) => record.conversationId === conversationId)
+          ) {
+            rejectedAllocation = true;
+            throw new Error("new allocation checkpoint failed");
+          }
+          await originalSessionSet(values);
+        });
+
+      socket.deliverFromHost(openEnvelope(conversationId, REMOTE_B));
+      const error = await fixture.harness.waitForEnvelope(
+        socket,
+        (envelope) => envelope.type === "relay.error" && envelope.conversationId === conversationId,
+      );
+
+      expect(error.payload).toMatchObject({ recoverable: true });
+      expect(rejectedAllocation).toBe(true);
+      expect(removedTabIds).toHaveLength(1);
+      expect(fixture.harness.tabsById.has(removedTabIds[0]!)).toBe(false);
+      expect(conversationTabRecords(fixture.harness)).toEqual([]);
+      expect(
+        [...fixture.harness.tabsById.values()].filter((candidate) =>
+          candidate.url.startsWith("https://chatgpt.com/"),
+        ),
+      ).toHaveLength(0);
+
+      sessionSet.mockRestore();
+      tabRemove.mockRestore();
+      const retryTabPromise = fixture.harness.waitForCreatedTab(1);
+      socket.deliverFromHost(openEnvelope(conversationId, REMOTE_B));
+      const retryTab = await retryTabPromise;
+      installManagedPoolResponder(fixture.harness, retryTab.id, { idle: true });
+      await waitForConversationTabRecord(fixture.harness, conversationId, {
+        leaseEpoch: 1,
+        provenance: "created",
+        remoteUrl: REMOTE_B,
+        tabId: retryTab.id,
+      });
+      expect(retryTab.id).not.toBe(removedTabIds[0]);
+    }, 15_000);
+
+    it("does not revive tab-bound run state after a physical close outlives its failed checkpoint", async () => {
+      const { harness, socket, tab } = await startHarness({ acknowledgeTerminals: false });
+      const terminalMarkdown = "Terminal state that a failed close must not revive";
+      let terminalVisible = false;
+      harness.installTabMessageResponder(tab.id, (message) => {
+        const pageUrl = harness.tabsById.get(tab.id)?.url ?? PROJECT_ROOT;
+        if (isMessageType(message, "content.ping")) {
+          return { ok: true, pageUrl, selectorVersion: CONTENT_RUNTIME_REVISION };
+        }
+        if (isMessageType(message, "content.composerStatus")) {
+          return {
+            ok: true,
+            ready: true,
+            rawCandidateCount: 1,
+            readyCandidateCount: 1,
+            visibilityState: "visible",
+            selectorVersion: CONTENT_RUNTIME_REVISION,
+          };
+        }
+        if (isMessageType(message, "content.inspectConversation")) {
+          return {
+            ok: true,
+            remoteUrl: pageUrl,
+            complete: !terminalVisible,
+            historyComplete: !terminalVisible,
+            messages: terminalVisible
+              ? [
+                  { role: "user", markdown: "Explain the relay race." },
+                  { role: "assistant", markdown: terminalMarkdown },
+                ]
+              : [],
+            observedAt: new Date().toISOString(),
+            selectorVersion: CONTENT_RUNTIME_REVISION,
+          };
+        }
+        if (isMessageType(message, "content.send")) {
+          return { ok: true, pageUrl, selectorVersion: CONTENT_RUNTIME_REVISION };
+        }
+        if (isMessageType(message, "content.recover")) {
+          return {
+            ok: true,
+            active: true,
+            matchedActiveRun: true,
+            markdown: "",
+            remoteUrl: pageUrl,
+            selectorVersion: CONTENT_RUNTIME_REVISION,
+          };
+        }
+        return { ok: false };
+      });
+      await harness.importContentScript(tab.id, async () => undefined);
+      socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID, REMOTE_A));
+      await waitUntil(
+        () =>
+          (
+            harness.sessionValue("activeRunsV2") as
+              Array<{ phase?: string; runId?: string }> | undefined
+          )?.some((run) => run.runId === FIRST_RUN_ID && run.phase === "active") === true &&
+          harness.tabsById.get(tab.id)?.url === REMOTE_A,
+        8_000,
+      );
+      terminalVisible = true;
+      const terminalCheckpoint = harness.pauseNextSessionWrite((values) => {
+        const snapshot = values as {
+          activeRunsV2?: unknown[];
+          pendingEventsV2?: unknown[];
+          terminalHistoryBarriersV1?: unknown[];
+        };
+        return (
+          snapshot.activeRunsV2?.length === 1 &&
+          snapshot.pendingEventsV2?.length === 1 &&
+          snapshot.terminalHistoryBarriersV1?.length === 1
+        );
+      });
+      const terminalRequest = chrome.runtime.sendMessage({
+        type: "content.event",
+        eventType: "complete",
+        conversationId: CONVERSATION_ID,
+        runId: FIRST_RUN_ID,
+        markdown: terminalMarkdown,
+        remoteUrl: REMOTE_A,
+      });
+      await terminalCheckpoint.entered;
+
+      const originalSessionSet = chrome.storage.session.set.bind(chrome.storage.session);
+      let rejectCloseCheckpoint = true;
+      const sessionSet = vi
+        .spyOn(chrome.storage.session, "set")
+        .mockImplementation(async (values) => {
+          const snapshot = values as {
+            activeRunsV2?: unknown[];
+            conversationTabsV2?: ConversationTabFixtureRecord[];
+            pendingEventsV2?: unknown[];
+            terminalHistoryBarriersV1?: unknown[];
+          };
+          const clearsConversation =
+            snapshot.conversationTabsV2?.some(
+              (record) => record.conversationId === CONVERSATION_ID,
+            ) === false;
+          if (
+            rejectCloseCheckpoint &&
+            clearsConversation &&
+            snapshot.activeRunsV2?.length === 0 &&
+            snapshot.pendingEventsV2?.length === 0 &&
+            snapshot.terminalHistoryBarriersV1?.length === 0
+          ) {
+            throw new Error("physical close checkpoint failed");
+          }
+          await originalSessionSet(values);
+        });
+      const close = makeEnvelope({
+        type: "conversation.close",
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        payload: { closeTab: true },
+      });
+      socket.deliverFromHost(close);
+      await waitUntil(() => !harness.tabsById.has(tab.id), 5_000);
+      terminalCheckpoint.release();
+      const closeError = await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "relay.error" &&
+          envelope.conversationId === CONVERSATION_ID &&
+          (envelope.payload as { code?: string }).code === "INTERNAL_ERROR",
+      );
+
+      expect(closeError.payload).toMatchObject({ recoverable: true });
+      await expect(terminalRequest).resolves.toEqual({ ok: false });
+      expect(harness.tabsById.has(tab.id)).toBe(false);
+      expect(socket.readyState).toBe(FakeRelayWebSocket.OPEN);
+      expect(harness.sessionValue("activeRunsV2")).toEqual(
+        expect.arrayContaining([expect.objectContaining({ runId: FIRST_RUN_ID })]),
+      );
+      const statusesBefore = harness
+        .outboundEnvelopes(socket)
+        .filter((envelope) => envelope.type === "relay.status").length;
+      socket.deliverFromHost(
+        makeEnvelope({
+          type: "relay.status.request",
+          instanceId: INSTANCE_ID,
+          payload: makeRelayStatusRequestPayload(),
+        }),
+      );
+      await waitUntil(
+        () =>
+          harness.outboundEnvelopes(socket).filter((envelope) => envelope.type === "relay.status")
+            .length > statusesBefore,
+      );
+      expect(
+        harness
+          .outboundEnvelopes(socket)
+          .filter((envelope) => envelope.type === "relay.status")
+          .at(-1)?.payload,
+      ).toMatchObject({ activeRuns: 0 });
+
+      rejectCloseCheckpoint = false;
+      const retry = makeEnvelope({
+        type: "conversation.close",
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        payload: { closeTab: true },
+      });
+      socket.deliverFromHost(retry);
+      const closed = await harness.waitForEnvelope(
+        socket,
+        (envelope) =>
+          envelope.type === "conversation.closed" &&
+          (envelope.payload as { requestId?: string }).requestId === retry.id,
+      );
+      expect(closed.payload).toMatchObject({ tabDisposition: "already-absent" });
+      await waitUntil(
+        () =>
+          (harness.sessionValue("conversationTabsV2") as unknown[] | undefined)?.length === 0 &&
+          (harness.sessionValue("activeRunsV2") as unknown[] | undefined)?.length === 0 &&
+          (harness.sessionValue("pendingEventsV2") as unknown[] | undefined)?.length === 0 &&
+          (harness.sessionValue("terminalHistoryBarriersV1") as unknown[] | undefined)?.length ===
+            0,
+        5_000,
+      );
+      sessionSet.mockRestore();
+    }, 20_000);
+
+    it("keeps a GC-closed lease retired in memory until a later checkpoint succeeds", async () => {
+      const fixture = await startManagedLifecycleHarness([
+        {
+          conversationId: "gc-checkpoint-failure-oldest",
+          url: PROJECT_ROOT,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 20,
+          lastUsedMinutesAgo: 20,
+        },
+        {
+          conversationId: "gc-checkpoint-failure-warm",
+          url: REMOTE_B,
+          provenance: "created",
+          idleState: { idle: true },
+          idleMinutesAgo: 15,
+          lastUsedMinutesAgo: 15,
+        },
+      ]);
+      const oldestTab = fixture.tabs.get("gc-checkpoint-failure-oldest")!;
+      const originalSessionSet = chrome.storage.session.set.bind(chrome.storage.session);
+      let matchingWrites = 0;
+      let enterRetry!: () => void;
+      let releaseRetry!: () => void;
+      const retryEntered = new Promise<void>((resolve) => {
+        enterRetry = resolve;
+      });
+      const retryGate = new Promise<void>((resolve) => {
+        releaseRetry = resolve;
+      });
+      const sessionSet = vi
+        .spyOn(chrome.storage.session, "set")
+        .mockImplementation(async (values) => {
+          const records = (values as { conversationTabsV2?: ConversationTabFixtureRecord[] })
+            .conversationTabsV2;
+          const retiredOldest =
+            records?.some((record) => record.conversationId === "gc-checkpoint-failure-oldest") ===
+            false;
+          if (retiredOldest) {
+            matchingWrites += 1;
+            if (matchingWrites === 1) throw new Error("GC close checkpoint failed");
+            if (matchingWrites === 2) {
+              enterRetry();
+              await retryGate;
+            }
+          }
+          await originalSessionSet(values);
+        });
+
+      fixture.harness.emitAlarm("relay-managed-tab-gc");
+      await waitUntil(() => !fixture.harness.tabsById.has(oldestTab.id), 5_000);
+      await retryEntered;
+      const popupStatus = (await fixture.harness.sendPopupMessage({
+        type: "popup.status",
+      })) as { tabPool?: { managed?: number } };
+
+      expect(popupStatus.tabPool).toMatchObject({ managed: 1 });
+      expect(conversationTabRecords(fixture.harness)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ conversationId: "gc-checkpoint-failure-oldest" }),
+          expect.objectContaining({ conversationId: "gc-checkpoint-failure-warm" }),
+        ]),
+      );
+      releaseRetry();
+      await waitUntil(
+        () =>
+          conversationTabRecords(fixture.harness).length === 1 &&
+          conversationTabRecords(fixture.harness)[0]?.conversationId ===
+            "gc-checkpoint-failure-warm",
+        5_000,
+      );
+      expect(matchingWrites).toBe(2);
+      expect(fixture.harness.tabsById.has(fixture.tabs.get("gc-checkpoint-failure-warm")!.id)).toBe(
+        true,
+      );
+      sessionSet.mockRestore();
+    }, 15_000);
+  });
+
   it("streams a minimized-window run through the default debugger capture", async () => {
     vi.resetModules();
     makeElementsVisibleToTheContentScript();
@@ -3179,7 +4553,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     ]);
   });
 
-  it("moves only an empty stale prewarm tab to the currently verified Project", async () => {
+  it("replaces an empty legacy prewarm without navigating its ownership-unknown tab", async () => {
     vi.resetModules();
     const harness = new FakeChromeRelayHarness();
     harness.installGlobals();
@@ -3209,6 +4583,8 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     const socket = await harness.waitForSocket();
     await connectFakeVsCodeHost(harness, socket);
 
+    harness.timeline.length = 0;
+    const replacementPromise = harness.waitForCreatedTab(1);
     socket.deliverFromHost(
       makeEnvelope({
         type: "conversation.open",
@@ -3217,20 +4593,19 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         payload: { active: false },
       }),
     );
-    await waitUntil(() => harness.tabsById.get(oldTab.id!)?.url === PROJECT_ROOT);
-    await waitUntil(
-      () =>
-        (
-          harness.sessionValue("conversationTabsV2") as
-            | Array<{ conversationId?: string; projectScope?: string; remoteUrl?: string }>
-            | undefined
-        )?.some(
-          (record) =>
-            record.conversationId === "stale-prewarm" &&
-            record.projectScope === PROJECT_SCOPE &&
-            record.remoteUrl === undefined,
-        ) === true,
-    );
+    const replacement = await replacementPromise;
+    installManagedPoolResponder(harness, replacement.id, { idle: true });
+    await waitForConversationTabRecord(harness, "stale-prewarm", {
+      projectScope: PROJECT_SCOPE,
+      provenance: "created",
+      tabId: replacement.id,
+    });
+
+    expect(replacement.id).not.toBe(oldTab.id);
+    expect(replacement.url).toBe(PROJECT_ROOT);
+    expect(harness.tabsById.has(oldTab.id)).toBe(true);
+    expect(harness.tabsById.get(oldTab.id)?.url).toBe(OTHER_PROJECT_ROOT);
+    expect(harness.timeline).not.toContain(`tabs.reload:${oldTab.id}`);
   });
 
   it("migrates a legacy V5 binding only after strict same-scope verification", async () => {
@@ -4989,14 +6364,11 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     visibleComplete = false;
     const inspectCountBeforeRace = inspectCount;
     holdNextInspect = true;
-    socket.deliverFromHost(
-      makeEnvelope({
-        type: "conversation.open",
-        instanceId: INSTANCE_ID,
-        conversationId: CONVERSATION_ID,
-        payload: { remoteUrl: REMOTE_A, active: false },
-      }),
-    );
+    // A passive view renewal intentionally performs no history read while a
+    // generation is active. A same-route URL notification is the production
+    // path that starts this read-only snapshot sync without recovering or
+    // replaying the active run.
+    harness.emitTabUrlUpdated(tab.id, REMOTE_A);
     await inspectEntered;
     expect(inspectCount).toBe(inspectCountBeforeRace + 1);
 
@@ -9031,6 +10403,84 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(harness.timeline).not.toContain(`window-updated:${homeWindowId}:focused:true`);
   }, 8_000);
 
+  describe("content.inspectIdleState live DOM attestation", () => {
+    type IdleDomVariant = "empty" | "draft" | "attachment" | "response-control" | "modal";
+
+    async function inspectLiveIdleState(variant: IdleDomVariant) {
+      vi.resetModules();
+      makeElementsVisibleToTheContentScript();
+      const harness = new FakeChromeRelayHarness();
+      harness.installGlobals();
+      const tab = await chrome.tabs.create({ url: PROJECT_ROOT, active: true });
+      if (tab.id === undefined) throw new Error("Fake Chrome did not create a Project tab.");
+
+      document.body.innerHTML = `
+        <main>
+          <section id="thread"></section>
+          <form data-type="unified-composer">
+            <div
+              class="ProseMirror"
+              id="prompt-textarea"
+              contenteditable="true"
+              role="textbox"
+              aria-label="Message ChatGPT"
+            >${variant === "draft" ? "Explain this draft" : ""}</div>
+            ${
+              variant === "attachment"
+                ? `<div data-testid="attachment-card">
+                     <span>selection.py</span>
+                     <button type="button" aria-label="Remove file">Remove</button>
+                   </div>`
+                : ""
+            }
+            <button type="button" data-testid="send-button" aria-label="Send prompt">Send</button>
+            ${
+              variant === "response-control"
+                ? `<button type="button" data-testid="stop-button" aria-label="Stop generating">
+                     Stop
+                   </button>`
+                : ""
+            }
+          </form>
+          ${
+            variant === "modal"
+              ? `<div role="dialog" aria-modal="true"><p>Confirm navigation</p></div>`
+              : ""
+          }
+        </main>`;
+
+      await harness.importContentScript(tab.id, async () => await import("./content-script"));
+      return await chrome.tabs.sendMessage(tab.id, { type: "content.inspectIdleState" });
+    }
+
+    it("reports one visible, writable, empty composer as idle", async () => {
+      await expect(inspectLiveIdleState("empty")).resolves.toMatchObject({
+        ok: true,
+        idle: true,
+        pageUrl: PROJECT_ROOT,
+        selectorVersion: CONTENT_RUNTIME_REVISION,
+      });
+    });
+
+    it.each([
+      ["a composer draft", "draft", "composer-not-empty"],
+      ["an attachment card", "attachment", "attachments-present"],
+      ["a Stop response control", "response-control", "response-control-present"],
+      ["an open modal", "modal", "modal-present"],
+    ] as const)(
+      "reports %s as non-idle with the exact blocker",
+      async (_label, variant, blocker) => {
+        await expect(inspectLiveIdleState(variant)).resolves.toMatchObject({
+          ok: true,
+          idle: false,
+          blocker,
+          pageUrl: PROJECT_ROOT,
+          selectorVersion: CONTENT_RUNTIME_REVISION,
+        });
+      },
+    );
+  });
+
   it("recognizes the unique modern composer owned by the send form", async () => {
     vi.resetModules();
     makeElementsVisibleToTheContentScript();
@@ -11752,8 +13202,12 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
           harness.sessionValue("activeRunsV2") as
             Array<{ runId?: string; phase?: string }> | undefined
         )?.some((run) => run.runId === chainedRunId && run.phase === "active") === true,
-      5_000,
-    );
+      8_000,
+    ).catch((error: unknown) => {
+      throw new Error(
+        `${String(error)} sendCount=${sendCount} activeRuns=${JSON.stringify(harness.sessionValue("activeRunsV2"))} Timeline tail: ${JSON.stringify(harness.timeline.slice(-80))}`,
+      );
+    });
 
     const stored = harness.localValue("conversationTranscriptFingerprintsV1") as
       | {
@@ -11767,7 +13221,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(stored?.entries?.[0]?.transcriptChainSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(sendCount).toBe(2);
     expect(runErrors(harness, socket, chainedRunId)).toHaveLength(0);
-  }, 12_000);
+  }, 15_000);
 
   it("pre-attests a minimized conversation during open before its transcript virtualizes", async () => {
     vi.resetModules();
@@ -14779,6 +16233,243 @@ async function startHarness(
   const tab = await tabPromise;
   window.history.replaceState({}, "", PROJECT_ROOT);
   return { harness, socket, tab };
+}
+
+async function startRestoredManagedPoolHarness(
+  idleState: { idle: true } | { idle: false; blocker: string },
+) {
+  vi.resetModules();
+  const harness = new FakeChromeRelayHarness();
+  harness.installGlobals();
+  seedProjectBinding(harness);
+  const createdTab = await chrome.tabs.create({ url: PROJECT_ROOT, active: false });
+  const tabId = createdTab.id;
+  if (tabId === undefined) throw new Error("Fake Chrome did not create a managed pool tab.");
+  const tab = { ...createdTab, id: tabId };
+  await chrome.tabs.create({ url: "https://example.test/user-work", active: true });
+  installManagedPoolResponder(harness, tab.id, idleState);
+  const restoredAt = new Date(Date.now() - 1_000).toISOString();
+  harness.seedSessionValue("conversationTabsV2", [
+    {
+      owned: true,
+      instanceId: INSTANCE_ID,
+      conversationId: CONVERSATION_ID,
+      tabId: tab.id,
+      projectScope: PROJECT_SCOPE,
+      createdAt: restoredAt,
+      provenance: "created",
+      leaseEpoch: 1,
+      lastUsedAt: restoredAt,
+    },
+  ]);
+  await harness.importServiceWorker(async () => await import("./service-worker"));
+  const socket = await harness.waitForSocket();
+  await connectFakeVsCodeHost(harness, socket);
+  await waitForConversationTabRecord(harness, CONVERSATION_ID, {
+    provenance: "created",
+    tabId: tab.id,
+  });
+  return { harness, socket, tab };
+}
+
+interface ManagedLifecycleFixtureSpec {
+  conversationId: string;
+  url: string;
+  provenance: "created" | "borrowed";
+  idleState: { idle: true } | { idle: false; blocker: string };
+  idleMinutesAgo?: number;
+  lastUsedMinutesAgo?: number;
+}
+
+async function startManagedLifecycleHarness(
+  specs: readonly ManagedLifecycleFixtureSpec[],
+  { connectHost = true }: { connectHost?: boolean } = {},
+) {
+  vi.resetModules();
+  const harness = new FakeChromeRelayHarness();
+  harness.installGlobals();
+  seedProjectBinding(harness);
+  const now = Date.now();
+  const tabs = new Map<string, { id: number; url: string }>();
+  const storedRecords: Array<Record<string, unknown>> = [];
+  for (const spec of specs) {
+    const created = await chrome.tabs.create({ url: spec.url, active: false });
+    if (created.id === undefined) throw new Error("Fake Chrome did not create a lifecycle tab.");
+    tabs.set(spec.conversationId, { id: created.id, url: spec.url });
+    installManagedPoolResponder(harness, created.id, spec.idleState);
+    const lastUsedMinutesAgo = spec.lastUsedMinutesAgo ?? spec.idleMinutesAgo ?? 1;
+    storedRecords.push({
+      owned: spec.provenance !== "borrowed",
+      instanceId: INSTANCE_ID,
+      conversationId: spec.conversationId,
+      tabId: created.id,
+      ...(spec.url === PROJECT_ROOT ? {} : { remoteUrl: spec.url }),
+      projectScope: PROJECT_SCOPE,
+      createdAt: new Date(
+        now - (Math.max(lastUsedMinutesAgo, spec.idleMinutesAgo ?? 0) + 1) * 60_000,
+      ).toISOString(),
+      provenance: spec.provenance,
+      leaseEpoch: 1,
+      lastUsedAt: new Date(now - lastUsedMinutesAgo * 60_000).toISOString(),
+      ...(spec.idleMinutesAgo === undefined
+        ? {}
+        : { idleSince: new Date(now - spec.idleMinutesAgo * 60_000).toISOString() }),
+    });
+  }
+  const createdUserTab = await chrome.tabs.create({
+    url: "https://example.test/user-work",
+    active: true,
+  });
+  if (createdUserTab.id === undefined) throw new Error("Fake Chrome did not create a user tab.");
+  const userTab = { id: createdUserTab.id, url: createdUserTab.url ?? "" };
+  harness.seedSessionValue("conversationTabsV2", storedRecords);
+  await harness.importServiceWorker(async () => await import("./service-worker"));
+  let socket: FakeRelayWebSocket | undefined;
+  if (connectHost) {
+    socket = await harness.waitForSocket();
+    await connectFakeVsCodeHost(harness, socket);
+  } else {
+    await harness.sendPopupMessage({ type: "popup.status" });
+  }
+  await waitUntil(
+    () =>
+      specs.every((spec) =>
+        conversationTabRecords(harness).some(
+          (record) => record.conversationId === spec.conversationId,
+        ),
+      ),
+    5_000,
+  );
+  return { harness, socket, tabs, userTab };
+}
+
+interface ConversationTabFixtureRecord {
+  createdAt?: string;
+  conversationId?: string;
+  idleSince?: string;
+  lastUsedAt?: string;
+  leaseEpoch?: number;
+  provenance?: string;
+  releaseRequestedAt?: string;
+  remoteUrl?: string;
+  tabId?: number;
+  userClaimedAt?: string;
+}
+
+function conversationTabRecords(harness: FakeChromeRelayHarness) {
+  return (
+    (harness.sessionValue("conversationTabsV2") as ConversationTabFixtureRecord[] | undefined) ?? []
+  );
+}
+
+async function waitForConversationTabRecord(
+  harness: FakeChromeRelayHarness,
+  conversationId: string,
+  expected: Record<string, unknown>,
+) {
+  await waitUntil(() => {
+    const record = conversationTabRecords(harness).find(
+      (candidate) => candidate.conversationId === conversationId,
+    );
+    if (!record) return false;
+    try {
+      expect(record).toMatchObject(expected);
+      return true;
+    } catch {
+      return false;
+    }
+  }, 8_000);
+  return conversationTabRecords(harness).find(
+    (candidate) => candidate.conversationId === conversationId,
+  )!;
+}
+
+function installManagedPoolResponder(
+  harness: FakeChromeRelayHarness,
+  tabId: number,
+  idleState: { idle: true } | { idle: false; blocker: string },
+) {
+  harness.installTabMessageResponder(tabId, (message) => {
+    const pageUrl = harness.tabsById.get(tabId)?.url ?? PROJECT_ROOT;
+    if (isMessageType(message, "content.ping")) {
+      return { ok: true, pageUrl, selectorVersion: CONTENT_RUNTIME_REVISION };
+    }
+    if (isMessageType(message, "content.inspectIdleState")) {
+      return idleState.idle
+        ? { ok: true, idle: true, pageUrl, selectorVersion: CONTENT_RUNTIME_REVISION }
+        : {
+            ok: true,
+            idle: false,
+            blocker: idleState.blocker,
+            pageUrl,
+            selectorVersion: CONTENT_RUNTIME_REVISION,
+          };
+    }
+    if (isMessageType(message, "content.inspectConversation")) {
+      return {
+        ok: true,
+        remoteUrl: pageUrl,
+        complete: true,
+        historyComplete: true,
+        messages: [],
+        observedAt: new Date().toISOString(),
+        selectorVersion: CONTENT_RUNTIME_REVISION,
+      };
+    }
+    if (isMessageType(message, "content.composerStatus")) {
+      return {
+        ok: true,
+        ready: true,
+        rawCandidateCount: 1,
+        readyCandidateCount: 1,
+        visibilityState: "visible",
+        selectorVersion: CONTENT_RUNTIME_REVISION,
+      };
+    }
+    if (isMessageType(message, "content.send")) {
+      return { ok: true, selectorVersion: CONTENT_RUNTIME_REVISION };
+    }
+    if (isMessageType(message, "content.terminalAck")) return { ok: true };
+    return { ok: false };
+  });
+}
+
+async function installManagedPoolRespondersUntil(
+  harness: FakeChromeRelayHarness,
+  expectedCount: number,
+  installedTabIds = new Set<number>(),
+) {
+  await waitUntil(() => {
+    for (const tabId of harness.tabsById.keys()) {
+      if (installedTabIds.has(tabId)) continue;
+      installManagedPoolResponder(harness, tabId, { idle: true });
+      installedTabIds.add(tabId);
+    }
+    return harness.tabsById.size >= expectedCount && installedTabIds.size >= expectedCount;
+  }, 8_000);
+  return installedTabIds;
+}
+
+function openEnvelope(conversationId: string, remoteUrl?: string): RelayEnvelope {
+  return makeEnvelope({
+    type: "conversation.open",
+    instanceId: INSTANCE_ID,
+    conversationId,
+    payload: {
+      active: false,
+      purpose: "view",
+      ...(remoteUrl ? { remoteUrl } : {}),
+    },
+  });
+}
+
+function releaseEnvelope(conversationId: string): RelayEnvelope {
+  return makeEnvelope({
+    type: "conversation.release",
+    instanceId: INSTANCE_ID,
+    conversationId,
+    payload: { purpose: "view", reason: "inactive" },
+  });
 }
 
 function seedProjectBinding(harness: FakeChromeRelayHarness) {

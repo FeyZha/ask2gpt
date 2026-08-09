@@ -7,6 +7,9 @@ import {
   type ChatModelOption,
   type ConversationCanonicalizationResultPayload,
   type ConversationClosedPayload,
+  type ConversationLeasePurpose,
+  type ConversationReleasedPayload,
+  type ConversationReleaseReason,
   type ConversationSnapshotPayload,
   type ConversationTitlePayload,
   type ConversationTranscriptProof,
@@ -32,6 +35,7 @@ import type {
 import { ChromeRelayServer } from "./chrome-relay-server";
 
 const RUN_COMMAND_REPLAY_WINDOW_MS = 30 * 60 * 1_000;
+const TAB_LEASE_MINIMUM_RELAY_VERSION = [0, 1, 2] as const;
 
 export class BrowserChatBackend implements ChatBackend {
   private readonly events = new EventEmitter();
@@ -64,6 +68,16 @@ export class BrowserChatBackend implements ChatBackend {
     string,
     {
       conversationId: string;
+      timer: NodeJS.Timeout;
+      resolve: (acknowledged: boolean) => void;
+    }
+  >();
+  private readonly releaseRequests = new Map<
+    string,
+    {
+      conversationId: string;
+      purpose: ConversationLeasePurpose;
+      reason: ConversationReleaseReason;
       timer: NodeJS.Timeout;
       resolve: (acknowledged: boolean) => void;
     }
@@ -103,6 +117,7 @@ export class BrowserChatBackend implements ChatBackend {
           new Error(`${reason} The conversation could not be confirmed.`),
         );
         this.rejectModelRequests(new Error(`${reason} Models could not be refreshed.`));
+        this.resolveReleaseRequests(false);
         this.resolveCloseRequests(false);
       }
       if (relay.connectionState.phase === "syncing") {
@@ -178,12 +193,19 @@ export class BrowserChatBackend implements ChatBackend {
     dispatchIntent = false,
   ): Promise<void> {
     this.assertReady();
+    const supportsTabLeases = this.supportsTabLeases();
     this.relay.send(
       makeEnvelope({
         type: "conversation.open",
         instanceId: this.relay.instanceId,
         conversationId,
-        payload: { remoteUrl, active: false, dispatchIntent, transcriptProof },
+        payload: {
+          remoteUrl,
+          active: false,
+          dispatchIntent,
+          ...(supportsTabLeases ? { purpose: dispatchIntent ? "dispatch" : "view" } : {}),
+          transcriptProof,
+        },
       }),
     );
   }
@@ -340,6 +362,15 @@ export class BrowserChatBackend implements ChatBackend {
     return false;
   }
 
+  async releaseConversation(
+    conversationId: string,
+    purpose: ConversationLeasePurpose = "view",
+    reason: ConversationReleaseReason = "inactive",
+  ): Promise<boolean> {
+    if (!this.relay.connected || !this.supportsTabLeases()) return false;
+    return this.requestConversationRelease(conversationId, purpose, reason);
+  }
+
   async acknowledgeTerminal(conversationId: string, runId: string, eventId: string) {
     this.releaseRun(conversationId, runId);
     this.rememberFinishedRun(conversationId, runId, eventId);
@@ -356,10 +387,21 @@ export class BrowserChatBackend implements ChatBackend {
     this.clearStatusRequestRetry();
     this.rejectCanonicalizationRequests(new Error("Browser backend was disposed."));
     this.rejectModelRequests(new Error("Browser backend was disposed."));
+    this.resolveReleaseRequests(false);
     this.resolveCloseRequests(false);
     this.relaySubscription.dispose();
     this.connectionSubscription.dispose();
     this.events.removeAllListeners();
+  }
+
+  private supportsTabLeases() {
+    const relayVersion = this.relay.connectionState.relayVersion;
+    if (!relayVersion) return false;
+    const match = /^(\d+)\.(\d+)\.(\d+)$/u.exec(relayVersion);
+    if (!match) return false;
+    const version = match.slice(1).map(Number);
+    const minimum = TAB_LEASE_MINIMUM_RELAY_VERSION;
+    return version[0] === minimum[0] && version[1] === minimum[1] && version[2]! >= minimum[2];
   }
 
   private handleEnvelope(envelope: RelayEnvelope) {
@@ -431,6 +473,23 @@ export class BrowserChatBackend implements ChatBackend {
       );
       return;
     }
+    if (envelope.type === "conversation.released") {
+      if (!conversationId || runId) return;
+      const payload = envelope.payload as ConversationReleasedPayload;
+      const pending = this.releaseRequests.get(payload.requestId);
+      if (
+        !pending ||
+        pending.conversationId !== conversationId ||
+        pending.purpose !== payload.purpose ||
+        pending.reason !== payload.reason
+      ) {
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.releaseRequests.delete(payload.requestId);
+      pending.resolve(true);
+      return;
+    }
     if (envelope.type === "conversation.title") {
       if (!conversationId || runId) return;
       const payload = envelope.payload as ConversationTitlePayload;
@@ -478,6 +537,16 @@ export class BrowserChatBackend implements ChatBackend {
           error,
         });
       } else if (conversationId && !runId) {
+        const pendingRelease = [...this.releaseRequests.entries()].find(
+          ([, request]) => request.conversationId === conversationId,
+        );
+        if (pendingRelease) {
+          const [requestId, request] = pendingRelease;
+          clearTimeout(request.timer);
+          this.releaseRequests.delete(requestId);
+          request.resolve(false);
+          return;
+        }
         const pendingClose = [...this.closeRequests.entries()].find(
           ([, request]) => request.conversationId === conversationId,
         );
@@ -782,12 +851,54 @@ export class BrowserChatBackend implements ChatBackend {
     });
   }
 
+  private requestConversationRelease(
+    conversationId: string,
+    purpose: ConversationLeasePurpose,
+    reason: ConversationReleaseReason,
+  ): Promise<boolean> {
+    const envelope = makeEnvelope({
+      type: "conversation.release",
+      instanceId: this.relay.instanceId,
+      conversationId,
+      payload: { purpose, reason },
+    });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.releaseRequests.delete(envelope.id);
+        resolve(false);
+      }, 3_000);
+      timer.unref();
+      this.releaseRequests.set(envelope.id, {
+        conversationId,
+        purpose,
+        reason,
+        timer,
+        resolve,
+      });
+      try {
+        this.relay.send(envelope);
+      } catch {
+        clearTimeout(timer);
+        this.releaseRequests.delete(envelope.id);
+        resolve(false);
+      }
+    });
+  }
+
   private resolveCloseRequests(acknowledged: boolean) {
     for (const pending of this.closeRequests.values()) {
       clearTimeout(pending.timer);
       pending.resolve(acknowledged);
     }
     this.closeRequests.clear();
+  }
+
+  private resolveReleaseRequests(acknowledged: boolean) {
+    for (const pending of this.releaseRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(acknowledged);
+    }
+    this.releaseRequests.clear();
   }
 
   private requestModels(

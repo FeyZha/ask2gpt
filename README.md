@@ -120,6 +120,12 @@ Project”。本机多个 VS Code 窗口共享 Project 绑定，但端口、会�
 更多可复制的问题和预期体验见
 [`examples/ask2gpt-tour/README.md`](./examples/ask2gpt-tour/README.md)。Ask2GPT 不会修改这个样例。
 
+Notebook 体验可直接打开
+[`examples/ask2gpt-tour/notebook-tour.ipynb`](./examples/ask2gpt-tour/notebook-tour.ipynb)：在 Code Cell
+中选中源码后使用 Cell 标题栏的 Ask2GPT 图标；没有文本选区时会附加当前完整 Cell，也可以先选择
+多个 Cell，再从 Notebook 工具栏或 Composer 的 `+` 附加。Markdown Cell 同样可作为上下文，但不会
+显示代码专用快捷动作。
+
 ## 已实现功能
 
 - 独立问答侧栏、Markdown/GFM、ChatGPT 风格代码块、块内复制、多色语法高亮和流式回答；
@@ -129,19 +135,29 @@ Project”。本机多个 VS Code 窗口共享 Project 绑定，但端口、会�
 - 停止、重新生成、排队追问或停止后发送；
 - 通过 Ask2GPT 侧栏标题栏、编辑器标题栏、右键菜单、命令面板或灯泡 Quick Fix 显式附加当前选区；
 - 通过 Composer 的 `+` 显式附加当前选区、当前文件或多个文本文件；
+- 在 `.ipynb` 中通过 Cell 标题栏、Notebook 工具栏、命令面板或 Composer 的 `+` 附加 Cell 内选区、
+  当前 Cell 或多个所选 Cell；Code 与 Markdown Cell 都保持独立的紧凑上下文卡片；
 - 选区附加后直接提供 8 个代码任务快捷动作；点击只填入按会话隔离的可编辑草稿，绝不自动发送；
 - 发送前预览和逐项移除上下文，并拒绝敏感文件、二进制和超限内容；
 - 代码上下文始终以附件胶囊封装，ChatGPT 可见问题不再展开文件元数据或源码；
 - 上下文卡片可跳回源码；Host 只把回答前最近一条用户消息所附代码中的 `file:line` 与函数定义
   标为可点击，未附加引用保持普通文本；
 - 编辑器选区可凭唯一内容证据反查已发送的对话轮次，并持续标出精确上下文卡片直到手动清除；
+- Notebook 上下文持久化 `NotebookSourceAnchorV2`；上下文卡片、回答中的 Cell 附件行号、Cell 内函数
+  定义以及编辑器 Cell 选区都可双向追踪。Cell 移动后只在内容与邻接证据唯一时重定位，重复或删除
+  时明确失败；
+- 空白草稿在 VS Code Reload 后保持同一会话 ID，且在明确派发意图前不会创建 ChatGPT 标签页；
+  点击、聚焦或输入 Composer 会启动派发预热，但不会把未提交的问题写入网页；
+- Relay 以三个并发槽为软容量复用自己创建且经页面空闲证明的标签页；不安全时允许临时溢出，
+  借用页、旧版来源不明页和用户手动激活页都不会被自动复用或关闭；
+- Relay Popup 显示标签页池的候选估算，并只允许清理执行时再次通过空闲证明的 Relay 自建页面；
 - 多 VS Code 窗口独立路由、重启恢复和终态去重；
 - AES-256-GCM 加密的扩展私有会话存储；
 - Chrome 最小化时的增强后台流式接收。
 
 当前发布元数据：
 
-- 当前版本：`0.1.1`
+- 当前版本：`0.1.3`
 - Relay 协议：`v15`
 - 内容运行时：`50`
 
@@ -151,6 +167,7 @@ Ask2GPT 只读取用户明确选择的内容：
 
 - 当前选区；
 - 当前编辑器内存中的文本；
+- 用户明确附加的 Notebook Code/Markdown Cell 源码；
 - 用户在系统文件选择器中确认的文本或代码文件。
 
 它不会枚举、搜索或推断工作区中的其他文件。`.env*`、私钥、证书、keystore、常见凭据文件、
@@ -158,8 +175,12 @@ Ask2GPT 只读取用户明确选择的内容：
 操作发送到 ChatGPT；Cookie、访问令牌和网页存储不会发送给 VS Code，也不会写入诊断日志。
 回答中的源码引用只会在回答前最近一条用户消息明确附加的上下文中解析；其他看似路径或函数的文字
 保持普通文本。选区快照缺失或在当前文件中重复出现时，源码跳转会明确失败，不会猜测旧行号。
-已发送上下文会持久化 `SourceAnchorV1` 内容哈希、规范化哈希和邻接行哈希等定位元数据；反查仍只
-接受同一 URI 下的唯一内容证据。Ask2GPT 不会为了定位引用而搜索工作区。
+Notebook 始终按 Cell source 捕获，不读取或发送原始 `.ipynb` JSON、Cell outputs、execution
+metadata、widget 状态、富 HTML、图片或 base64 负载；从普通文件入口选择 `.ipynb` 会被拒绝。
+所有上下文共同遵守最多 8 项、单项 40,000 字符、合计 60,000 字符的限制。
+已发送普通文本上下文会持久化 `SourceAnchorV1`，Notebook Cell 会持久化
+`NotebookSourceAnchorV2`，包含内容、Cell 与邻接 Cell 哈希等定位元数据；反查仍只接受同一资源下
+的唯一内容证据。Ask2GPT 不会为了定位引用而搜索工作区。
 为避免超长历史阻塞编辑器，回答来源按钮只为当前会话最近 200 条终态回答建立有界索引；更早回答
 仍可阅读，但其中的路径和符号保持普通文本。
 
@@ -186,7 +207,15 @@ nativeMessaging、剪贴板或文件 URL 权限。权限用途和完整威胁模
 **升级后仍显示旧版本或旧运行时**
 
 完整替换 Relay 解压目录，在 `chrome://extensions` 重新加载扩展，并重新加载 VS Code。不要让两个
-Relay 版本同时启用。
+Relay 版本同时启用。相邻 patch 组合只支持滚动升级，不支持让旧 Relay 二进制读取新版本写入的
+状态；不要让 0.1.3 Relay 降级读取新版本状态，正式安装应让 VSIX 与 Relay 保持同版。
+
+**升级前留下了很多 Ask2GPT Project 标签页**
+
+打开 Relay Popup 查看“标签页池”。其中候选数量是读取时的估算；“清理安全闲置页”会逐页二次
+证明，并只关闭 Relay 能证明为自己创建、当前空闲且
+没有草稿、附件、生成任务、终态确认或用户接管的页面。升级前来源不明的 Project 根页和 Relay
+借用的既有会话页不会自动关闭；请先在 Chrome 标签栏确认内容，再手动关闭。
 
 **ChatGPT 要求登录、验证码或提示频率限制**
 
@@ -198,6 +227,8 @@ ChatGPT 的安全提示，也不会在发送结果不确定时自动重发问题
 - ChatGPT 页面结构、模型目录或会话协议变化后，可能需要更新兼容层；
 - 使用量、可用模型、生成速度和频率限制由 ChatGPT 账号与网页端决定；
 - 不支持图片、二进制、Deep Research、Web Search 或 Apps；
+- Notebook 首版只支持 Code/Markdown Cell 源码；不附加整个 `.ipynb`，也不传输 Cell 输出、图片、
+  HTML 或 widget；
 - 只同步已映射会话的当前可见分支，不扫描全部 ChatGPT 历史或不可见分支；
 - 文件重命名或移动后，基于原 URI 的上下文跳转与对话反查可能失效；Ask2GPT 不会搜索工作区来
   猜测新位置；

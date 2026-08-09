@@ -1,6 +1,11 @@
 import type { ContextSnapshot } from "@ask2gpt/protocol";
 import * as vscode from "vscode";
 
+import {
+  isNotebookContextSnapshot,
+  resolveNotebookContextCell,
+  showNotebookContextRange,
+} from "./notebook-source-navigation";
 import { Ask2GPTError } from "./services/errors";
 import { sourceAnchorMatchesContent, sourceAnchorSha256 } from "./source-anchor";
 import { trustedContextUri, TrustedContextUriError } from "./trusted-context-uri";
@@ -42,6 +47,26 @@ export async function openContextFromState(
         ? "This code context is no longer available in this chat."
         : "当前聊天中已找不到这段代码上下文。",
     );
+  }
+
+  if (isNotebookContextSnapshot(context)) {
+    let resolution;
+    try {
+      resolution = await resolveNotebookContextCell(context);
+    } catch (error) {
+      if (error instanceof TrustedContextUriError) {
+        throw contextNavigationError(state.locale, "CONTEXT_TARGET_UNTRUSTED");
+      }
+      throw error;
+    }
+    if (resolution.status !== "found") {
+      throw contextNavigationError(
+        state.locale,
+        resolution.status === "ambiguous" ? "CONTEXT_RANGE_AMBIGUOUS" : "CONTEXT_RANGE_STALE",
+      );
+    }
+    await showNotebookContextRange(resolution);
+    return;
   }
 
   let uri: vscode.Uri;
@@ -90,7 +115,7 @@ export function resolveNonSelectionSnapshotRange(
   document: vscode.TextDocument,
   context: ContextSnapshot,
 ): SnapshotRangeResolution {
-  const anchor = context.sourceAnchor;
+  const anchor = context.sourceAnchor?.formatVersion === 1 ? context.sourceAnchor : undefined;
   if (anchor && !sourceAnchorMatchesContent(anchor, context.content)) {
     return { status: "missing" };
   }
@@ -137,7 +162,8 @@ function findUniqueNeighborAnchoredRange(
   document: vscode.TextDocument,
   context: ContextSnapshot,
 ): SnapshotRangeResolution {
-  const { beforeLineSha256, afterLineSha256 } = context.sourceAnchor ?? {};
+  const anchor = context.sourceAnchor?.formatVersion === 1 ? context.sourceAnchor : undefined;
+  const { beforeLineSha256, afterLineSha256 } = anchor ?? {};
   if (!beforeLineSha256 && !afterLineSha256) return { status: "missing" };
 
   const expectedLineCount = context.endLine - context.startLine + 1;

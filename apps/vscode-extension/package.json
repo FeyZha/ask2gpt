@@ -1,6 +1,6 @@
 {
   "name": "ask2gpt",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "private": true,
   "publisher": "FeyZha",
   "displayName": "Ask2GPT",
@@ -37,6 +37,7 @@
     "onCommand:ask2gpt.open",
     "onCommand:ask2gpt.newConversation",
     "onCommand:ask2gpt.attachSelection",
+    "onCommand:ask2gpt.attachNotebookCell",
     "onCommand:ask2gpt.findRelatedTurn",
     "onCommand:ask2gpt.attachCurrentFile",
     "onCommand:ask2gpt.attachFiles",
@@ -112,6 +113,13 @@
         "icon": "$(comment-discussion)"
       },
       {
+        "command": "ask2gpt.attachNotebookCell",
+        "title": "附加 Notebook 单元格 / Attach Notebook Cell(s)",
+        "shortTitle": "附加 Cell",
+        "category": "Ask2GPT",
+        "icon": "$(notebook)"
+      },
+      {
         "command": "ask2gpt.findRelatedTurn",
         "title": "查找关联对话 / Find Related Turn",
         "shortTitle": "关联对话",
@@ -184,6 +192,9 @@
           "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/"
         },
         {
+          "command": "ask2gpt.attachNotebookCell"
+        },
+        {
           "command": "ask2gpt.findRelatedTurn",
           "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/"
         }
@@ -210,6 +221,22 @@
           "command": "ask2gpt.findRelatedTurn",
           "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/",
           "group": "navigation@11"
+        }
+      ],
+      "notebook/cell/title": [
+        {
+          "command": "ask2gpt.attachNotebookCell",
+          "group": "inline/cell@1"
+        },
+        {
+          "command": "ask2gpt.findRelatedTurn",
+          "group": "inline/cell@2"
+        }
+      ],
+      "notebook/toolbar": [
+        {
+          "command": "ask2gpt.attachNotebookCell",
+          "group": "navigation@1"
         }
       ],
       "view/title": [

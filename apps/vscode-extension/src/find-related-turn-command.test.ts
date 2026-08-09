@@ -6,7 +6,8 @@ import {
   type ActiveTraceSelection,
   type FindRelatedTurnCommandDependencies,
 } from "./find-related-turn-command";
-import type { SelectionReference } from "./selection-reference";
+import type { NotebookCellReference, SelectionReference } from "./selection-reference";
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "./source-anchor";
 
 const selectedContent = "const value = 1;";
 const selection: SelectionReference = {
@@ -166,6 +167,33 @@ describe("createFindRelatedTurnCommand", () => {
       "context-conversation-1",
     );
   });
+
+  it("opens the sent turn linked to an active notebook cell range", async () => {
+    const reference = notebookReference();
+    const conversation = makeNotebookConversation("notebook-conversation", reference);
+    const deps = dependencies([conversation], {
+      reference,
+      selectedContent,
+    });
+
+    await createFindRelatedTurnCommand(deps)();
+
+    expect(deps.showQuickPick).not.toHaveBeenCalled();
+    expect(deps.revealTurn).toHaveBeenCalledWith(
+      conversation.id,
+      "question-notebook-conversation",
+      "context-notebook-conversation",
+    );
+  });
+
+  it("forwards the clicked cell-toolbar target to selection capture", async () => {
+    const commandTarget = { notebookCell: "host-owned" };
+    const deps = dependencies([], null);
+
+    await createFindRelatedTurnCommand(deps)(commandTarget);
+
+    expect(deps.getActiveSelection).toHaveBeenCalledWith(commandTarget);
+  });
 });
 
 function dependencies(
@@ -176,7 +204,7 @@ function dependencies(
   },
 ) {
   return {
-    getActiveSelection: vi.fn(() => activeSelection ?? undefined),
+    getActiveSelection: vi.fn((_commandTarget?: unknown) => activeSelection ?? undefined),
     getState: vi.fn(() => ({ conversations })),
     isZh: vi.fn(() => false),
     showWarningMessage: vi.fn(),
@@ -223,4 +251,81 @@ function makeConversation(id: string, createdAt = "2026-08-09T00:00:00.000Z", ar
       },
     ],
   } satisfies Conversation;
+}
+
+function notebookReference(): NotebookCellReference {
+  return {
+    type: "notebook-cell",
+    notebookUri: "file:///workspace/analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 4,
+    cellUri: "vscode-notebook-cell:///workspace/analysis.ipynb#cell-2",
+    cellIndex: 2,
+    cellKind: "code",
+    cellLanguage: "typescript",
+    cellDocumentVersion: 3,
+    cellContentSha256: sourceAnchorSha256(selectedContent),
+    normalizedCellContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(selectedContent)),
+    scope: "range",
+    startLine: 0,
+    startCharacter: 0,
+    endLine: 0,
+    endCharacter: selectedContent.length,
+  };
+}
+
+function makeNotebookConversation(id: string, reference: NotebookCellReference): Conversation {
+  const createdAt = "2026-08-09T00:00:00.000Z";
+  return {
+    id,
+    title: `Conversation ${id}`,
+    createdAt,
+    updatedAt: createdAt,
+    messages: [
+      {
+        id: `question-${id}`,
+        role: "user",
+        markdown: "Please review this cell.",
+        status: "complete",
+        createdAt,
+        contexts: [
+          {
+            id: `context-${id}`,
+            kind: "selection",
+            fileName: "analysis.ipynb",
+            uri: reference.notebookUri,
+            language: reference.cellLanguage,
+            startLine: 1,
+            endLine: 1,
+            content: selectedContent,
+            charCount: selectedContent.length,
+            unsaved: false,
+            sourceAnchor: {
+              formatVersion: 2,
+              notebookUri: reference.notebookUri,
+              notebookType: reference.notebookType,
+              notebookVersion: reference.notebookVersion,
+              cellIndex: reference.cellIndex,
+              cellKind: reference.cellKind,
+              cellLanguage: reference.cellLanguage,
+              scope: reference.scope,
+              documentVersion: reference.cellDocumentVersion,
+              range: {
+                startLine: reference.startLine,
+                startCharacter: reference.startCharacter,
+                endLine: reference.endLine,
+                endCharacter: reference.endCharacter,
+              },
+              contentSha256: sourceAnchorSha256(selectedContent),
+              normalizedContentSha256: sourceAnchorSha256(
+                normalizeSourceAnchorContent(selectedContent),
+              ),
+              cellContentSha256: reference.cellContentSha256,
+              normalizedCellContentSha256: reference.normalizedCellContentSha256,
+            },
+          },
+        ],
+      },
+    ],
+  };
 }

@@ -148,7 +148,11 @@ describe("VS Code discoverability manifest", () => {
     const relatedTurnMenuEntries = Object.entries(manifest.contributes.menus).flatMap(
       ([menu, entries]) =>
         entries
-          .filter(({ command, when }) => command === findRelatedTurnCommand && when !== "false")
+          .filter(
+            (entry) =>
+              entry.command === findRelatedTurnCommand &&
+              (!("when" in entry) || entry.when !== "false"),
+          )
           .map((entry) => ({ menu, ...entry })),
     );
     expect(relatedTurnMenuEntries).toEqual([
@@ -165,6 +169,11 @@ describe("VS Code discoverability manifest", () => {
         group: "navigation@11",
         when: selectionWhen,
       },
+      {
+        menu: "notebook/cell/title",
+        command: findRelatedTurnCommand,
+        group: "inline/cell@2",
+      },
     ]);
     expect(manifest.contributes.menus["view/title"]).not.toContainEqual(
       expect.objectContaining({ command: findRelatedTurnCommand }),
@@ -174,7 +183,10 @@ describe("VS Code discoverability manifest", () => {
     const visibleMenuEntries = Object.entries(manifest.contributes.menus).flatMap(
       ([menu, entries]) =>
         entries
-          .filter(({ command, when }) => command === attachCommand && when !== "false")
+          .filter(
+            (entry) =>
+              entry.command === attachCommand && (!("when" in entry) || entry.when !== "false"),
+          )
           .map((entry) => ({ menu, ...entry })),
     );
     expect(visibleMenuEntries).toHaveLength(4);
@@ -194,5 +206,36 @@ describe("VS Code discoverability manifest", () => {
         (menu) => menu.startsWith("editor/") || menu.startsWith("chat/editor/"),
       ),
     ).toEqual(["editor/title", "editor/context"]);
+  });
+
+  it("puts Notebook source actions on native cell and notebook surfaces", () => {
+    const attachNotebookCommand = "ask2gpt.attachNotebookCell";
+
+    expect(manifest.activationEvents).toContain(`onCommand:${attachNotebookCommand}`);
+    expect(manifest.contributes.commands).toContainEqual(
+      expect.objectContaining({
+        category: "Ask2GPT",
+        command: attachNotebookCommand,
+        icon: "$(notebook)",
+        shortTitle: "附加 Cell",
+      }),
+    );
+    expect(manifest.contributes.menus.commandPalette).toContainEqual({
+      command: attachNotebookCommand,
+    });
+    expect(manifest.contributes.menus["notebook/cell/title"]).toEqual([
+      {
+        command: attachNotebookCommand,
+        group: "inline/cell@1",
+      },
+      {
+        command: "ask2gpt.findRelatedTurn",
+        group: "inline/cell@2",
+      },
+    ]);
+    expect(manifest.contributes.menus["notebook/toolbar"]).toContainEqual({
+      command: attachNotebookCommand,
+      group: "navigation@1",
+    });
   });
 });

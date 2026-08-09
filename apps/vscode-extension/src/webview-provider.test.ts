@@ -28,6 +28,7 @@ vi.mock("vscode", () => ({
   },
   window: {
     activeTextEditor: undefined,
+    activeNotebookEditor: undefined,
     showWarningMessage: vi.fn(async () => undefined),
   },
   Uri: {
@@ -47,6 +48,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   (vscode.window as { activeTextEditor?: unknown }).activeTextEditor = undefined;
+  (vscode.window as { activeNotebookEditor?: unknown }).activeNotebookEditor = undefined;
 });
 
 describe("Ask2GPTViewProvider state delivery", () => {
@@ -106,6 +108,84 @@ describe("Ask2GPTViewProvider state delivery", () => {
         endLine: 6,
         endCharacter: 11,
       }),
+    );
+    provider.dispose();
+  });
+
+  it("captures selected notebook cells for the composer notebook action", async () => {
+    const state = appState({ activeRuns: 0 });
+    const attachNotebookCells = vi.fn();
+    const controller = {
+      attachNotebookCells,
+      getState: () => state,
+      onState: () => ({ dispose: vi.fn() }),
+    };
+    const document = {
+      uri: { toString: () => "vscode-notebook-cell:/workspace/analysis.ipynb#0" },
+      languageId: "python",
+      version: 3,
+      getText: () => "answer = 42",
+    };
+    const cell = {
+      index: 0,
+      notebook: undefined as unknown,
+      kind: 2,
+      document,
+    };
+    const notebook = {
+      uri: {
+        scheme: "file",
+        toString: () => "file:///workspace/analysis.ipynb",
+      },
+      notebookType: "jupyter-notebook",
+      version: 7,
+      cellCount: 1,
+      cellAt: () => cell,
+      getCells: () => [cell],
+    };
+    cell.notebook = notebook;
+    (vscode.window as { activeNotebookEditor?: unknown }).activeNotebookEditor = {
+      notebook,
+      selection: { start: 0, end: 1 },
+      selections: [{ start: 0, end: 1 }],
+    };
+    let receiveMessage: ((message: WebviewToHostMessage) => void) | undefined;
+    const view = {
+      onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
+      visible: true,
+      webview: {
+        asWebviewUri: (value: unknown) => value,
+        cspSource: "test-source",
+        html: "",
+        onDidReceiveMessage: vi.fn((listener: (message: WebviewToHostMessage) => void) => {
+          receiveMessage = listener;
+          return { dispose: vi.fn() };
+        }),
+        options: {},
+        postMessage: vi.fn(async () => true),
+      },
+    };
+    const provider = new Ask2GPTViewProvider(
+      { path: "extension" } as never,
+      controller as never,
+      { error: vi.fn(), info: vi.fn() } as never,
+      vi.fn(async () => undefined),
+      vi.fn(async () => undefined),
+    );
+    provider.resolveWebviewView(view as never);
+
+    receiveMessage?.({ type: "attachNotebookCell", conversationId: "conversation-1" });
+
+    await vi.waitFor(() =>
+      expect(attachNotebookCells).toHaveBeenCalledWith("conversation-1", [
+        expect.objectContaining({
+          type: "notebook-cell",
+          notebookUri: "file:///workspace/analysis.ipynb",
+          cellIndex: 0,
+          scope: "cell",
+        }),
+      ]),
     );
     provider.dispose();
   });

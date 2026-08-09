@@ -13,7 +13,7 @@ import {
   makeRelayStatusRequestPayload,
   safeParseRelayEnvelope,
 } from "./index";
-import type { ContextSnapshot, SourceAnchorV1 } from "./index";
+import type { ContextSnapshot, NotebookSourceAnchorV2, SourceAnchorV1 } from "./index";
 
 describe("relay protocol", () => {
   it("keeps source anchors versioned while legacy context snapshots remain valid", () => {
@@ -56,6 +56,44 @@ describe("relay protocol", () => {
     expect(legacy.sourceAnchor).toBeUndefined();
   });
 
+  it("models notebook cell provenance without making a virtual cell URI authoritative", () => {
+    const sourceAnchor: NotebookSourceAnchorV2 = {
+      formatVersion: 2,
+      notebookUri: "file:///workspace/analysis.ipynb",
+      notebookType: "jupyter-notebook",
+      notebookVersion: 8,
+      cellIndex: 3,
+      cellKind: "code",
+      cellLanguage: "python",
+      scope: "range",
+      documentVersion: 5,
+      range: { startLine: 1, startCharacter: 0, endLine: 2, endCharacter: 4 },
+      contentSha256: "a".repeat(64),
+      normalizedContentSha256: "b".repeat(64),
+      cellContentSha256: "c".repeat(64),
+      normalizedCellContentSha256: "d".repeat(64),
+      beforeCellSha256: "e".repeat(64),
+      afterCellSha256: "f".repeat(64),
+      workspaceRelativePath: "analysis.ipynb",
+    };
+    const context: ContextSnapshot = {
+      id: "context-notebook",
+      kind: "selection",
+      fileName: "analysis.ipynb",
+      uri: sourceAnchor.notebookUri,
+      language: sourceAnchor.cellLanguage,
+      startLine: 2,
+      endLine: 3,
+      content: "x = 1\nprint(x)",
+      charCount: 14,
+      unsaved: true,
+      sourceAnchor,
+    };
+
+    expect(context.uri).toBe("file:///workspace/analysis.ipynb");
+    expect(JSON.stringify(context)).not.toContain("vscode-notebook-cell:");
+  });
+
   it("classifies conversation placeholders and accessibility navigation as generic titles", () => {
     for (const title of [
       "New chat",
@@ -84,6 +122,9 @@ describe("relay protocol", () => {
     expect(isRelayProductVersionCompatible("0.1.1", "0.1.0")).toBe(true);
     expect(isRelayProductVersionCompatible("0.1.0", "0.0.1")).toBe(false);
     expect(isRelayProductVersionCompatible("0.1.1", "0.1.2")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.2", "0.1.3")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.3", "0.1.2")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.1", "0.1.3")).toBe(false);
     expect(isRelayProductVersionCompatible("0.1.0", "0.2.0")).toBe(false);
   });
 
@@ -146,6 +187,80 @@ describe("relay protocol", () => {
       safeParseRelayEnvelope({
         ...acknowledgement,
         payload: { ...acknowledgement.payload, tabDisposition: "assumed" },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("validates explicit lease purposes while preserving legacy conversation.open payloads", () => {
+    const base = {
+      version: PROTOCOL_VERSION,
+      id: "open-request-a",
+      type: "conversation.open",
+      instanceId: "window-a",
+      conversationId: "conversation-a",
+    } as const;
+
+    expect(safeParseRelayEnvelope({ ...base, payload: { active: true } }).success).toBe(true);
+    expect(safeParseRelayEnvelope({ ...base, payload: { dispatchIntent: true } }).success).toBe(
+      true,
+    );
+    expect(
+      safeParseRelayEnvelope({
+        ...base,
+        payload: { active: false, dispatchIntent: true, purpose: "dispatch" },
+      }).success,
+    ).toBe(true);
+    expect(
+      safeParseRelayEnvelope({
+        ...base,
+        payload: { active: true, dispatchIntent: true, purpose: "view" },
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseRelayEnvelope({
+        ...base,
+        payload: { dispatchIntent: false, purpose: "dispatch" },
+      }).success,
+    ).toBe(false);
+    expect(safeParseRelayEnvelope({ ...base, payload: { purpose: "background" } }).success).toBe(
+      false,
+    );
+  });
+
+  it("validates non-destructive lease release requests and correlated acknowledgements", () => {
+    const release = makeEnvelope({
+      type: "conversation.release",
+      instanceId: "window-a",
+      conversationId: "conversation-a",
+      payload: { purpose: "view", reason: "inactive" },
+    });
+    const acknowledgement = makeEnvelope({
+      type: "conversation.released",
+      instanceId: "window-a",
+      conversationId: "conversation-a",
+      payload: {
+        requestId: release.id,
+        purpose: "view",
+        reason: "inactive",
+      },
+    });
+
+    expect(safeParseRelayEnvelope(release).success).toBe(true);
+    expect(safeParseRelayEnvelope(acknowledgement).success).toBe(true);
+    expect(isHostToChromeMessageType("conversation.release")).toBe(true);
+    expect(isChromeToHostMessageType("conversation.release")).toBe(false);
+    expect(isChromeToHostMessageType("conversation.released")).toBe(true);
+    expect(isHostToChromeMessageType("conversation.released")).toBe(false);
+    expect(
+      safeParseRelayEnvelope({
+        ...release,
+        payload: { purpose: "view", reason: "deleted" },
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseRelayEnvelope({
+        ...acknowledgement,
+        payload: { purpose: "view", reason: "inactive" },
       }).success,
     ).toBe(false);
   });

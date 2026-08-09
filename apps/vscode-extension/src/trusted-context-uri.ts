@@ -5,7 +5,8 @@ import { assertAllowedContextFile } from "./services/context-policy";
 
 const ALLOWED_CONTEXT_URI_SCHEMES = new Set(["file", "untitled", "vscode-remote"]);
 
-export type TrustedContextUriFailure = "invalid-uri" | "unsupported-scheme" | "basename-mismatch";
+export type TrustedContextUriFailure =
+  "anchor-uri-mismatch" | "invalid-uri" | "unsupported-scheme" | "basename-mismatch";
 
 export class TrustedContextUriError extends Error {
   constructor(readonly reason: TrustedContextUriFailure) {
@@ -17,6 +18,13 @@ export class TrustedContextUriError extends Error {
 /** Resolves only the editor URI captured by a host-owned context snapshot. */
 export function trustedContextUri(context: ContextSnapshot) {
   assertAllowedContextFile(context.fileName);
+
+  if (
+    context.sourceAnchor?.formatVersion === 2 &&
+    context.sourceAnchor.notebookUri !== context.uri
+  ) {
+    throw new TrustedContextUriError("anchor-uri-mismatch");
+  }
 
   let uri: vscode.Uri;
   try {

@@ -2,7 +2,8 @@ import type { ContextSnapshot, Conversation, ConversationMessage } from "@ask2gp
 import { describe, expect, it } from "vitest";
 
 import { findConversationTraceMatches, type ConversationTraceMatch } from "./conversation-trace";
-import type { SelectionReference } from "./selection-reference";
+import type { NotebookCellReference, SelectionReference } from "./selection-reference";
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "./source-anchor";
 import type { AppState } from "./types";
 
 describe("findConversationTraceMatches", () => {
@@ -273,6 +274,142 @@ describe("findConversationTraceMatches", () => {
       ),
     ).toEqual([]);
   });
+
+  it("matches a notebook turn from container, cell fingerprint, range, and content evidence", () => {
+    const notebook = notebookContext("notebook-context", "selected()", {
+      cellIndex: 4,
+      notebookVersion: 7,
+    });
+    const state = makeState([
+      makeConversation("notebook", [message("notebook-message", "user", [notebook])]),
+    ]);
+
+    const matches = findConversationTraceMatches(
+      state,
+      notebookReference("selected()", { cellIndex: 4, notebookVersion: 7 }),
+      "selected()",
+    );
+
+    expect(matches).toEqual([
+      expect.objectContaining({
+        confidence: "exact",
+        contextId: "notebook-context",
+        matchKind: "exact",
+      }),
+    ]);
+  });
+
+  it("matches an unchanged single cell at the same index after the notebook version changes", () => {
+    const notebook = notebookContext("captured", "selected()", {
+      cellIndex: 0,
+      notebookVersion: 3,
+    });
+    const state = makeState([
+      makeConversation("notebook", [message("notebook-message", "user", [notebook])]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        notebookReference("selected()", { cellIndex: 0, notebookVersion: 8 }),
+        "selected()",
+      ),
+    ).toEqual([expect.objectContaining({ contextId: "captured", matchKind: "exact" })]);
+  });
+
+  it("fails closed at a stable index when capture-time neighbor evidence changed", () => {
+    const notebook = notebookContext("captured", "selected()", {
+      beforeCellSha256: sourceAnchorSha256("captured-before"),
+      cellIndex: 2,
+      notebookVersion: 3,
+    });
+    const state = makeState([
+      makeConversation("notebook", [message("notebook-message", "user", [notebook])]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        notebookReference("selected()", {
+          beforeCellSha256: sourceAnchorSha256("replacement-before"),
+          cellIndex: 2,
+          notebookVersion: 8,
+        }),
+        "selected()",
+      ),
+    ).toEqual([]);
+  });
+
+  it("fails closed when equal source moved without capture-time neighbor evidence", () => {
+    const notebook = notebookContext("captured", "selected()", {
+      cellIndex: 1,
+      notebookVersion: 3,
+    });
+    const state = makeState([
+      makeConversation("notebook", [message("notebook-message", "user", [notebook])]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        notebookReference("selected()", { cellIndex: 4, notebookVersion: 8 }),
+        "selected()",
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not confuse another same-source cell after notebook structure changes", () => {
+    const notebook = notebookContext("captured", "selected()", {
+      beforeCellSha256: sourceAnchorSha256("captured-before"),
+      afterCellSha256: sourceAnchorSha256("captured-after"),
+      cellIndex: 2,
+      notebookVersion: 3,
+    });
+    const state = makeState([
+      makeConversation("notebook", [message("notebook-message", "user", [notebook])]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        notebookReference("selected()", {
+          beforeCellSha256: sourceAnchorSha256("different-before"),
+          afterCellSha256: sourceAnchorSha256("captured-after"),
+          cellIndex: 5,
+          notebookVersion: 8,
+        }),
+        "selected()",
+      ),
+    ).toEqual([]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        notebookReference("selected()", {
+          beforeCellSha256: sourceAnchorSha256("captured-before"),
+          afterCellSha256: sourceAnchorSha256("captured-after"),
+          cellIndex: 5,
+          notebookVersion: 8,
+        }),
+        "selected()",
+      ),
+    ).toEqual([expect.objectContaining({ contextId: "captured" })]);
+  });
+
+  it("does not let a plain text-document reference address notebook context", () => {
+    const notebook = notebookContext("captured", "selected()");
+    const state = makeState([
+      makeConversation("notebook", [message("notebook-message", "user", [notebook])]),
+    ]);
+
+    expect(
+      findConversationTraceMatches(
+        state,
+        selection({ uri: "file:///repo/analysis.ipynb" }),
+        "selected()",
+      ),
+    ).toEqual([]);
+  });
 });
 
 function summary(match: ConversationTraceMatch) {
@@ -283,6 +420,31 @@ function selection(overrides: Partial<SelectionReference> = {}): SelectionRefere
   return {
     uri: "file:///repo/source.ts",
     documentVersion: 1,
+    startLine: 2,
+    startCharacter: 0,
+    endLine: 2,
+    endCharacter: 10,
+    ...overrides,
+  };
+}
+
+function notebookReference(
+  cellContent: string,
+  overrides: Partial<NotebookCellReference> = {},
+): NotebookCellReference {
+  return {
+    type: "notebook-cell",
+    notebookUri: "file:///repo/analysis.ipynb",
+    notebookType: "jupyter-notebook",
+    notebookVersion: 1,
+    cellUri: "vscode-notebook-cell:///repo/analysis.ipynb#cell-1",
+    cellIndex: 1,
+    cellKind: "code",
+    cellLanguage: "python",
+    cellDocumentVersion: 1,
+    cellContentSha256: sourceAnchorSha256(cellContent),
+    normalizedCellContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(cellContent)),
+    scope: "range",
     startLine: 2,
     startCharacter: 0,
     endLine: 2,
@@ -304,6 +466,43 @@ function context(id: string, overrides: Partial<ContextSnapshot> = {}): ContextS
     charCount: 10,
     unsaved: false,
     ...overrides,
+  };
+}
+
+function notebookContext(
+  id: string,
+  content: string,
+  anchorOverrides: Partial<Extract<ContextSnapshot["sourceAnchor"], { formatVersion: 2 }>> = {},
+): ContextSnapshot {
+  const cellContent = content;
+  return {
+    id,
+    kind: "selection",
+    fileName: "analysis.ipynb",
+    uri: "file:///repo/analysis.ipynb",
+    language: "python",
+    startLine: 3,
+    endLine: 3,
+    content,
+    charCount: content.length,
+    unsaved: false,
+    sourceAnchor: {
+      formatVersion: 2,
+      notebookUri: "file:///repo/analysis.ipynb",
+      notebookType: "jupyter-notebook",
+      notebookVersion: 1,
+      cellIndex: 1,
+      cellKind: "code",
+      cellLanguage: "python",
+      scope: "range",
+      documentVersion: 1,
+      range: { startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 10 },
+      contentSha256: sourceAnchorSha256(content),
+      normalizedContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(content)),
+      cellContentSha256: sourceAnchorSha256(cellContent),
+      normalizedCellContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(cellContent)),
+      ...anchorOverrides,
+    },
   };
 }
 

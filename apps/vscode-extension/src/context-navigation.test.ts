@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const vscodeMock = vi.hoisted(() => ({
+  notebooks: new Map<string, unknown>(),
+  openNotebookDocument: vi.fn(),
   openTextDocument: vi.fn(),
+  showNotebookDocument: vi.fn(),
   showTextDocument: vi.fn(),
+  visibleTextEditors: [] as unknown[],
 }));
 
 vi.mock("vscode", () => {
@@ -25,10 +29,20 @@ vi.mock("vscode", () => {
 
   class Selection extends Range {}
 
+  class NotebookRange {
+    constructor(
+      readonly start: number,
+      readonly end: number,
+    ) {}
+  }
+
   return {
     Position,
     Range,
     Selection,
+    NotebookRange,
+    NotebookCellKind: { Markup: 1, Code: 2 },
+    NotebookEditorRevealType: { InCenterIfOutsideViewport: 2 },
     TextEditorRevealType: { InCenterIfOutsideViewport: 2 },
     Uri: {
       parse: (value: string) => {
@@ -42,12 +56,21 @@ vi.mock("vscode", () => {
         return { scheme, fsPath: path, path, toString: () => value };
       },
     },
-    window: { showTextDocument: vscodeMock.showTextDocument },
-    workspace: { openTextDocument: vscodeMock.openTextDocument },
+    window: {
+      get visibleTextEditors() {
+        return vscodeMock.visibleTextEditors;
+      },
+      showNotebookDocument: vscodeMock.showNotebookDocument,
+      showTextDocument: vscodeMock.showTextDocument,
+    },
+    workspace: {
+      openNotebookDocument: vscodeMock.openNotebookDocument,
+      openTextDocument: vscodeMock.openTextDocument,
+    },
   };
 });
 
-import type { ContextSnapshot } from "@ask2gpt/protocol";
+import type { ContextSnapshot, SourceAnchorV1 } from "@ask2gpt/protocol";
 
 import { openContextFromState, resolveContextFromState } from "./context-navigation";
 import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "./source-anchor";
@@ -55,7 +78,21 @@ import type { AppState } from "./types";
 
 describe("context navigation", () => {
   beforeEach(() => {
+    vscodeMock.notebooks.clear();
+    vscodeMock.visibleTextEditors.length = 0;
+    vscodeMock.openNotebookDocument
+      .mockReset()
+      .mockImplementation(async (uri: { toString(exact?: boolean): string }) => {
+        const notebook = vscodeMock.notebooks.get(uri.toString());
+        if (!notebook) throw new Error(`Missing notebook: ${uri.toString()}`);
+        return notebook;
+      });
     vscodeMock.openTextDocument.mockReset();
+    vscodeMock.showNotebookDocument.mockReset().mockImplementation(async () => ({
+      selection: undefined,
+      selections: [],
+      revealRange: vi.fn(),
+    }));
     vscodeMock.showTextDocument.mockReset();
   });
 
@@ -319,6 +356,50 @@ describe("context navigation", () => {
     ).rejects.toMatchObject({ code: "SENSITIVE_CONTEXT" });
     expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
   });
+
+  it("opens a notebook container and reveals the uniquely relocated cell", async () => {
+    const source = "print(value)";
+    const notebookUri = "file:///workspace/analysis.ipynb";
+    const notebook = testNotebook(notebookUri, 8, ["before", source]);
+    vscodeMock.notebooks.set(notebookUri, notebook);
+    const selected = context("notebook-context", notebookUri, {
+      fileName: "analysis.ipynb",
+      content: source,
+      charCount: source.length,
+      language: "python",
+      sourceAnchor: {
+        formatVersion: 2,
+        notebookUri,
+        notebookType: "jupyter-notebook",
+        notebookVersion: 2,
+        cellIndex: 0,
+        cellKind: "code",
+        cellLanguage: "python",
+        scope: "cell",
+        documentVersion: 1,
+        range: { startLine: 0, startCharacter: 0, endLine: 0, endCharacter: source.length },
+        contentSha256: sourceAnchorSha256(source),
+        normalizedContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(source)),
+        cellContentSha256: sourceAnchorSha256(source),
+        normalizedCellContentSha256: sourceAnchorSha256(normalizeSourceAnchorContent(source)),
+      },
+    });
+
+    await openContextFromState(appState(selected), "conversation-a", selected.id);
+
+    expect(vscodeMock.openNotebookDocument).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "/workspace/analysis.ipynb" }),
+    );
+    expect(vscodeMock.showNotebookDocument).toHaveBeenCalledWith(
+      notebook,
+      expect.objectContaining({
+        preserveFocus: false,
+        preview: true,
+        selections: [expect.objectContaining({ start: 1, end: 2 })],
+      }),
+    );
+    expect(vscodeMock.openTextDocument).not.toHaveBeenCalled();
+  });
 });
 
 function context(
@@ -350,10 +431,7 @@ function anchoredContext(id: string, content: string, overrides: Partial<Context
   });
 }
 
-function sourceAnchor(
-  content: string,
-  overrides: Partial<NonNullable<ContextSnapshot["sourceAnchor"]>> = {},
-) {
+function sourceAnchor(content: string, overrides: Partial<SourceAnchorV1> = {}) {
   return {
     formatVersion: 1 as const,
     contentSha256: sourceAnchorSha256(content),
@@ -471,4 +549,35 @@ function textDocument(content: string) {
       lineOffsets[position.line]! + Math.min(position.character, lines[position.line]!.length),
     );
   }
+}
+
+function testNotebook(uri: string, version: number, sources: string[]) {
+  const notebook = {
+    uri: testUri(uri),
+    notebookType: "jupyter-notebook",
+    version,
+    cellCount: sources.length,
+    cells: [] as Array<{ index: number; notebook: unknown; kind: number; document: unknown }>,
+    cellAt(index: number) {
+      return this.cells[index]!;
+    },
+    getCells() {
+      return this.cells;
+    },
+  };
+  notebook.cells = sources.map((source, index) => ({
+    index,
+    notebook,
+    kind: 2,
+    document: {
+      ...textDocument(source),
+      uri: testUri(`vscode-notebook-cell:///workspace/analysis.ipynb#cell-${index}`),
+      languageId: "python",
+    },
+  }));
+  return notebook;
+}
+
+function testUri(value: string) {
+  return { scheme: value.split(":", 1)[0], path: value, toString: () => value };
 }

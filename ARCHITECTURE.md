@@ -1,6 +1,6 @@
 # Ask2GPT — Chrome Relay 编程助手：架构与安全边界
 
-本文描述 0.1.1 和 Relay 协议 v15。
+本文描述 0.1.3 和 Relay 协议 v15。
 
 产品架构目标是在 VS Code 中提供 Codex 风格的对话体验，同时使用用户已登录的 ChatGPT 网页
 会话作为回答来源：模型、消息、流式回答、标题和当前可见历史以 ChatGPT 页面为事实来源。
@@ -55,6 +55,14 @@ https://chatgpt.com/
   连接诊断，不会误投递成会话命令；协议关闭码和安全长度内的关闭原因也会转成可读提示。
 - 同一连接内的 envelope ID 防重放、协议方向和 `instanceId` 校验用于避免误路由，不能
   证明对端是可信本机进程。
+- v15 的 `conversation.release` / `conversation.released` 是 0.1.2 起可用的可选页面租约优化。
+  Host 以 `TAB_LEASE_MINIMUM_RELAY_VERSION = [0, 1, 2]` / `supportsTabLeases()` 做 rolling
+  capability gate：连接 0.1.1 Relay 时仍发送不含 `purpose` 的 legacy `conversation.open`，并且
+  不发送 `conversation.release`；确认 Relay 至少为 0.1.2 后，才发送 `purpose` 和 release。
+  Relay 只把 release 当成启动空闲证明的提示；连接中断或 3 秒内没有 ACK 都不得影响会话切换、
+  发送、历史持久化或恢复的正确性。该能力保持 v15 的向后兼容可选字段，不提升协议版本。相邻
+  patch 的兼容窗口只用于先后升级仍在运行的双端，不承诺把已写入 0.1.2 状态的 Relay 二进制降回
+  0.1.1；二进制回滚必须视为不支持，正式安装始终应让 VSIX 与 Relay 保持同版。
 
 VS Code 窗口 reload 后重新取得自己的存储槽位和稳定路由；同一工作区的并行窗口会租用
 不同槽位，避免覆盖记录、替换 socket、接管错误标签页或串流其他窗口的回答。
@@ -78,19 +86,54 @@ Chrome Relay 持久保存一个全局 `Ask2GPT` Project 绑定：
   Ask2GPT Project 等确需用户处理时保留并聚焦，临时故障时立即清理；
 - 已有普通会话 URL `https://chatgpt.com/c/...` 仅作为升级兼容映射继续恢复；
 - 本地换会话、重命名或删除不调用 ChatGPT 的移动、重命名或删除能力。
-- `conversation.close` 只有在 owned 标签成功关闭、确认已不存在，或调用方明确要求仅解除映射后
-  才清除本地映射；成功返回与请求 ID 关联的 `conversation.closed`。关闭失败保留映射并返回
-  可重试错误，不以固定延时假定成功。
+- `conversation.close` 仍是本地会话删除使用的逻辑清理命令，不承担池回收职责。Relay 自建页在
+  请求关闭失败时保留映射并返回可重试错误；借用页和旧版来源不明页返回 `left-open`、解除本地
+  映射但保留 Chrome 标签页。成功返回与请求 ID 关联的 `conversation.closed`，不以固定延时
+  假定关闭成功。
 
-Chrome 只管理两类标签页：
+Chrome 为映射标签记录三类 provenance：
 
-1. Ask2GPT 为本地会话创建的标签页；
-2. 已由本地 `instanceId + conversationId + remoteUrl` 明确映射的标签页。
+1. `created`：当前 Relay 明确创建，可在满足全部安全条件时进入受管池；
+2. `borrowed`：按精确 `instanceId + conversationId + remoteUrl` 采用的既有页面，只用于该映射；
+3. `legacy-unknown`：升级前记录或会话存储丢失后无法证明来源的页面，始终按未知来源处理。
 
-`tabId + instanceId + conversationId + remoteUrl` 共同约束命令和返回事件。Relay 不通过
-ChatGPT 左侧栏寻找会话，不枚举账号历史，也不把“标题相同”当作会话身份。仅在绑定缺失时，
-Relay 会检查已打开 ChatGPT 标签页的当前可见 Project 路由和名称，以自动识别 `Ask2GPT`；
-用户也可在 Popup 中显式绑定当前可见 Project。
+缺少 provenance 的旧记录只迁移为 `legacy-unknown`，不会猜测成 `created`。当前 schema 要求
+`borrowed` 同时写入 `owned: false`，但这只是 0.1.2 运行时和持久化格式的不变量，不是旧二进制的
+回滚保护机制。`borrowed` 与 `legacy-unknown` 不会被 0.1.2 自动导航、复用或关闭；删除本地会话时
+也只解除映射。Popup 会报告这些页面或可能的旧 Project 根页，用户必须先在 Chrome 标签栏确认
+内容，再手动关闭。不得用 0.1.1 Relay 打开 0.1.2 写入的会话状态。
+
+### 标签页租约、复用与回收
+
+- 新建的空白草稿是纯 Host 状态：活动会话 ID 写入 workspace state，并在 VS Code Reload 后复用
+  同一安全 ID；它没有远端 URL 和可见消息时不做被动预热。只有首次发送或明确的 dispatch intent
+  才打开/租用 ChatGPT 页面；点击、聚焦或开始输入 Composer 会发出 dispatch intent，因此可能在
+  真正提交前预热页面，但不会把问题写入网页或发送。
+- Relay 以 `MAX_CONCURRENT_RUNS = 3` 作为受管页面软容量，并通过一个全局分配器串行完成采用、
+  复用和创建。不同 VS Code 窗口仍可并行运行，但同一物理标签在任一时刻只有一个
+  `instanceId + conversationId + leaseEpoch` 租约。
+- 复用只选择 `created` 的最久未使用页。Worker 侧必须确认没有活动 run、未确认终态、历史屏障、
+  canonicalization、可见性/debugger 租约、导航、快照同步、预热或业务命令；Chrome 页还必须非
+  active/highlighted/pinned/audible 且 Project scope 精确一致。
+- Content Script 通过 `content.inspectIdleState` 另行证明：页面没有活动 run，恰好一个可见且
+  可写的 composer，草稿为空，没有附件、停止/响应控件或可见 modal。任一证据缺失、歧义、超时
+  或 selector 版本不兼容都 fail closed；页面保持原租约。
+- 若三个受管页都受保护或无法证明空闲，Relay 为正确性创建临时 overflow 页面，不抢占、不清空
+  草稿，也不关闭用户页面。安全页稍后才按 LRU 复用或被 GC 回收。
+- 用户在 Chrome 中手动激活受管页后记录 `userClaimedAt`，永久退出自动复用与自动关闭候选；Relay
+  为发送/恢复执行的内部激活不会误标为用户接管。
+- 一分钟周期 GC 在 Host 已连接时只关闭空闲至少 10 分钟的 surplus `created` 页，并至少保留一个
+  warm page；对应 Host 断开且最后使用已满 30 分钟后，才可关闭最终安全空闲页。每次关闭前重新
+  执行 Worker 检查与页面空闲证明。
+- Relay Popup 显示 managed/active/reusable/protected、borrowed、legacy candidates 与软容量的
+  状态快照；`reusable`、legacy candidates 和预计可清理数都是估算，可能在页面变化后立即失效。
+  “清理安全闲置页”会在执行时二次检查并只关闭当前再次通过完整证明的 `created` 页，因此最终
+  关闭数可以少于 Popup 先前显示的候选数；provenance 警告不构成自动删除授权。
+
+`tabId + instanceId + conversationId + remoteUrl` 共同约束命令和返回事件；物理页换租约时再以单调
+`leaseEpoch` 阻止迟到的分配工作覆盖新租约。Relay 不通过 ChatGPT 左侧栏寻找会话，不枚举账号
+历史，也不把“标题相同”当作会话身份。仅在绑定缺失时，Relay 会检查已打开 ChatGPT 标签页的
+当前可见 Project 路由和名称，以自动识别 `Ask2GPT`；用户也可在 Popup 中显式绑定当前可见 Project。
 
 Chrome Relay 是运行中标签页映射的权威；Host 的 `remoteUrl` 是标签页关闭或重启后的恢复缓存。
 稳定映射由 `instanceId + conversationId + remoteUrl` 标识。对于仍然存在的 owned 标签页，Host
@@ -131,8 +174,10 @@ closed，不会自动重放问题或切换到其他后端。
    run 不一致时 fail closed。
 2. 每个会话拥有独立的待发送草稿上下文，新会话默认不附加任何代码。用户可通过 Ask2GPT 侧栏
    标题栏、编辑器标题栏、右键菜单、命令面板或黄色灯泡中的动作明确附加当前选区，或通过
-   Composer 的 `+` 附加当前选区/当前文件/选择文本文件；这些快照都来自编辑器内存缓冲区，并且在 Composer 中可见、
-   可预览和可移除。
+   Composer 的 `+` 附加当前选区/当前文件/选择文本文件。Notebook 使用独立的 Cell 标题栏、Notebook
+   工具栏、命令面板和 Composer 入口，附加 Cell 内选区、当前 Cell 或多个所选 Cell；这些快照都来自
+   编辑器内存缓冲区，并且在 Composer 中可见、可预览和可移除。
+   空白新会话 ID 在 Reload 后保持稳定，但没有远端 URL 与可见消息时不触发 Chrome 页面预热。
 3. 宿主对所有合法非空 prompt 使用同一发送和并发检查，不做本地意图分类或产品 handoff。
 4. 宿主按会话保存、去重并持久化待发送 Context Bundle。会话切换不得清空草稿或把附件
    带入其他会话；发送时原子冻结用户可见的快照。可见 Prompt 始终只有用户问题，所有快照均随
@@ -206,7 +251,7 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 函数定位仅对这些已附加 URI 调用只读的 Document Symbol Provider；无语言服务时可从有界快照
   的定义索引回退，且定义范围仍必须位于附件证据内。文件名或定义有歧义时使用 VS Code QuickPick，
   不随机选择。
-- 每个捕获上下文随加密会话持久化 `SourceAnchorV1`：精确内容与规范化内容 SHA-256、文档版本、
+- 每个普通文本上下文随加密会话持久化 `SourceAnchorV1`：精确内容与规范化内容 SHA-256、文档版本、
   可选邻接行 SHA-256 和工作区相对路径。它只补充来源与重定位证据，不授权读取其他文件；较新、
   当前版本无法识别的 anchor 会被丢弃但不会导致整段对话不可读。
 - “查找关联对话”只扫描加密状态中已发送 user message 的 context 快照，并要求相同 URI 与唯一
@@ -214,6 +259,35 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
   `revealTurn`；问题轮次和对应上下文卡片持续强调，直到用户手动清除。
 - 源码追踪不会调用工作区文件枚举或搜索；未在最近 user turn 明确附加的文件不会因回答文本而
   被打开。文件重命名或移动后，原 URI 反查可能失效，系统不会搜索工作区猜测替代路径。
+
+### Notebook Cell 上下文
+
+- Notebook 是 Cell-first 数据源，不是普通 JSON 文件。普通选区/当前文件入口会拒绝
+  `vscode-notebook-cell:` 文档；即使 `.ipynb` 被强制作为普通文本打开，也会在调用
+  `TextDocument.getText()` 前拒绝。系统文件选择入口同样拒绝 `.ipynb`；只有显式 Notebook 动作可以
+  创建 Cell 上下文。捕获只调用已选 Cell 的 `TextDocument.getText()`，不读取或持久化 outputs、execution
+  metadata、widget 状态、富 HTML、图片或 base64 数据。
+- Cell 内存在非空文本选区时只捕获精确范围；否则捕获当前完整 Cell。Notebook 多选按 Cell 序号排序、
+  去重，并在快照阶段共同执行最多 8 项、单项 40,000 字符、合计 60,000 字符的 Context Bundle 门禁。
+  Code 与 Markdown Cell 都可附加，只有 Code Cell 显示 8 个代码任务快捷动作。
+- `notebook/cell/title` 命令参数只能按对象身份解析为 Host 当前已打开 Notebook 中的真实
+  `NotebookCell`；因此点击非活动 Cell 的按钮仍绑定被点击 Cell，而不会误用活动编辑器。伪造或过期
+  的类 Cell 对象直接拒绝。Notebook toolbar 没有单 Cell 参数时才使用当前 Notebook 的明确选择。
+- `NotebookSourceAnchorV2` 保存 Notebook 容器 URI/类型/版本、捕获时 Cell 序号、Cell 类型与语言、
+  Cell 内范围、精确/规范化范围哈希、完整 Cell 哈希、相邻 Cell 哈希和可选工作区相对路径。虚拟
+  `vscode-notebook-cell:` URI 不进入持久化；只有 `file`、`untitled`、`vscode-remote` 容器可成为
+  Host 权威地址。
+- 发送时每个 Cell 生成独立的合成源文件附件，例如 `analysis.cell-004.L3-L12.py` 或
+  `analysis.cell-007.md`；未知语言降级为纯文本。可见问题仍只有用户问题，前端始终显示紧凑 Cell
+  卡片；不存在 V2 anchor 的 `.ipynb` 上下文在 transport 层再次 fail closed，不能作为原始 JSON
+  附件发送。
+- 上下文卡片通过 `openNotebookDocument` / `showNotebookDocument` 打开 Host 保存的 Notebook，
+  再以 `NotebookRange` / `revealRange` 定位 Cell 与 Cell 内范围。原索引只在 Notebook 版本和完整
+  Cell 证据仍一致时使用；Cell 移动后必须由唯一内容及邻接证据重定位，重复 Cell 返回 ambiguous，
+  删除或内容失配返回 stale/missing，均不得跳到第一个候选。
+- 回答中的合成附件 `file:line`、Cell 内函数定义、上下文卡片回跳以及编辑器 Cell 选区反查对话，共用
+  `conversationId + messageId/contextId` 的 Host 权威映射，形成四向 trace。Webview 不发送 Notebook
+  URI，Host 不枚举其他 Notebook、工作区文件或隐藏输出寻找替代目标。
 
 ### 后台模型同步
 
@@ -252,6 +326,7 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 待发送上下文包含选区时，Webview 在 Composer 内显示 8 个静态代码任务快捷动作。点击只修改当前
   会话的本地草稿并聚焦输入框，不新增 Host/protocol 消息，也不自动发送、排队或打断；只有用户
   确认发送后，草稿文本才与仍封装的选区上下文一起进入既有发送链路。
+- Notebook 多 Cell 中每个 Cell 单独计为一项；Code Cell 参与快捷动作可见性，Markdown Cell 不参与。
 
 任一层超限均明确拒绝，不静默截断。Content Script 必须观察到每个附件文件名且发送控件
 恢复可用后才提交，否则返回 `CHATGPT_ATTACHMENT_FAILED` 并 fail closed。可见 Prompt 不包含
@@ -268,6 +343,8 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 同一会话的保存、迁移和删除在宿主内串行执行；待写入内容在执行前快照。
 - Chrome 的最小 tab/run 映射写入扩展自己的 `chrome.storage.session` 或
   `chrome.storage.local`。这些记录不包含 ChatGPT Cookie，也不读取网站 storage。
+- tab 映射同时保存 `created | borrowed | legacy-unknown` provenance、单调 `leaseEpoch`、最近使用、
+  空闲证明和用户接管时间；缺失新字段的记录只按保守默认值恢复。
 - 删除和重命名只改变本地记录。删除可关闭插件创建的标签页，但不调用远端删除或重命名。
 - 断线删除使用不含对话内容的关闭墓碑，重连后补发幂等标签页关闭命令。
 
@@ -277,7 +354,9 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 每个窗口的会话 ID 只在其 `instanceId` 路由内解释；相同会话 ID 不能跨窗口串线。
 - Chrome 端最多三个会话同时生成；每个会话最多一个活动 run。
 - 业务命令按会话串行，不同会话可并行；Stop 不应被其他会话的冷标签页阻塞。
-- 关闭、重载或故障一个窗口时，只清理该实例的 socket 和标签页映射，不影响其他窗口。
+- 关闭、重载或故障一个窗口时只断开该实例的 socket，不立即释放或关闭物理页面，以覆盖短时
+  Reload；完成终态/逻辑删除仍按原协议收口。断开满 30 分钟后，只有经过完整证明的 Relay 自建
+  空闲页才可由 GC 回收，其他窗口不受影响。
 
 ## 中断与恢复
 

@@ -11,7 +11,10 @@ import type {
 import type { Ask2GPTController } from "./controller";
 import { openContextFromState } from "./context-navigation";
 import { openAnswerSourceReferenceFromState, openAnswerSymbolFromState } from "./source-trace";
-import { selectionReferenceFromEditor } from "./selection-reference";
+import {
+  notebookCellReferencesFromEditor,
+  selectionReferenceFromEditor,
+} from "./selection-reference";
 import { Ask2GPTError } from "./services/errors";
 import type { SafeLogger } from "./services/logger";
 import { withSourceTraceHints } from "./source-trace-index";
@@ -367,6 +370,23 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
               );
             }
             this.controller.attachSelection(message.conversationId, reference);
+          }
+          return;
+        case "attachNotebookCell":
+          {
+            const references = notebookCellReferencesFromEditor(
+              vscode.window.activeNotebookEditor,
+              vscode.window.activeTextEditor,
+            );
+            if (!references) {
+              throw new Ask2GPTError(
+                "NO_NOTEBOOK_CELL_SELECTION",
+                vscode.env.language.toLowerCase().startsWith("zh")
+                  ? "请先在 Notebook 中选择一个或多个 Cell。"
+                  : "Select one or more notebook cells first.",
+              );
+            }
+            this.controller.attachNotebookCells(message.conversationId, references);
           }
           return;
         case "attachCurrentFile":

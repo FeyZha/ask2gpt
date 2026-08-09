@@ -1,6 +1,7 @@
 # Ask2GPT 体验样例
 
-这里的 `insight-board.ts` 是一段完全离线的 TypeScript 示例代码：它只在内存中把用户反馈归纳为洞察，不读取文件、不访问网络，也不需要密钥。
+这里的 `insight-board.ts` 是一段完全离线的 TypeScript 示例代码；`notebook-tour.ipynb` 提供等价的
+Notebook Cell 体验。两个样例都只处理虚构数据，不访问网络，也不需要密钥。
 
 代码包含正常业务逻辑，也保留了缓存、数据规范化、可变性和时间表示等可讨论点。体验时先不要看答案，直接让 Ask2GPT 帮你分析。
 
@@ -55,10 +56,28 @@
 
 这个请求应与普通问题一样发送到当前 ChatGPT 会话，不出现本地拦截提示或其他产品的任务模板。
 
+## 第六次体验：Notebook Cell
+
+1. 使用 VS Code 的 Notebook 编辑器打开 `notebook-tour.ipynb`。
+2. 在 Python Code Cell 内选择一段源码，点击 Cell 标题栏的 Ask2GPT 图标；确认卡片显示 Notebook
+   文件名、Cell 序号、语言、行号以及“未包含输出”。
+3. 清空文本选区后再次附加，确认捕获当前完整 Cell；再选择多个 Cell，从 Notebook 工具栏或
+   Composer 的 `+` 附加，确认按 Notebook 顺序各生成一个卡片。
+4. 点击“解释这段代码”或“查找问题”，再发送：
+
+> 解释这些 Cell 之间的数据流，并指出最可能造成结果不一致的位置。只分析源码，不使用输出。
+
+5. 点击已发送卡片或回答中的 `notebook-tour.cell-XXX.py:line`，应返回原 Cell；重新选择该源码并运行
+   “查找关联对话”，应返回同一轮次。
+
+整个流程都不应把原始 `.ipynb` JSON、Cell 输出、metadata、widget、HTML、图片或 base64 数据显示
+在问题正文或发送到 ChatGPT。
+
 ## 体验检查
 
 - 发送前能看到文件名、语言、行号、字符数和代码预览。
 - 发送成功后，待发送上下文被清空。
 - 回答支持 Markdown、列表和代码块。
 - 多轮问题保持在同一个远端 ChatGPT 会话中。
+- Notebook 上下文保持 Cell-first、source-only，并能从卡片、回答引用和编辑器选区双向定位。
 - Ask2GPT 不修改本示例或项目中的任何文件。

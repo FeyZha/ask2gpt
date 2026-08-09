@@ -3,6 +3,65 @@
 All notable changes to Ask2GPT are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-08-09
+
+### Added
+
+- First-class Jupyter Notebook context capture for code and Markdown cells, including exact text
+  selections, whole-cell capture, and bounded multi-cell selection.
+- Notebook source provenance that keeps the stable notebook container URI together with cell,
+  content, and neighboring-cell hashes so inserted or moved cells can be relocated safely.
+- Notebook-aware source tracing: context cards, answer file/line references, symbol definitions, and
+  editor-to-conversation lookup resolve back to the authoritative cell instead of opening raw
+  `.ipynb` JSON.
+- Dedicated Notebook cell and toolbar actions, plus a Composer action for attaching the active cell.
+
+### Security
+
+- Notebook contexts contain cell source only. Outputs, execution metadata, HTML, images, widgets,
+  attachments, and base64 payloads are excluded, and `.ipynb` files are never uploaded as raw JSON.
+- Notebook cell virtual URIs are not trusted as durable source identities; navigation is restricted
+  to the captured `file`, `untitled`, or `vscode-remote` notebook container and fails closed when a
+  cell is stale or ambiguous.
+
+## [0.1.2] - 2026-08-09
+
+### Added
+
+- Relay tab leases with explicit `created`, `borrowed`, and fail-closed `legacy-unknown`
+  provenance, monotonic lease epochs, page-side idle attestation, and globally serialized allocation.
+- Borrowed user tabs persist `owned: false` as a 0.1.2 schema invariant and never enter 0.1.2's
+  automatic navigation, reuse, or close paths. Loading a 0.1.1 binary over 0.1.2 state is unsupported.
+- A three-page managed soft capacity shared across VS Code windows. Safely idle Relay-created pages
+  are reused by LRU; protected pages may temporarily overflow the target instead of being disturbed.
+- Conservative managed-page garbage collection: connected instances retain one warm page while
+  surplus pages become eligible after 10 idle minutes; pages for disconnected instances require 30
+  minutes since last use. Every close repeats worker and page idle checks.
+- Relay Popup pool-count estimates and a manual **clean safe idle pages** action that repeats every
+  worker and page proof at execution time. Borrowed, legacy-unknown, user-activated, dirty, running,
+  or terminal-unacknowledged pages are never eligible under 0.1.2.
+
+### Changed
+
+- Empty local drafts now keep the same conversation ID across VS Code reloads and remain purely
+  local until a send or explicit dispatch intent requires a ChatGPT page.
+- protocol v15 adds optional `conversation.open.payload.purpose`, `conversation.release`, and
+  `conversation.released` messages. The Host enables them only when
+  `TAB_LEASE_MINIMUM_RELAY_VERSION = [0, 1, 2]` is satisfied by `supportsTabLeases()`; a 0.1.2 Host
+  connected to a rolling 0.1.1 Relay continues using legacy open messages and sends no release.
+- The adjacent-patch protocol window supports rolling upgrades only. Binary rollback from Relay
+  0.1.2 to 0.1.1 is not supported; released installations must keep the VSIX and Relay on one version.
+- `conversation.release` is best-effort optimization only. A timeout, disconnect, unsupported peer,
+  or failed idle proof leaves the page leased and does not affect navigation, persistence, or send
+  correctness.
+
+### Security
+
+- Relay-created pages are recycled or closed only after all worker lifecycle barriers clear and the
+  exact page proves a unique empty writable composer with no attachment, response control, or modal.
+  Missing or ambiguous evidence fails closed. Borrowed and legacy pages are never automatically
+  navigated, recycled, or closed.
+
 ## [0.1.1] - 2026-08-09
 
 ### Added

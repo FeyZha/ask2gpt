@@ -1,4 +1,4 @@
-# Ask2GPT 0.1.1 — 人工验收
+# Ask2GPT 0.1.3 — 人工验收
 
 本清单针对 Relay protocol v15。验收前不要混用旧 VSIX 和旧 Chrome Relay。
 
@@ -6,15 +6,15 @@
 
 - [ ] 从不含 `node_modules`、`dist`、VSIX、ZIP 或旧版本归档的干净 checkout 执行
       `pnpm install --frozen-lockfile`、`pnpm audit:dependencies` 与 `pnpm verify`，全部通过。
-- [ ] `pnpm package` 生成 `ask2gpt-0.1.1.vsix` 与
-      `ask2gpt-relay-0.1.1.zip`。
+- [ ] `pnpm package` 生成 `ask2gpt-0.1.3.vsix` 与
+      `ask2gpt-relay-0.1.3.zip`。
 - [ ] `pnpm verify:artifacts` 通过；Release 中两个安装包的 SHA-256 与
       `SHA256SUMS.txt` 一致。
 - [ ] 根目录 `THIRD_PARTY_NOTICES.txt` 通过 `pnpm notices:check`；VSIX 和 Relay ZIP 都包含
       完全一致的第三方许可证声明，且同时保留 Ask2GPT 的 MIT `LICENSE`。
-- [ ] 安装 `ask2gpt-0.1.1.vsix` 后执行 **Reload / 重新加载**；没有提示时运行
+- [ ] 安装 `ask2gpt-0.1.3.vsix` 后执行 **Reload / 重新加载**；没有提示时运行
       `Developer: Reload Window`。
-- [ ] 在 `chrome://extensions` 中加载 0.1.1 Relay 目录；升级时必须完整替换解压目录，禁止只覆盖
+- [ ] 在 `chrome://extensions` 中加载 0.1.3 Relay 目录；升级时必须完整替换解压目录，禁止只覆盖
       `service-worker.js`、`content-script.js` 等个别文件，然后从 Chrome
       工具栏打开 Relay Popup 并点击“重新加载 Relay”（工具栏无入口时再使用扩展卡片的重载）。
 - [ ] Popup 明确说明重载无需验证码，也不会删除或重命名 ChatGPT 会话。
@@ -27,6 +27,12 @@
 - [ ] v15 发布线内按任意顺序更新 VSIX 和 Relay 时，仅 `0.1.0` 起且产品补丁版本一致或相差 1
       的双端保持连接；正式安装仍要求同版。低于 `0.1.0`、相差两版及以上或跨出 `0.1.x` 时
       明确显示版本不兼容。同步更新并重载后恢复。
+- [ ] 0.1.2 VSIX 连接仍在 rolling window 内的 0.1.1 Relay 时保持健康：Host 的
+      `supportsTabLeases()` 为 false，`conversation.open` 不带 `purpose`，且不发送
+      `conversation.release`；升级 Relay 至 0.1.2 后 capability 自动开启。反向组合（0.1.1 VSIX +
+      0.1.2 Relay）也继续接受 legacy open，不把可选租约字段当作握手条件。
+- [ ] 上述相邻 patch 组合只验收滚动升级，不验收二进制回滚。不得让 0.1.1 Relay 读取 0.1.2 已写入
+      的 session/local 状态；需要恢复时重新加载同版 0.1.2 Relay，并人工确认 Chrome 中仍打开的页面。
 - [ ] 版本不一致持续存在时，Relay 重试逐步退避到 30 秒，不以亚秒级频率刷连接与日志；
       同步更新后首次完整握手立即清零退避。
 - [ ] Host 在 `relay.hello` 后拒绝产品版本时，Relay 仍显示明确的版本错误，不出现短暂“已连接”
@@ -80,6 +86,50 @@
       “检查 Chrome 连接”可以立即开始新扫描。
 - [ ] 人为把同一 `conversationId` 放入两个实例路由，事件仍由 `instanceId` 隔离，不会
       进入错误窗口。
+
+## 空白草稿与 Relay 标签页池
+
+- [ ] 全新启动时记录活动空白草稿的本地 `conversationId`，不发送问题并连续执行三次
+      `Developer: Reload Window`；每次恢复同一 ID，Chrome 中不新增 Ask2GPT Project 根页或会话页。
+- [ ] 空白草稿尚未点击、聚焦或输入 Composer 时 Reload VS Code；草稿附件与本地会话身份保持且不
+      创建 ChatGPT 页。点击、聚焦或开始输入 Composer 会触发 dispatch prewarm，可能在提交前分配
+      页面；此时网页 composer 仍为空、问题未发送，Reload 后本地草稿与会话身份仍保持。
+- [ ] 连续新建并切换 50 个从未发送、没有远端 URL 的本地会话，再 Reload VS Code；活动空白 ID
+      稳定，Relay 不因被动预热创建 50 个标签页，也不出现重复 Project 根页。
+- [ ] 依次让 50 个会话各完成一次短回答并切换到下一会话；每次 release 失败或 3 秒 ACK 超时都不
+      阻塞切换与下一次发送。无保护条件时 Relay 复用最久未使用的自建空闲页，稳定受管池不超过三个；
+      若某页无法证明安全，允许临时 overflow，但不得清空或抢占它，之后只在证明安全时收敛。
+- [ ] 同时从三个 VS Code 窗口各启动一个真实回答，确认三个 Relay-created 页有互斥租约且并发运行；
+      第四个活动 run 被既有三并发门禁明确拒绝。三个终态完成、落盘并 ACK 后，页面才可能进入空闲池。
+- [ ] 在 Relay-created 页面留下未发送 composer 文本，分别附加一个文件、打开可见 modal、保留停止/
+      响应控件；逐项确认 `content.inspectIdleState` fail closed，页面不会被 LRU 复用、Popup 清理或 GC
+      关闭。清除状态后还必须重新通过唯一可见可写 composer、空文本和无附件证明。
+- [ ] 先在 Chrome 打开一个与本地 `remoteUrl` 精确相同、且未被当前 Relay 跟踪的会话页，再恢复本地
+      会话；Popup 将其计为 borrowed。切换、release、本地删除、Popup 清理与 GC 都不导航或关闭该页，
+      删除只返回 `left-open` 并解除本地映射。
+- [ ] 注入/保留升级前缺少 provenance 的 tab 记录并 Reload Relay；它只迁移为
+      `legacy-unknown`。Popup 报告 legacy candidate，但自动 GC 和“清理安全闲置页”均不关闭；用户
+      在 Chrome 标签栏确认后手动关闭。
+- [ ] 检查 0.1.2 新采用的用户页以 `provenance: borrowed` 与 `owned: false` 成对持久化；在 0.1.2
+      内切换、删除、Popup 清理与 GC 均不导航或关闭它。不要加载 0.1.1 二进制验证此项：跨版本
+      状态回滚不受支持，也不得作为用户页安全边界。
+- [ ] 点击一个 Relay-created 空闲页使其成为 Chrome 当前标签；它记录 `userClaimedAt` 并在 Popup
+      显示为 protected。之后创建更多会话、等待 GC、执行安全清理都不复用或关闭该页；Relay 为发送
+      进行的内部短时激活不能产生同样的用户接管标记。
+- [ ] Popup 的 managed/active/reusable/protected、borrowed、legacy candidates 与软容量 3 是读取
+      当时的状态快照/候选估算，不要求预计可清理数等于最终关闭数。点击“清理安全闲置页”后逐页
+      二次执行 worker 与页面证明，只减少当时仍安全的 Relay-created 页面，并跳过 running、dirty、
+      pinned、audible、active、user-claimed 及未知来源页。
+- [ ] Host 保持连接并准备至少三个安全空闲自建页；等待 10 分钟后的一分钟周期 GC 只关闭 surplus，
+      至少保留一个 warm page。关闭全部 VS Code Host 后，最终安全页在最后使用满 30 分钟前保持；
+      满 30 分钟且再次通过空闲证明后才关闭。修改系统时钟、worker suspension 或错过 alarm 不得造成
+      提前关闭；下一次唤醒按绝对时间重新判断。
+- [ ] 在 release 后但终态仍在 outbox、终态历史屏障未清、canonicalization/快照同步/导航/预热/
+      debugger/可见性租约仍存在的各阶段触发分配、Popup 清理和 GC；所有阶段都保持原页。只有精确
+      终态落盘 ACK、全部屏障清除并通过页面空闲证明后才允许复用。
+- [ ] Chrome Service Worker 普通 suspension/restart、Relay Popup 受控 Reload 和 VS Code Reload
+      都保持 `provenance + leaseEpoch + lastUsedAt + idleSince + userClaimedAt` 的保守语义；无法恢复
+      provenance 时降级为 `legacy-unknown`，绝不升级成 Relay-created。
 
 ## ChatGPT Project 与会话映射
 
@@ -177,8 +227,9 @@
       内容可能延迟；再次开启后恢复上述后台流式行为。
 - [ ] 在无活动 run 时，用户在同一个 owned 标签页内从 B 主动切换到会话 C；Relay 不导入 C、
       不改写 B 的绑定。重新选择本地会话或再次发送时，同一标签页恢复到 B。
-- [ ] 新建第二个本地会话会建立独立后台标签页；在两个本地会话间反复切换时，各自始终回到
-      原远端 URL，不新增第三个映射、不交叉同步历史。
+- [ ] 新建第二个本地会话本身不建立后台页；首次发送时取得独占租约。若第一会话已 release、
+      没有屏障且页面通过空闲证明，可用同一物理页导航到第二会话；否则使用另一页或安全 overflow。
+      两个本地会话的远端 URL、历史和事件始终按 `instanceId + conversationId + leaseEpoch` 隔离。
 - [ ] 用户关闭 B 的 owned 标签页后，重新选择该本地会话只按保存的 B URL 创建一个替代页；
       其他本地会话的标签页和映射保持不变。
 - [ ] 完成上述 A→B 会话后，在同一本地会话继续提问；Relay 直接使用当前 B，回答正常完成。
@@ -277,9 +328,53 @@
       文档版本及可用的邻接行 SHA-256；保存并 Reload VS Code 后这些元数据仍随加密会话恢复。
 - [ ] 重命名或移动已附加文件后，原 URI 的上下文打开与“查找关联对话”允许明确失败；不得枚举或搜索
       工作区、按同名文件猜测新 URI，且失败不改变编辑器内容或对话状态。
+
+### Notebook Cell 上下文
+
+- [ ] 使用 VS Code Notebook/Jupyter 编辑器打开
+      [`examples/ask2gpt-tour/notebook-tour.ipynb`](./examples/ask2gpt-tour/notebook-tour.ipynb)。Code Cell
+      标题栏显示“附加 Cell”与“查找关联对话”，Notebook 工具栏显示附加入口，命令面板与 Composer
+      `+` 也能找到 Notebook Cell 动作；普通文本编辑器入口和原有选区入口不消失、不重复。
+- [ ] 在 Code Cell 内选中精确代码并点击 Cell 标题栏动作；侧栏打开并显示
+      `notebook-tour.ipynb · Cell N · Python · Lx–Ly · 未包含输出`，问题输入框保持为空。清空文本选区
+      后再次触发会附加当前完整 Cell，不偷偷切换为普通“当前文件”或读取 `.ipynb` JSON。
+- [ ] 保持 Cell A 为活动编辑器，再直接点击 Cell B 标题栏的“附加 Cell”和“查找关联对话”；两项操作
+      都只绑定被点击的 Cell B。A 中的文本选区不得泄漏到 B，B 不是活动文本 Cell 时按完整 Cell 捕获。
+      传入伪造/过期的类 Cell 参数时明确拒绝，不能回退到 A 或 Notebook 当前选择。
+- [ ] 选择连续及非连续的多个 Code/Markdown Cell 后，从 Notebook 工具栏和 Composer `+` 分别附加；
+      每个 Cell 只出现一次并按 Notebook 顺序排列。Code Cell 显示 8 个代码任务快捷动作，只有 Markdown
+      Cell 时不显示这些代码专用动作，点击快捷动作仍只填草稿、不自动发送。
+- [ ] 发送前预览只包含 Cell source。为样例 Cell 添加文本输出、traceback、execution metadata、HTML、
+      图片、widget 状态和一段明显的 base64 标记后重新附加；卡片预览、ChatGPT 可见问题、附件内容、
+      加密会话记录与诊断都不得出现这些输出或元数据。发送附件名应类似
+      `notebook-tour.cell-004.L3-L12.py` / `notebook-tour.cell-007.md`，而不是 `.ipynb`。
+- [ ] 使用“重新打开编辑器方式 / Reopen Editor With”把 `notebook-tour.ipynb` 强制作为普通文本打开，
+      分别尝试附加文本选区和“当前文件”；两项都在读取/生成预览前明确要求使用 Notebook Cell 动作，
+      不产生上下文卡片。系统文件选择器选择同一文件也必须在 `openTextDocument` 前拒绝。构造/恢复
+      缺少合法 `NotebookSourceAnchorV2` 的 `.ipynb`
+      context 时，transport 再次以 `NOTEBOOK_RAW_CONTEXT_UNSUPPORTED` fail closed，页面不得出现附件。
+- [ ] 单个 Cell 超过 40,000 字符、所选 Cell 超过 8 个、多个 Cell 合计超过 60,000 字符时均在发送前
+      明确拒绝且不截断；恰好位于限制内时正常附加。每个 Cell 单独计为一个 Context Bundle 项。
+- [ ] 打开 Cell 动作后、真正捕获前修改 Notebook 或 Cell；旧 click-time reference 返回
+      `NOTEBOOK_CELL_STALE`，不得读取修改后的 Cell、回退到当前 Cell 或另一个 Notebook。未保存、
+      `untitled` 与 `vscode-remote` Notebook 仍按各自容器 URI 工作，其他 scheme 明确拒绝。
+- [ ] 发送一个 Code Cell 后插入/移动其他 Cell，再点击待发送或已发送上下文卡片；内容与邻接证据唯一
+      时使用 `openNotebookDocument` / `showNotebookDocument` 回到正确 Cell 和 Cell 内行范围。复制出
+      两个同内容且无法消歧的 Cell 时报告 ambiguous，删除或改写目标时报告 stale/missing；均不跳到
+      第一个候选或旧索引。
+- [ ] 在回答中点击 `notebook-tour.cell-NNN.py:line`，可回到该附件对应的 Cell 内行；点击回答引用的
+      Cell 内函数名可高亮其定义。未附加的 Notebook 文件、越界行、早于最近 user turn 的附件别名和
+      伪造 `vscode-notebook-cell:` URI 保持普通文本或明确拒绝。
+- [ ] 在 Notebook Cell 中重新选择已发送的源码并运行“查找关联对话”，可定位精确 user turn 与唯一
+      context 卡片；相同范围位于不同 Cell 时以 Notebook 容器、Cell 指纹和内容证据区分。完成卡片→
+      Cell、回答行号→Cell、回答函数→定义、Cell 选区→对话四条 trace 后手动清除强调。
+- [ ] 保存并 Reload VS Code，确认 V2 anchor 原样恢复且持久化记录不含 `vscode-notebook-cell:` URI。
+      修改 `formatVersion`、Notebook URI、Cell/范围哈希或添加未知字段的记录后 Reload，损坏 anchor
+      被丢弃/隔离但整段对话仍可读，任何定位操作都不得获得更宽读取权限。
+
 - [ ] 新建会话或首次进入待发送草稿时保持空白；即使活动编辑器有选区，也不得自动附加选区
       或当前文件。
-- [ ] 用户通过 Ask2GPT 侧栏/编辑器动作、黄色灯泡 Quick Fix 或输入框 `+` 显式添加的上下文立即
+- [ ] 用户通过 Ask2GPT 侧栏/编辑器/Notebook 动作、黄色灯泡 Quick Fix 或输入框 `+` 显式添加的上下文立即
       可见，显示文件名、语言、行号、字符数、未保存状态和“封装为代码上下文”；发送前可以预览和移除。
 - [ ] 移除上下文后，本草稿保持无上下文；编辑器焦点、选区、光标或文档变化不得偷偷恢复附件。
 - [ ] 用户可以在当前选区和当前文件之间切换；切换主上下文槽是替换而非叠加，明确选择的其他
@@ -309,8 +404,9 @@
 - [ ] 发送成功后当前 Context Bundle 进入已发送消息，输入区附件全部清空且不会自动重新挂回；
       发送失败时问题草稿、附件、默认/手动来源及移除状态完整恢复。
 - [ ] 显式读取只限用户从侧栏标题栏、编辑器标题栏、右键菜单、命令面板或黄色灯泡主动触发的
-      “问 Ask2GPT（使用当前选区）”动作，以及用户从 `+` 选择的当前选区/当前文件；无选区时动作
-      不读取任何内容，也不扫描、搜索、读取或上传工作区其他内容。
+      “问 Ask2GPT（使用当前选区）”动作，用户从 `+` 选择的当前选区/当前文件，以及 Notebook
+      Cell 标题栏、Notebook 工具栏、命令面板或 `+` 的显式 Cell 动作；无选区/Cell 时动作不读取任何
+      内容，也不扫描、搜索、读取或上传工作区其他内容。
 - [ ] 敏感文件、二进制、单项超过 40,000 字符、超过 8 项、总内容超过 60,000 字符、问题
       超过 20,000 字符时明确拒绝且不静默截断。
 - [ ] “帮我修改并运行测试”“解释如何修改这个算法”等普通编码请求都走同一条 Relay 发送链路，
@@ -348,9 +444,10 @@
       Pro”六个网页挡位并默认选中“极速”；打开菜单不触发目录请求，也不显示加载状态。
 - [ ] 选择挡位后 VS Code 标签在当前点击内立即变化，不显示“准备模型”或同步状态，也不操作
       ChatGPT 页面；用户可以继续输入，不需要等待。
-- [ ] 活动会话空闲时即预热账户模型目录和两次一致的完整历史指纹；健康预热后的发送只增加一次
-      新历史检查，并与 debugger 附加并行。冷启动或历史变化时回退到两次稳定检查；切换失败时
-      问题不得提交，成功时 ChatGPT 收到的模型与前端所选挡位一致。
+- [ ] 已有远端 URL 或可见历史的活动会话空闲时预热账户模型目录和两次一致的完整历史指纹；健康
+      预热后的发送只增加一次新历史检查，并与 debugger 附加并行。纯空白草稿不预热、不创建页。
+      冷启动或历史变化时回退到两次稳定检查；切换失败时问题不得提交，成功时 ChatGPT 收到的模型
+      与前端所选挡位一致。
 - [ ] 人为阻塞首个回答后的 `chrome.storage.session.set`，首个非空快照仍先到达 VS Code；解除
       阻塞后恢复提示完成持久化，Relay 重启仍可只读恢复且不会重复发送。
 - [ ] 发送前模型意图与问题属于同一请求；一次性意图只影响下一次 ChatGPT 页面请求，无法确认

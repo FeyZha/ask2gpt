@@ -2,6 +2,7 @@ import type { ContextSnapshot, Conversation, ConversationMessage } from "@ask2gp
 import { describe, expect, it } from "vitest";
 
 import { withSourceTraceHints } from "./source-trace-index";
+import { normalizeSourceAnchorContent, sourceAnchorSha256 } from "./source-anchor";
 import type { AppState } from "./types";
 
 describe("withSourceTraceHints", () => {
@@ -44,6 +45,21 @@ describe("withSourceTraceHints", () => {
     expect(
       withSourceTraceHints(state).sourceTraceHints?.["conversation-1"]?.answer?.fileReferences,
     ).toEqual(["06_vector_store.L34-L36.py:2"]);
+  });
+
+  it("recognizes a notebook attachment alias as cell-local line evidence", () => {
+    const context = makeNotebookContext("first()\nsecond()", {
+      cellIndex: 3,
+      range: { startLine: 4, startCharacter: 0, endLine: 5, endCharacter: 8 },
+    });
+    const state = makeState([
+      user("question", [context]),
+      assistant("answer", "See analysis.cell-004.L5-L6.py:2."),
+    ]);
+
+    expect(
+      withSourceTraceHints(state).sourceTraceHints?.["conversation-1"]?.answer?.fileReferences,
+    ).toEqual(["analysis.cell-004.L5-L6.py:2"]);
   });
 
   it("does not authorize a trailing attachment line outside the captured selection range", () => {
@@ -208,6 +224,48 @@ function makeContext(overrides: Partial<ContextSnapshot> = {}): ContextSnapshot 
     charCount: overrides.content?.length ?? 26,
     unsaved: false,
     ...overrides,
+  };
+}
+
+function makeNotebookContext(
+  content: string,
+  anchorOverrides: Partial<Extract<ContextSnapshot["sourceAnchor"], { formatVersion: 2 }>>,
+): ContextSnapshot {
+  const range = anchorOverrides.range ?? {
+    startLine: 0,
+    startCharacter: 0,
+    endLine: 0,
+    endCharacter: content.length,
+  };
+  const normalizedHash = sourceAnchorSha256(normalizeSourceAnchorContent(content));
+  return {
+    id: "notebook-context",
+    kind: "selection",
+    fileName: "analysis.ipynb",
+    uri: "file:///workspace/analysis.ipynb",
+    language: "python",
+    startLine: range.startLine + 1,
+    endLine: range.endLine + 1,
+    content,
+    charCount: content.length,
+    unsaved: false,
+    sourceAnchor: {
+      formatVersion: 2,
+      notebookUri: "file:///workspace/analysis.ipynb",
+      notebookType: "jupyter-notebook",
+      notebookVersion: 1,
+      cellIndex: 0,
+      cellKind: "code",
+      cellLanguage: "python",
+      scope: "range",
+      documentVersion: 1,
+      range,
+      contentSha256: sourceAnchorSha256(content),
+      normalizedContentSha256: normalizedHash,
+      cellContentSha256: sourceAnchorSha256(content),
+      normalizedCellContentSha256: normalizedHash,
+      ...anchorOverrides,
+    },
   };
 }
 

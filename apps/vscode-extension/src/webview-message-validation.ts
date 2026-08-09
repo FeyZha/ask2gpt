@@ -19,8 +19,9 @@ export function parseWebviewMessage(value: unknown): WebviewToHostMessage | unde
     case "newConversation":
       return isId(value.sourceConversationId) ? (value as WebviewToHostMessage) : undefined;
     case "attachSelection":
+    case "attachNotebookCell":
       return isId(value.conversationId) && hasOnlyKeys(value, ["type", "conversationId"])
-        ? { type: "attachSelection", conversationId: value.conversationId }
+        ? { type: value.type, conversationId: value.conversationId }
         : undefined;
     case "attachCurrentFile":
     case "attachFiles":
