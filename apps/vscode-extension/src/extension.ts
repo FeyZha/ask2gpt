@@ -2,6 +2,7 @@ import { PROTOCOL_VERSION } from "@ask2gpt/protocol";
 import * as vscode from "vscode";
 
 import { Ask2GPTController } from "./controller";
+import { findConversationTraceMatches, type ConversationTraceMatch } from "./conversation-trace";
 import { BrowserChatBackend } from "./services/browser-chat-backend";
 import { ChromeRelayServer } from "./services/chrome-relay-server";
 import { ContextService } from "./services/context-service";
@@ -33,6 +34,8 @@ let shutdownResources:
   | undefined;
 let shutdownPromise: Promise<void> | undefined;
 
+export const FIND_RELATED_TURN_COMMAND = "ask2gpt.findRelatedTurn";
+
 export async function activate(context: vscode.ExtensionContext) {
   const logger = new SafeLogger();
 
@@ -46,7 +49,7 @@ export async function activate(context: vscode.ExtensionContext) {
     "version" in packageJson &&
     typeof packageJson.version === "string"
       ? packageJson.version
-      : "0.0.1";
+      : "0.1.0";
 
   // Records remain inside extension-private global storage, but each relay
   // instance gets its own namespace to prevent cross-window lost updates.
@@ -130,6 +133,14 @@ export async function activate(context: vscode.ExtensionContext) {
   );
   const handoffSelection = createSelectionHandoff(controller, provider);
   const attachSelectionAndOpen = async (reference: SelectionReference | undefined) => {
+    if (!reference) {
+      void vscode.window.showWarningMessage(
+        vscode.env.language.toLowerCase().startsWith("zh")
+          ? "请先在编辑器中选择代码。"
+          : "Select code in the editor first.",
+      );
+      return;
+    }
     try {
       await handoffSelection(reference);
     } catch (error) {
@@ -146,6 +157,70 @@ export async function activate(context: vscode.ExtensionContext) {
     () => selectionReferenceFromEditor(vscode.window.activeTextEditor),
     attachSelectionAndOpen,
   );
+  const findRelatedTurn = async () => {
+    const editor = vscode.window.activeTextEditor;
+    const reference = selectionReferenceFromEditor(editor);
+    if (!editor || !reference) {
+      void vscode.window.showWarningMessage(
+        vscode.env.language.toLowerCase().startsWith("zh")
+          ? "请先在编辑器中选择代码。"
+          : "Select code in the editor first.",
+      );
+      return;
+    }
+
+    const selectedContent = editor.document.getText(editor.selection);
+    const matches = distinctTraceTurns(
+      findConversationTraceMatches(controller.getState(), reference, selectedContent),
+    );
+    const isZh = vscode.env.language.toLowerCase().startsWith("zh");
+    if (matches.length === 0) {
+      const attachLabel = isZh ? "使用此选区提问" : "Ask about this selection";
+      const action = await vscode.window.showInformationMessage(
+        isZh
+          ? "没有找到与当前选区关联的已发送对话。"
+          : "No sent conversation is linked to the current selection.",
+        attachLabel,
+      );
+      if (action === attachLabel) await attachSelectionAndOpen(reference);
+      return;
+    }
+
+    const selected =
+      matches.length === 1
+        ? matches[0]
+        : await vscode.window
+            .showQuickPick(
+              matches.map((match) => ({
+                label: `$(comment-discussion) ${match.conversationTitle}`,
+                description: `${match.conversationArchivedAt ? `${isZh ? "已归档" : "Archived"} · ` : ""}${match.contextFileName}:L${match.contextStartLine}–${match.contextEndLine}`,
+                detail: traceQuestionPreview(match.messageMarkdown),
+                match,
+              })),
+              {
+                matchOnDescription: true,
+                matchOnDetail: true,
+                placeHolder: isZh
+                  ? "选择与当前代码关联的对话轮次"
+                  : "Choose a conversation turn linked to this code",
+              },
+            )
+            .then((item) => item?.match);
+    if (!selected) return;
+
+    if (selected.conversationArchivedAt) {
+      const restoreLabel = isZh ? "恢复并打开" : "Restore and open";
+      const action = await vscode.window.showInformationMessage(
+        isZh ? "关联轮次位于已归档对话中。" : "The linked turn is in an archived conversation.",
+        restoreLabel,
+      );
+      if (action !== restoreLabel) return;
+      await controller.unarchiveConversation(selected.conversationId, true);
+    } else {
+      await controller.selectConversation(selected.conversationId);
+    }
+    await provider.revealTurn(selected.conversationId, selected.messageId, selected.contextId);
+  };
   const selectionCodeActions = registerSelectionCodeActionProvider();
   context.subscriptions.push(
     provider,
@@ -164,6 +239,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // and range. The wrapper also safely recaptures the active range if another
     // extension invokes the command without the internal reference.
     vscode.commands.registerCommand(ATTACH_SELECTION_COMMAND, attachActiveSelection),
+    vscode.commands.registerCommand(FIND_RELATED_TURN_COMMAND, findRelatedTurn),
     vscode.commands.registerCommand("ask2gpt.attachCurrentFile", async () => {
       const conversationId = controller.activeConversation?.id;
       if (!conversationId) return;
@@ -208,6 +284,21 @@ export async function activate(context: vscode.ExtensionContext) {
     version: extensionVersion,
     port: relay.port,
   });
+}
+
+function distinctTraceTurns(matches: ConversationTraceMatch[]) {
+  const seen = new Set<string>();
+  return matches.filter((match) => {
+    const key = `${match.conversationId}:${match.messageId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function traceQuestionPreview(markdown: string) {
+  const preview = markdown.replace(/\s+/gu, " ").trim();
+  return preview.length > 120 ? `${preview.slice(0, 119)}…` : preview;
 }
 
 export async function deactivate() {

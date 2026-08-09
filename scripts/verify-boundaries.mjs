@@ -18,6 +18,7 @@ const productionSources = [
   (file) =>
     /\.(?:ts|tsx)$/.test(file) && !/\.test\.(?:ts|tsx)$/.test(file) && !file.endsWith(".d.ts"),
 );
+let productionCodeActionConstructions = 0;
 
 const forbiddenRuntimePatterns = [
   [/\b(?:node:)?child_process\b/, "child_process"],
@@ -35,6 +36,7 @@ const forbiddenRuntimePatterns = [
 for (const file of productionSources) {
   const source = await readFile(file, "utf8");
   const relative = normalize(path.relative(root, file));
+  productionCodeActionConstructions += source.match(/new vscode\.CodeAction\s*\(/gu)?.length ?? 0;
 
   for (const [pattern, label] of forbiddenRuntimePatterns) {
     if (
@@ -60,6 +62,7 @@ for (const file of productionSources) {
     "setContext",
     "workbench.view.extension.ask2gptContainer",
     "ask2gpt.sidebar.focus",
+    "vscode.executeDocumentSymbolProvider",
   ]);
   for (const match of source.matchAll(/\bcommands\.executeCommand\s*\(\s*(["'`])([^"'`]+)\1/g)) {
     if (!approvedExecuteCommands.has(match[2])) {
@@ -101,6 +104,7 @@ const expectedCommands = [
   "ask2gpt.attachFiles",
   "ask2gpt.attachSelection",
   "ask2gpt.copyDiagnostics",
+  "ask2gpt.findRelatedTurn",
   "ask2gpt.newConversation",
   "ask2gpt.open",
   "ask2gpt.retryConnection",
@@ -126,6 +130,10 @@ if (
   failures.push("VS Code commands do not preserve the Ask2GPT brand and legacy command namespace");
 }
 const attachSelectionCommand = "ask2gpt.attachSelection";
+const findRelatedTurnCommand = "ask2gpt.findRelatedTurn";
+const attachSelectionWhen =
+  "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/";
+const attachSelectionViewWhen = "view == ask2gpt.sidebar";
 const visibleAttachSelectionMenus = Object.entries(vscodePackage.contributes.menus ?? {}).flatMap(
   ([menu, entries]) =>
     entries
@@ -138,19 +146,60 @@ const editorShortcutMenus = Object.keys(vscodePackage.contributes.menus ?? {}).f
 const attachSelectionContribution = vscodePackage.contributes.commands.find(
   (entry) => entry.command === attachSelectionCommand,
 );
-const hiddenPaletteEntry = vscodePackage.contributes.menus.commandPalette?.find(
+const paletteEntry = vscodePackage.contributes.menus.commandPalette?.find(
   (entry) => entry.command === attachSelectionCommand,
 );
 if (
   attachSelectionContribution?.enablement !== undefined ||
-  attachSelectionContribution?.icon !== undefined ||
+  attachSelectionContribution?.icon !== "$(comment-discussion)" ||
   !vscodePackage.activationEvents.includes(`onCommand:${attachSelectionCommand}`) ||
-  hiddenPaletteEntry?.when !== "false" ||
-  editorShortcutMenus.length !== 0 ||
-  visibleAttachSelectionMenus.length !== 0 ||
+  paletteEntry?.when !== attachSelectionWhen ||
+  JSON.stringify(editorShortcutMenus) !== JSON.stringify(["editor/title", "editor/context"]) ||
+  visibleAttachSelectionMenus.length !== 4 ||
+  !visibleAttachSelectionMenus.every(({ menu, entry }) =>
+    menu === "view/title"
+      ? entry.when === attachSelectionViewWhen
+      : entry.when === attachSelectionWhen,
+  ) ||
+  vscodePackage.contributes.menus["editor/title"]?.[0]?.group !== "navigation@1" ||
+  vscodePackage.contributes.menus["editor/context"]?.[0]?.group !== "navigation@10" ||
+  vscodePackage.contributes.menus["view/title"]?.[0]?.group !== "navigation@1" ||
   vscodePackage.contributes.keybindings !== undefined
 ) {
-  failures.push("VS Code selected-code surface must be reserved for one runtime lightbulb action");
+  failures.push("VS Code selected-code surface must use the reviewed editor and view actions");
+}
+const findRelatedTurnContribution = vscodePackage.contributes.commands.find(
+  (entry) => entry.command === findRelatedTurnCommand,
+);
+const visibleFindRelatedTurnMenus = Object.entries(vscodePackage.contributes.menus ?? {}).flatMap(
+  ([menu, entries]) =>
+    entries
+      .filter((entry) => entry.command === findRelatedTurnCommand && entry.when !== "false")
+      .map((entry) => ({ menu, entry })),
+);
+const expectedFindRelatedTurnMenus = [
+  { menu: "commandPalette", group: undefined },
+  { menu: "editor/title", group: "navigation@2" },
+  { menu: "editor/context", group: "navigation@11" },
+];
+if (
+  findRelatedTurnContribution?.enablement !== undefined ||
+  findRelatedTurnContribution?.icon !== "$(references)" ||
+  !vscodePackage.activationEvents.includes(`onCommand:${findRelatedTurnCommand}`) ||
+  visibleFindRelatedTurnMenus.length !== expectedFindRelatedTurnMenus.length ||
+  !expectedFindRelatedTurnMenus.every(({ menu, group }) =>
+    visibleFindRelatedTurnMenus.some(
+      (candidate) =>
+        candidate.menu === menu &&
+        candidate.entry.when === attachSelectionWhen &&
+        candidate.entry.group === group,
+    ),
+  ) ||
+  visibleFindRelatedTurnMenus.some(({ menu }) => menu === "view/title")
+) {
+  failures.push(
+    "VS Code related-turn command must stay selection-gated in the palette and reviewed editor actions",
+  );
 }
 const selectionHandoffSource = await readFile(
   path.join(vscodeSourceRoot, "selection-handoff.ts"),
@@ -161,6 +210,21 @@ const selectionCodeActionSource = await readFile(
   "utf8",
 );
 const extensionSource = await readFile(path.join(vscodeSourceRoot, "extension.ts"), "utf8");
+const webviewMessageValidationSource = await readFile(
+  path.join(vscodeSourceRoot, "webview-message-validation.ts"),
+  "utf8",
+);
+const openSourceReferenceStart = webviewMessageValidationSource.indexOf(
+  'case "openSourceReference":',
+);
+const openSourceReferenceEnd = webviewMessageValidationSource.indexOf(
+  'case "selectConversation":',
+  openSourceReferenceStart,
+);
+const openSourceReferenceValidation =
+  openSourceReferenceStart >= 0 && openSourceReferenceEnd > openSourceReferenceStart
+    ? webviewMessageValidationSource.slice(openSourceReferenceStart, openSourceReferenceEnd)
+    : "";
 if (
   !extensionSource.includes("registerSelectionCodeActionProvider()") ||
   !selectionCodeActionSource.includes("registerCodeActionsProvider") ||
@@ -168,11 +232,11 @@ if (
   !selectionCodeActionSource.includes(`command: ATTACH_SELECTION_COMMAND`) ||
   !selectionCodeActionSource.includes("vscode.window.activeTextEditor") ||
   (selectionCodeActionSource.match(/new vscode\.CodeAction\(/gu)?.length ?? 0) !== 1 ||
+  productionCodeActionConstructions !== 1 ||
   selectionCodeActionSource.includes("isPreferred = true") ||
   !productionSources.some((file) => normalize(file).endsWith("/selection-code-action.ts")) ||
   productionSources.some((file) => normalize(file).endsWith("/selection-context.ts")) ||
   vscodePackage.contributes.codeLens !== undefined ||
-  vscodePackage.contributes.menus["editor/context"] !== undefined ||
   vscodePackage.contributes.menus["chat/editor/inlineGutter"] !== undefined ||
   vscodePackage.contributes.menus["editor/content"] !== undefined ||
   selectionHandoffSource.includes("workbench.action.chat.attachSelection") ||
@@ -181,7 +245,17 @@ if (
   extensionSource.includes("NATIVE_SELECTION_AFFORDANCE_CONTEXT")
 ) {
   failures.push(
-    "VS Code selected-code handoff must avoid duplicate surfaces and private workbench commands",
+    "VS Code selected-code handoff must avoid unreviewed surfaces and private workbench commands",
+  );
+}
+if (
+  !/hasOnlyKeys\(\s*value,\s*\[\s*"type"\s*,\s*"conversationId"\s*,\s*"messageId"\s*,\s*"kind"\s*,\s*"reference"\s*\]\s*\)/u.test(
+    openSourceReferenceValidation,
+  ) ||
+  /\buri\b/u.test(openSourceReferenceValidation)
+) {
+  failures.push(
+    "Webview source-reference navigation must send bounded references, never a URI or path authority",
   );
 }
 if (vscodePackage.scripts.package !== "node ../../scripts/package-vscode.mjs") {

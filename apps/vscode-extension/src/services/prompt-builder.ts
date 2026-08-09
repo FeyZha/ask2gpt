@@ -9,10 +9,8 @@ import { assertAllowedContextBundle } from "./context-policy";
 import { Ask2GPTError } from "./errors";
 
 export const MAX_QUESTION_CHARS = 20_000;
-export const MAX_VISIBLE_PROMPT_CHARS = 100_000;
-export { MAX_INLINE_CONTEXT_BUNDLE_CHARS, MAX_INLINE_CONTEXT_CHARS };
 
-export type ContextDeliveryMode = "inline" | "file";
+export type ContextDeliveryMode = "file";
 
 export interface ContextDeliveryItem {
   contextId: string;
@@ -47,12 +45,57 @@ export function buildVisiblePromptPlan(
   if (contexts.length === 0) return { prompt: trimmed, attachments: [], delivery: [] };
   assertAllowedContextBundle(contexts);
 
+  const usedFileNames = new Set<string>();
+  const attachments: ChatFileAttachment[] = [];
+  const delivery: ContextDeliveryItem[] = [];
+
+  contexts.forEach((context, index) => {
+    const fileName = uniqueAttachmentFileName(context, index, usedFileNames);
+    attachments.push({
+      id: context.id,
+      fileName,
+      mimeType: mimeTypeForContext(context),
+      content: context.content,
+    });
+    delivery.push({ contextId: context.id, mode: "file", fileName });
+  });
+
+  // Keep the human-visible question untouched. Code snapshots travel as
+  // bounded file attachments, so ChatGPT receives the same context without
+  // expanding transport metadata and source text into the conversation UI.
+  return { prompt: trimmed, attachments, delivery };
+}
+
+export function planContextDelivery(contexts: readonly ContextSnapshot[]) {
+  if (contexts.length === 0) return [];
+  return buildVisiblePromptPlan("preview", contexts).delivery;
+}
+
+/**
+ * Reconstructs the transport text used before 0.1.0 so a restored ChatGPT
+ * snapshot cannot replace a compact local context card with the old expanded
+ * prompt. New sends must only use buildVisiblePromptPlan.
+ */
+export function buildLegacyVisiblePrompt(
+  question: string,
+  contexts: readonly ContextSnapshot[] = [],
+) {
+  return buildLegacyVisiblePromptPlan(question, contexts).prompt;
+}
+
+export function buildLegacyVisiblePromptPlan(
+  question: string,
+  contexts: readonly ContextSnapshot[] = [],
+) {
+  const trimmed = question.trim();
+  if (contexts.length === 0) return { prompt: trimmed, attachmentFileNames: [] as string[] };
+  assertAllowedContextBundle(contexts);
+
   let inlineChars = 0;
   const usedFileNames = new Set<string>();
   const inlineSections: string[] = [];
   const attachmentLines: string[] = [];
-  const attachments: ChatFileAttachment[] = [];
-  const delivery: ContextDeliveryItem[] = [];
+  const attachmentFileNames: string[] = [];
 
   contexts.forEach((context, index) => {
     const canInline =
@@ -62,45 +105,29 @@ export function buildVisiblePromptPlan(
     if (canInline) {
       inlineChars += context.content.length;
       inlineSections.push(
-        `${contextHeader(context, `Context ${label}:`)}\n\n${context.content}\n\n--- End Context ${label} ---`,
+        `${legacyContextHeader(context, `Context ${label}:`)}\n\n${context.content}\n\n--- End Context ${label} ---`,
       );
-      delivery.push({ contextId: context.id, mode: "inline" });
       return;
     }
 
     const fileName = uniqueAttachmentFileName(context, index, usedFileNames);
-    attachments.push({
-      id: context.id,
-      fileName,
-      mimeType: mimeTypeForContext(context),
-      content: context.content,
-    });
+    attachmentFileNames.push(fileName);
     attachmentLines.push(
       `- ${fileName} — ${singleLine(context.language)}, lines ${context.startLine}-${context.endLine}, ${context.charCount.toLocaleString()} chars${context.unsaved ? ", unsaved snapshot" : ""}`,
     );
-    delivery.push({ contextId: context.id, mode: "file", fileName });
   });
 
   const sections = [...inlineSections];
   if (attachmentLines.length > 0) {
     sections.push(`Attached code files:\n${attachmentLines.join("\n")}`);
   }
-  const prompt = `${sections.join("\n\n")}\n\nQuestion:\n${trimmed}`;
-  if (prompt.length > MAX_VISIBLE_PROMPT_CHARS) {
-    throw new Ask2GPTError(
-      "PROMPT_TOO_LARGE",
-      `问题和内联上下文打包后超过 ${MAX_VISIBLE_PROMPT_CHARS.toLocaleString()} 字符，请缩小内容。`,
-    );
-  }
-  return { prompt, attachments, delivery };
+  return {
+    prompt: `${sections.join("\n\n")}\n\nQuestion:\n${trimmed}`,
+    attachmentFileNames,
+  };
 }
 
-export function planContextDelivery(contexts: readonly ContextSnapshot[]) {
-  if (contexts.length === 0) return [];
-  return buildVisiblePromptPlan("preview", contexts).delivery;
-}
-
-function contextHeader(context: ContextSnapshot, heading: string) {
+function legacyContextHeader(context: ContextSnapshot, heading: string) {
   return [
     heading,
     `File: ${singleLine(context.fileName)}`,
@@ -160,5 +187,5 @@ function mimeTypeForContext(context: ContextSnapshot) {
 }
 
 function singleLine(value: string) {
-  return value.replace(/[\r\n\u2028\u2029]+/g, " ").trim();
+  return value.replace(/[\r\n\u2028\u2029]+/gu, " ").trim();
 }

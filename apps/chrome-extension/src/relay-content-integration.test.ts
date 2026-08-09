@@ -205,15 +205,14 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       harness.timeline.includes(`debugger.command-target:${tab.id}:root:Target.setAutoAttach`),
     );
     const debuggerAttachIndex = harness.timeline.indexOf(`debugger.attach:${tab.id}`);
-    const offscreenRestoreIndex = harness.timeline.indexOf(
+    const unfocusedRestoreIndex = harness.timeline.indexOf(
       `window-updated:${homeWindowId}:state:normal`,
     );
     expect(debuggerAttachIndex).toBeGreaterThanOrEqual(0);
-    expect(offscreenRestoreIndex).toBeGreaterThanOrEqual(0);
-    // The home window must reach its validated off-screen normal state before
-    // the debugger prepares the exact renderer; no capture may wake a still
-    // visibly positioned minimized window.
-    expect(offscreenRestoreIndex).toBeLessThan(debuggerAttachIndex);
+    expect(unfocusedRestoreIndex).toBeGreaterThanOrEqual(0);
+    // The home window must reach its unfocused normal state before the debugger
+    // prepares the exact renderer; no capture may wake a still-minimized page.
+    expect(unfocusedRestoreIndex).toBeLessThan(debuggerAttachIndex);
     expect(
       harness.timeline.includes(
         `debugger.command-target:${tab.id}:root:Emulation.setFocusEmulationEnabled`,
@@ -403,7 +402,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     ).toBe(true);
     expect(harness.timeline.some((entry) => entry.includes("focused:true"))).toBe(false);
     expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
-    expect(harness.timeline).toContain(
+    expect(harness.timeline).not.toContain(
       `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
     );
     await waitUntil(() =>
@@ -427,7 +426,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     });
     requireElement<HTMLButtonElement>('[data-testid="send-button"]').type = "submit";
     const contentSendMessages: Array<Record<string, unknown>> = [];
-    let offscreenComposerStatusMessages = 0;
+    let restoredComposerStatusMessages = 0;
     harness.beforeTabMessage = (_tabId, message) => {
       if (isMessageType(message, "content.send")) {
         contentSendMessages.push(structuredClone(message as Record<string, unknown>));
@@ -436,9 +435,12 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         isMessageType(message, "content.composerStatus") &&
         harness.tabsById.get(tab.id)?.windowId === homeWindowId &&
         harness.tabsById.get(tab.id)?.active === true &&
-        harness.windowBounds(homeWindowId).left <= -8_000
+        harness.timeline
+          .filter((entry) => entry.startsWith(`window-updated:${homeWindowId}:state:`))
+          .at(-1)
+          ?.endsWith(":normal") === true
       ) {
-        offscreenComposerStatusMessages += 1;
+        restoredComposerStatusMessages += 1;
       }
     };
     await harness.importContentScript(tab.id, async () => await import("./content-script"));
@@ -469,7 +471,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(page.formSubmits()).toBe(2);
     expect(page.submittedPrompts()).toEqual(["Explain the relay race.", "Explain the relay race."]);
     expect(contentSendMessages).toHaveLength(2);
-    expect(offscreenComposerStatusMessages).toBeGreaterThanOrEqual(2);
+    expect(restoredComposerStatusMessages).toBeGreaterThanOrEqual(2);
     expect(contentSendMessages[0]).not.toHaveProperty("debuggerDispatch");
     expect(contentSendMessages[1]).not.toHaveProperty("debuggerDispatch");
     expect(
@@ -533,7 +535,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     ).toHaveLength(3);
     expect(minimizedTimeline.some((entry) => entry.includes("focused:true"))).toBe(false);
     expect(minimizedTimeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
-    expect(minimizedTimeline).toContain(
+    expect(minimizedTimeline).not.toContain(
       `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
     );
     expect(minimizedTimeline).toContain(`window-updated:${homeWindowId}:state:normal`);
@@ -857,7 +859,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 12_000);
 
-  it("uses one trusted pointer in the off-screen home window when enhanced reception is disabled", async () => {
+  it("uses one trusted pointer in the unfocused home window when enhanced reception is disabled", async () => {
     const { harness, socket, tab } = await startHarness({
       debuggerPermission: true,
       enhancedBackgroundReception: false,
@@ -909,7 +911,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       1,
     );
     expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
-    expect(harness.timeline).toContain(
+    expect(harness.timeline).not.toContain(
       `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
     );
     expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
@@ -7958,10 +7960,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
     expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
     expect(harness.windowBounds(homeWindowId)).toEqual({
-      height: 100,
-      left: -16_000,
-      top: -16_000,
-      width: 100,
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
     });
     expect(harness.timeline).toContain(`window-updated:${homeWindowId}:state:normal`);
     expect(harness.timeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
@@ -8226,10 +8228,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(harness.tabsById.get(tab.id)?.active).toBe(true);
     expect((await chrome.windows.get(tab.windowId)).state).toBe("normal");
     expect(harness.windowBounds(tab.windowId)).toEqual({
-      height: 100,
-      left: -16_000,
-      top: -16_000,
-      width: 100,
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
     });
 
     harness.setWindowFocused(tab.windowId, true);
@@ -8585,7 +8587,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
   }, 8_000);
 
-  it("restores an unresponsive minimized home window only at safe off-screen bounds", async () => {
+  it("sends packaged context from a minimized home window at browser-managed bounds without focus", async () => {
     const { harness, socket, tab } = await startHarness();
     const homeWindowId = tab.windowId;
     const userTab = await chrome.tabs.create({
@@ -8597,6 +8599,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     harness.setWindowState(homeWindowId, "minimized");
 
     let sendCalls = 0;
+    let contentSendPayload: Record<string, unknown> | undefined;
     harness.installTabMessageResponder(tab.id, (message) => {
       if (isMessageType(message, "content.ping")) {
         return { ok: true, pageUrl: PROJECT_ROOT, selectorVersion: CONTENT_RUNTIME_REVISION };
@@ -8619,6 +8622,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
       }
       if (isMessageType(message, "content.send")) {
         sendCalls += 1;
+        contentSendPayload = structuredClone(message as Record<string, unknown>);
         return { ok: true, selectorVersion: CONTENT_RUNTIME_REVISION };
       }
       return { ok: false };
@@ -8626,7 +8630,26 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     await harness.importContentScript(tab.id, async () => undefined);
     const sendTimelineStart = harness.timeline.length;
 
-    socket.deliverFromHost(sendEnvelope(FIRST_RUN_ID));
+    socket.deliverFromHost(
+      makeEnvelope({
+        type: "conversation.send",
+        instanceId: INSTANCE_ID,
+        conversationId: CONVERSATION_ID,
+        runId: FIRST_RUN_ID,
+        payload: {
+          prompt: "Explain the selected code.",
+          messageId: `message-${FIRST_RUN_ID}`,
+          attachments: [
+            {
+              id: "selection-context",
+              fileName: "06_vector_store.L34-L39.py",
+              mimeType: "text/x-python",
+              content: "embeddings = AzureOpenAIEmbeddings(...)\n",
+            },
+          ],
+        },
+      }),
+    );
     await waitUntil(
       () =>
         (
@@ -8637,10 +8660,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
     expect(harness.tabsById.get(tab.id)?.windowId).toBe(homeWindowId);
     expect(harness.windowBounds(homeWindowId)).toEqual({
-      height: 100,
-      left: -16_000,
-      top: -16_000,
-      width: 100,
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
     });
     await expect(
       chrome.runtime.sendMessage({
@@ -8664,11 +8687,24 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
 
     const sendTimeline = harness.timeline.slice(sendTimelineStart);
     expect(sendCalls).toBe(1);
+    expect(contentSendPayload).toMatchObject({
+      prompt: "Explain the selected code.",
+      attachments: [
+        {
+          id: "selection-context",
+          fileName: "06_vector_store.L34-L39.py",
+          mimeType: "text/x-python",
+          content: "embeddings = AzureOpenAIEmbeddings(...)\n",
+        },
+      ],
+    });
     expect(sendTimeline.some((entry) => entry.startsWith("window-created:"))).toBe(false);
     expect(sendTimeline.filter((entry) => entry === `tab-active:${userTab.id}:true`)).toHaveLength(
       1,
     );
-    expect(sendTimeline).toContain(`window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`);
+    expect(sendTimeline).not.toContain(
+      `window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`,
+    );
     expect(sendTimeline).toContain(`window-updated:${homeWindowId}:state:normal`);
     expect((await chrome.windows.get(homeWindowId)).state).toBe("minimized");
     expect(runErrors(harness, socket, FIRST_RUN_ID)).toHaveLength(0);
@@ -11558,10 +11594,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
     expect((await chrome.windows.get(homeWindowId)).type).toBe("normal");
     expect(harness.windowBounds(homeWindowId)).toEqual({
-      height: 100,
-      left: -16_000,
-      top: -16_000,
-      width: 100,
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
     });
     expect(mappedSendCount).toBe(1);
     expect(
@@ -11862,10 +11898,10 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     expect(runErrors(harness, socket, runId)).toHaveLength(0);
     expect((await chrome.windows.get(homeWindowId)).state).toBe("normal");
     expect(harness.windowBounds(homeWindowId)).toEqual({
-      height: 100,
-      left: -16_000,
-      top: -16_000,
-      width: 100,
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
     });
     expect(harness.tabsById.get(mappedTab.id)?.active).toBe(true);
     expect(harness.tabsById.get(decoyTab.id)?.active).toBe(false);
@@ -12035,7 +12071,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     );
   }, 12_000);
 
-  it("keeps a dispatch-intent home window off-screen and hands it directly to the later send", async () => {
+  it("keeps a dispatch-intent home window unfocused and hands it directly to the later send", async () => {
     vi.resetModules();
     const harness = new FakeChromeRelayHarness();
     harness.installGlobals();
@@ -12145,7 +12181,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     await waitUntil(
       () =>
         visibleInspectionBlocked &&
-        harness.timeline.includes(`window-updated:${homeWindowId}:bounds:-16000,-16000,100,100`),
+        harness.timeline.includes(`window-updated:${homeWindowId}:state:normal`),
       5_000,
     );
 
@@ -14357,7 +14393,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
     modelPicker.removeFromPage();
   });
 
-  it("uploads a large code context as a file before sending the compact prompt", async () => {
+  it("uploads packaged code context before sending only the human-readable question", async () => {
     const { harness, socket, tab } = await startHarness();
     installChatGptComposerFixture(harness, tab.id);
     const form = requireElement<HTMLFormElement>("form");
@@ -14408,7 +14444,7 @@ describe("MV3 relay and ChatGPT content-script integration", () => {
         conversationId: CONVERSATION_ID,
         runId: "run-with-file",
         payload: {
-          prompt: "Attached code files:\n- large.ts\n\nQuestion:\nReview it.",
+          prompt: "Review it.",
           messageId: "message-with-file",
           attachments: [
             {

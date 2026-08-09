@@ -101,6 +101,58 @@ describe("context navigation", () => {
     expect(editor.revealRange).toHaveBeenCalledWith(editor.selection, 2);
   });
 
+  it("relocates a unique selection across the whole document before validating stale line metadata", async () => {
+    const document = textDocument("moved();\nother();\n");
+    const editor = {
+      selection: undefined as unknown,
+      revealRange: vi.fn(),
+    };
+    vscodeMock.openTextDocument.mockResolvedValue(document);
+    vscodeMock.showTextDocument.mockResolvedValue(editor);
+    const selected = context("moved-context", "file:///workspace/source.ts", {
+      content: "moved()",
+      endLine: 40,
+      startLine: 40,
+    });
+
+    await openContextFromState(appState(selected), "conversation-a", "moved-context");
+
+    expect(editor.selection).toMatchObject({
+      start: { line: 0, character: 0 },
+      end: { line: 0, character: 7 },
+    });
+    expect(editor.revealRange).toHaveBeenCalledWith(editor.selection, 2);
+  });
+
+  it.each([
+    ["missing", "not-present", "before\nafter"],
+    ["repeated", "same", "same\nsame"],
+  ])(
+    "falls back to the original line range when selection content is %s",
+    async (_case, content, source) => {
+      const document = textDocument(source);
+      const editor = {
+        selection: undefined as unknown,
+        revealRange: vi.fn(),
+      };
+      vscodeMock.openTextDocument.mockResolvedValue(document);
+      vscodeMock.showTextDocument.mockResolvedValue(editor);
+      const selected = context("fallback-context", "file:///workspace/source.ts", {
+        content,
+        endLine: 2,
+        startLine: 2,
+      });
+
+      await openContextFromState(appState(selected), "conversation-a", "fallback-context");
+
+      expect(editor.selection).toMatchObject({
+        start: { line: 1, character: 0 },
+        end: { line: 1, character: source.split("\n")[1]!.length },
+      });
+      expect(editor.revealRange).toHaveBeenCalledWith(editor.selection, 2);
+    },
+  );
+
   it("rejects missing or stale host context instead of opening a webview-supplied target", async () => {
     const state = appState(context("pending-context", "file:///workspace/pending.ts"));
 
@@ -121,7 +173,29 @@ describe("context navigation", () => {
         "conversation-a",
         "stale-context",
       ),
-    ).rejects.toMatchObject({ code: "CONTEXT_RANGE_STALE" });
+    ).rejects.toMatchObject({
+      code: "CONTEXT_RANGE_STALE",
+      message: "The file changed and the attached line range is no longer available.",
+    });
+    expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
+
+    vscodeMock.openTextDocument.mockResolvedValue(textDocument("same\nsame"));
+    await expect(
+      openContextFromState(
+        appState(
+          context("repeated-stale-context", "file:///workspace/stale.ts", {
+            content: "same",
+            endLine: 8,
+            startLine: 7,
+          }),
+        ),
+        "conversation-a",
+        "repeated-stale-context",
+      ),
+    ).rejects.toMatchObject({
+      code: "CONTEXT_RANGE_STALE",
+      message: "The file changed and the attached line range is no longer available.",
+    });
     expect(vscodeMock.showTextDocument).not.toHaveBeenCalled();
   });
 });
@@ -237,7 +311,8 @@ function textDocument(content: string) {
         end: { line, character: lines[line]!.length },
       },
     }),
-    getText: (range: { start: { line: number; character: number }; end: unknown }) => {
+    getText: (range?: { start: { line: number; character: number }; end: unknown }) => {
+      if (!range) return content;
       const start = lineOffsets[range.start.line]! + range.start.character;
       const end = offsetAt(range.end as { line: number; character: number });
       return content.slice(start, end);

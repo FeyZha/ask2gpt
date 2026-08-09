@@ -838,6 +838,8 @@ export interface ConversationMessage {
   status: MessageStatus;
   createdAt: string;
   contexts?: ContextSnapshot[];
+  /** Version 2 keeps code context out of visible prompt text and sends it as files. */
+  contextTransportVersion?: 2;
   /** Run-scoped transport failure; markdown remains answer content only. */
   runError?: RelayErrorPayload;
   terminalReceipt?: {

@@ -38,12 +38,12 @@ describe("relay protocol", () => {
   });
 
   it("allows either update order within the reviewed v15 product release line", () => {
-    expect(isRelayProductVersionCompatible("0.0.1", "0.0.1")).toBe(true);
-    expect(isRelayProductVersionCompatible("0.0.1", "0.0.2")).toBe(true);
-    expect(isRelayProductVersionCompatible("0.0.2", "0.0.1")).toBe(true);
-    expect(isRelayProductVersionCompatible("0.0.1", "0.0.0")).toBe(false);
-    expect(isRelayProductVersionCompatible("0.0.2", "0.0.3")).toBe(true);
-    expect(isRelayProductVersionCompatible("0.0.1", "0.1.0")).toBe(false);
+    expect(isRelayProductVersionCompatible("0.1.0", "0.1.0")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.0", "0.1.1")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.1", "0.1.0")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.0", "0.0.1")).toBe(false);
+    expect(isRelayProductVersionCompatible("0.1.1", "0.1.2")).toBe(true);
+    expect(isRelayProductVersionCompatible("0.1.0", "0.2.0")).toBe(false);
   });
 
   it("accepts a dedicated Host-to-Chrome status request and rejects a forged status event", () => {

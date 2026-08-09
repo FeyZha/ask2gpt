@@ -29,7 +29,7 @@ import { ConversationStore } from "./services/conversation-store";
 import { Ask2GPTError } from "./services/errors";
 import { SafeLogger } from "./services/logger";
 import { DEFAULT_CHATGPT_MODE_ID, mergeChatGptModeOptions } from "./services/model-options";
-import { buildVisiblePrompt, buildVisiblePromptPlan } from "./services/prompt-builder";
+import { buildLegacyVisiblePromptPlan, buildVisiblePromptPlan } from "./services/prompt-builder";
 import type { SelectionReference } from "./selection-reference";
 
 const ACTIVE_CONVERSATION_KEY = "ask2gpt.activeConversationId";
@@ -751,7 +751,9 @@ export class Ask2GPTController {
       markdown: question.trim(),
       status: "complete",
       createdAt: now,
-      ...(attachedContexts.length > 0 ? { contexts: attachedContexts } : {}),
+      ...(attachedContexts.length > 0
+        ? { contexts: attachedContexts, contextTransportVersion: 2 as const }
+        : {}),
     };
     conversation.messages.push(userMessage);
     this.updateAutomaticTitle(conversation, question);
@@ -1170,6 +1172,7 @@ export class Ask2GPTController {
     const previousMarkdown = message.markdown;
     const previousStatus = message.status;
     const previousRunError = message.runError;
+    const previousContextTransportVersion = userMessage.contextTransportVersion;
     const previousSyncStatus = conversation.syncStatus;
     const previousUpdatedAt = conversation.updatedAt;
     const runId = randomUUID();
@@ -1177,6 +1180,7 @@ export class Ask2GPTController {
     message.markdown = "";
     message.status = "streaming";
     delete message.runError;
+    if (userMessage.contexts?.length) userMessage.contextTransportVersion = 2;
     conversation.run = {
       id: runId,
       messageId: message.id,
@@ -1211,6 +1215,7 @@ export class Ask2GPTController {
       message.markdown = previousMarkdown;
       message.status = previousStatus;
       message.runError = previousRunError;
+      userMessage.contextTransportVersion = previousContextTransportVersion;
       conversation.syncStatus = previousSyncStatus;
       if (conversation.updatedAt === startedAt) conversation.updatedAt = previousUpdatedAt;
       await this.store.save(conversation).catch((saveError: unknown) => {
@@ -2037,7 +2042,9 @@ export class Ask2GPTController {
         markdown: queued.text,
         status: "complete",
         createdAt: attemptedAt,
-        ...(attachedContexts.length > 0 ? { contexts: attachedContexts } : {}),
+        ...(attachedContexts.length > 0
+          ? { contexts: attachedContexts, contextTransportVersion: 2 as const }
+          : {}),
       };
       conversation.messages.push(userMessage);
       this.updateAutomaticTitle(conversation, queued.text);
@@ -2826,10 +2833,7 @@ function findMatchingMessageIndex(
 function isSameRemoteMessage(local: ConversationMessage, remote: RemoteHistoryMessage) {
   if (local.role !== remote.role) return false;
   if (local.markdown === remote.markdown) return true;
-  const visiblePrompt = visiblePromptForStoredMessage(local);
-  return Boolean(
-    visiblePrompt && renderedPromptPresentationMatches(remote.markdown, visiblePrompt),
-  );
+  return packagedPromptPresentationMatches(remote.markdown, local);
 }
 
 function canReuseByPosition(local: ConversationMessage, remote: RemoteHistoryMessage) {
@@ -2844,10 +2848,7 @@ function synchronizeRemoteMessage(
   remote: RemoteHistoryMessage,
   activeRunMessageId?: string,
 ) {
-  const visiblePrompt = visiblePromptForStoredMessage(local);
-  const preservePackagedQuestion = Boolean(
-    visiblePrompt && renderedPromptPresentationMatches(remote.markdown, visiblePrompt),
-  );
+  const preservePackagedQuestion = packagedPromptPresentationMatches(remote.markdown, local);
   const markdown = preservePackagedQuestion ? local.markdown : remote.markdown;
   const status = local.id === activeRunMessageId ? local.status : "complete";
   const runError = status === "error" ? local.runError : undefined;
@@ -2880,17 +2881,54 @@ function renderedPromptPresentationMatches(rendered: string, prompt: string) {
   );
 }
 
-function visiblePromptForStoredMessage(message: ConversationMessage) {
+function packagedPromptPresentationMatches(rendered: string, message: ConversationMessage) {
+  const presentation = promptPresentationForStoredMessage(message);
+  if (!presentation) return false;
+
+  const candidates = [presentation.prompt];
+  if (presentation.fileNames.length > 0) {
+    for (const separator of ["\n\n", "\n", " "]) {
+      const attachmentBlock = presentation.fileNames.join(separator);
+      candidates.push(
+        `${presentation.prompt}${separator}${attachmentBlock}`,
+        `${attachmentBlock}${separator}${presentation.prompt}`,
+      );
+    }
+  }
+
+  return candidates.some(
+    (candidate) =>
+      renderedPromptPresentationMatches(rendered, candidate) ||
+      rendered
+        .replace(/\r\n?/gu, "\n")
+        .replace(/\u00a0/gu, " ")
+        .trim() === promptInlinePresentationForTranscriptProof(candidate),
+  );
+}
+
+function promptPresentationForStoredMessage(message: ConversationMessage) {
   if (message.role !== "user" || !message.contexts || message.contexts.length === 0) {
     return undefined;
   }
   try {
-    return buildVisiblePrompt(message.markdown, message.contexts);
+    const plan = buildVisiblePromptPlan(message.markdown, message.contexts);
+    const legacyPlan = buildLegacyVisiblePromptPlan(message.markdown, message.contexts);
+    const packaged = message.contextTransportVersion === 2;
+    return {
+      prompt: packaged ? plan.prompt : legacyPlan.prompt,
+      fileNames: packaged
+        ? plan.attachments.map((attachment) => attachment.fileName)
+        : legacyPlan.attachmentFileNames,
+    };
   } catch {
     // Older encrypted records may contain context that a newer policy no
     // longer permits. A failed equivalence check must not abort history sync.
     return undefined;
   }
+}
+
+function visiblePromptForStoredMessage(message: ConversationMessage) {
+  return promptPresentationForStoredMessage(message)?.prompt;
 }
 
 function createRemoteMessage(

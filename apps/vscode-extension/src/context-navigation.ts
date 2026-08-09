@@ -58,6 +58,17 @@ function contextEditorRange(
   context: ContextSnapshot,
   locale: AppState["locale"],
 ) {
+  if (context.kind === "selection" && context.content.length > 0) {
+    const currentText = document.getText();
+    const contentOffset = currentText.indexOf(context.content);
+    if (contentOffset >= 0 && currentText.lastIndexOf(context.content) === contentOffset) {
+      return new vscode.Range(
+        document.positionAt(contentOffset),
+        document.positionAt(contentOffset + context.content.length),
+      );
+    }
+  }
+
   const startLine = context.startLine - 1;
   const endLine = context.endLine - 1;
   if (
@@ -77,21 +88,5 @@ function contextEditorRange(
 
   const start = new vscode.Position(startLine, 0);
   const endTextLine = document.lineAt(endLine);
-  const lineRange = new vscode.Range(start, endTextLine.range.end);
-  if (context.kind !== "selection" || context.content.length === 0) return lineRange;
-
-  const searchEnd =
-    endLine + 1 < document.lineCount ? new vscode.Position(endLine + 1, 0) : endTextLine.range.end;
-  const searchRange = new vscode.Range(start, searchEnd);
-  const currentText = document.getText(searchRange);
-  const contentOffset = currentText.indexOf(context.content);
-  if (contentOffset < 0 || currentText.lastIndexOf(context.content) !== contentOffset) {
-    return lineRange;
-  }
-
-  const documentOffset = document.offsetAt(searchRange.start) + contentOffset;
-  return new vscode.Range(
-    document.positionAt(documentOffset),
-    document.positionAt(documentOffset + context.content.length),
-  );
+  return new vscode.Range(start, endTextLine.range.end);
 }

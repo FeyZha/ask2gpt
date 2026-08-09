@@ -10,6 +10,8 @@ import type {
 } from "./types";
 import type { Ask2GPTController } from "./controller";
 import { openContextFromState } from "./context-navigation";
+import { openAnswerSourceReferenceFromState, openAnswerSymbolFromState } from "./source-trace";
+import { selectionReferenceFromEditor } from "./selection-reference";
 import { Ask2GPTError } from "./services/errors";
 import type { SafeLogger } from "./services/logger";
 import { normalizeExternalHttpUrl } from "./webview/external-url";
@@ -71,6 +73,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
   private generationFlushDueAt?: number;
   private webviewReady = false;
   private pendingComposerFocus = false;
+  private pendingTurnReveal?: Extract<HostToWebviewMessage, { type: "revealTurn" }>;
   private initialStateJson?: string;
   private lastDeliveredRuns = new Map<string, string>();
   private pendingStateRuns = new Map<string, string>();
@@ -185,6 +188,21 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
     this.flushComposerFocus();
   }
 
+  async revealTurn(conversationId: string, messageId: string, contextId?: string) {
+    this.pendingTurnReveal = {
+      type: "revealTurn",
+      conversationId,
+      messageId,
+      ...(contextId ? { contextId } : {}),
+    };
+    await this.show(false);
+    // The renderer must see the selected conversation before it receives the
+    // scroll request. The delivery lane preserves that order, and a retained
+    // request survives a renderer that has not announced readiness yet.
+    this.postStateNow(this.controller.getState());
+    this.flushTurnReveal();
+  }
+
   dispose() {
     // Invalidate every in-flight post before clearing its lane. A compact
     // delivery can settle after the extension itself is disposed; without
@@ -194,6 +212,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
     this.view = undefined;
     this.webviewReady = false;
     this.pendingComposerFocus = false;
+    this.pendingTurnReveal = undefined;
     this.cancelStateFlush();
     this.cancelStateRetry();
     this.cancelGenerationFlush();
@@ -235,6 +254,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
             }
           }
           this.flushComposerFocus();
+          this.flushTurnReveal();
           return;
         case "newConversation":
           await this.controller.newConversation(message.sourceConversationId);
@@ -334,6 +354,20 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
         case "regenerate":
           await this.controller.regenerate(message.conversationId, message.messageId);
           return;
+        case "attachSelection":
+          {
+            const reference = selectionReferenceFromEditor(vscode.window.activeTextEditor);
+            if (!reference) {
+              throw new Ask2GPTError(
+                "EMPTY_SELECTION",
+                vscode.env.language.toLowerCase().startsWith("zh")
+                  ? "请先在编辑器中选择代码。"
+                  : "Select code in the editor first.",
+              );
+            }
+            this.controller.attachSelection(message.conversationId, reference);
+          }
+          return;
         case "attachCurrentFile":
           this.controller.attachCurrentFile(message.conversationId);
           return;
@@ -349,6 +383,23 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
             message.conversationId,
             message.contextId,
           );
+          return;
+        case "openSourceReference":
+          if (message.kind === "file-line") {
+            await openAnswerSourceReferenceFromState(
+              this.controller.getState(),
+              message.conversationId,
+              message.messageId,
+              message.reference,
+            );
+          } else {
+            await openAnswerSymbolFromState(
+              this.controller.getState(),
+              message.conversationId,
+              message.messageId,
+              message.reference,
+            );
+          }
           return;
         case "copy":
           await vscode.env.clipboard.writeText(message.text);
@@ -800,6 +851,7 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
     for (const [key, update] of this.activeGenerations) {
       if (!this.isCurrentGeneration(update, state)) this.activeGenerations.delete(key);
     }
+    this.flushTurnReveal();
   }
 
   private runIds(state: AppState) {
@@ -814,6 +866,23 @@ export class Ask2GPTViewProvider implements vscode.WebviewViewProvider {
     if (!this.pendingComposerFocus || !this.webviewReady) return;
     this.pendingComposerFocus = false;
     void this.post({ type: "focusComposer" });
+  }
+
+  private flushTurnReveal() {
+    const reveal = this.pendingTurnReveal;
+    if (!reveal || !this.webviewReady || this.stateDelivery || this.pendingState) return;
+    const deliveryGeneration = this.viewGeneration;
+    this.pendingTurnReveal = undefined;
+    void this.post(reveal).then((delivered) => {
+      if (delivered || this.pendingTurnReveal) return;
+      this.pendingTurnReveal = reveal;
+      // Replacing a Webview aborts the old delivery asynchronously. The new
+      // renderer may complete its ready handshake before that failure restores
+      // this request, so explicitly flush it into the new generation. Do not
+      // retry against the same renderer here; a persistent post failure would
+      // otherwise create a tight loop.
+      if (deliveryGeneration !== this.viewGeneration) this.flushTurnReveal();
+    });
   }
 
   private notice(level: "info" | "warning" | "error", message: string) {

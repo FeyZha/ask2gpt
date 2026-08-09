@@ -1,4 +1,5 @@
 import {
+  isValidElement,
   memo,
   startTransition,
   useCallback,
@@ -8,6 +9,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { createRoot } from "react-dom/client";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -16,8 +18,6 @@ import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 import {
-  MAX_INLINE_CONTEXT_BUNDLE_CHARS,
-  MAX_INLINE_CONTEXT_CHARS,
   type ChatModelOption,
   type Conversation,
   type ConversationMessage,
@@ -25,6 +25,11 @@ import {
   type QueuedFollowUp,
 } from "@ask2gpt/protocol";
 
+import { parseAnswerSourceReferences } from "../answer-source-reference";
+import {
+  extractAnswerSourceDefinitions,
+  matchKnownAnswerSourceSymbol,
+} from "../answer-source-symbol";
 import type { AppState, ConnectionPhase, GenerationViewUpdate, ModelPickerState } from "../types";
 import {
   ArchiveIcon,
@@ -50,7 +55,136 @@ import { onHostMessage, postMessage } from "./vscode";
 import "./styles.css";
 
 const copyLabel = { "zh-CN": "复制", en: "Copy" } as const;
+const codeBlockCopyLabel = { "zh-CN": "复制代码", en: "Copy code" } as const;
+const codeBlockFallbackLabel = { "zh-CN": "代码", en: "Code" } as const;
+const MAX_COMPOSER_CHARS = 20_000;
+const codeTaskActionCopy = {
+  "zh-CN": {
+    label: "代码任务快捷动作",
+    groupLabel: "针对已选代码的快捷任务",
+    hint: "只填入，不自动发送",
+    applied: "已填入草稿，可继续编辑后发送",
+    alreadyAdded: "该任务已在草稿末尾",
+    limitReached: "草稿已接近 20,000 字符上限，未添加任务",
+    actions: [
+      {
+        id: "explain",
+        label: "解释这段代码",
+        prompt: "解释这段代码的用途、执行流程和关键设计。",
+      },
+      {
+        id: "find-issues",
+        label: "查找问题",
+        prompt: "查找这段代码中的错误、边界情况和潜在问题。",
+      },
+      {
+        id: "fix-error",
+        label: "修复报错",
+        prompt: "分析并修复这段代码中的报错，说明根因和修改。",
+      },
+      {
+        id: "review",
+        label: "代码审查",
+        prompt: "审查这段代码，按严重程度指出问题并给出改进建议。",
+      },
+      {
+        id: "refactor",
+        label: "重构",
+        prompt: "重构这段代码以提高可读性和可维护性，并保持现有行为。",
+      },
+      {
+        id: "comments",
+        label: "添加注释",
+        prompt: "为这段代码添加必要且简洁的注释，避免解释显而易见的内容。",
+      },
+      {
+        id: "tests",
+        label: "编写单元测试",
+        prompt: "为这段代码编写覆盖正常路径、边界情况和失败路径的单元测试。",
+      },
+      {
+        id: "performance-security",
+        label: "分析性能或安全问题",
+        prompt: "分析这段代码的性能和安全风险，并给出可执行的改进方案。",
+      },
+    ],
+  },
+  en: {
+    label: "Code task shortcuts",
+    groupLabel: "Quick tasks for the selected code",
+    hint: "Fills the draft without sending",
+    applied: "Added to the draft. Refine it, then send",
+    alreadyAdded: "That task is already at the end of the draft",
+    limitReached: "The draft is near the 20,000-character limit; the task was not added",
+    actions: [
+      {
+        id: "explain",
+        label: "Explain this code",
+        prompt: "Explain this code's purpose, execution flow, and key design decisions.",
+      },
+      {
+        id: "find-issues",
+        label: "Find issues",
+        prompt: "Find bugs, edge cases, and potential problems in this code.",
+      },
+      {
+        id: "fix-error",
+        label: "Fix the error",
+        prompt: "Diagnose and fix the error in this code, explaining the root cause and changes.",
+      },
+      {
+        id: "review",
+        label: "Review the code",
+        prompt: "Review this code, report issues by severity, and suggest concrete improvements.",
+      },
+      {
+        id: "refactor",
+        label: "Refactor",
+        prompt: "Refactor this code for readability and maintainability while preserving behavior.",
+      },
+      {
+        id: "comments",
+        label: "Add comments",
+        prompt: "Add concise, useful comments to this code without explaining the obvious.",
+      },
+      {
+        id: "tests",
+        label: "Write unit tests",
+        prompt: "Write unit tests for this code covering happy paths, edge cases, and failures.",
+      },
+      {
+        id: "performance-security",
+        label: "Performance or security",
+        prompt:
+          "Analyze this code for performance and security risks and propose actionable fixes.",
+      },
+    ],
+  },
+} as const;
 const COMPOSER_DISPATCH_PREWARM_THROTTLE_MS = 3_000;
+
+type CodeTaskApplyResult = "applied" | "already-added" | "limit-reached";
+
+function appendCodeTaskPrompt(currentDraft: string, prompt: string) {
+  if (!currentDraft.trim()) return { result: "applied", text: prompt } as const;
+  const draftWithoutTrailingWhitespace = currentDraft.trimEnd();
+  if (
+    draftWithoutTrailingWhitespace === prompt ||
+    draftWithoutTrailingWhitespace.endsWith(`\n\n${prompt}`)
+  ) {
+    return { result: "already-added", text: currentDraft } as const;
+  }
+  const separator = currentDraft.endsWith("\n\n")
+    ? ""
+    : currentDraft.endsWith("\n")
+      ? "\n"
+      : "\n\n";
+  const nextText = `${currentDraft}${separator}${prompt}`;
+  if (nextText.length > MAX_COMPOSER_CHARS) {
+    return { result: "limit-reached", text: currentDraft } as const;
+  }
+  return { result: "applied", text: nextText } as const;
+}
 
 function readInitialAppState() {
   const element = document.getElementById("ask2gpt-initial-state");
@@ -108,6 +242,13 @@ interface OptimisticComposerSend {
   createdAt: string;
   requestId: string;
   text: string;
+}
+
+interface TurnRevealRequest {
+  conversationId: string;
+  messageId: string;
+  contextId?: string;
+  revision: number;
 }
 
 function hasAuthoritativeUserMessage(
@@ -168,6 +309,8 @@ export function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [composerFocusRevision, setComposerFocusRevision] = useState(0);
+  const [turnReveal, setTurnReveal] = useState<TurnRevealRequest>();
+  const turnRevealRevisionRef = useRef(0);
   const [pendingNewConversationSourceId, setPendingNewConversationSourceId] = useState<string>();
   const pendingNewConversationSourceIdRef = useRef<string | undefined>(undefined);
   const [notice, setNotice] = useState<{ level: string; message: string }>();
@@ -288,6 +431,16 @@ export function App() {
         setHistoryOpen(false);
         setContextOpen(false);
         setComposerFocusRevision((revision) => revision + 1);
+      }
+      if (message.type === "revealTurn") {
+        setHistoryOpen(false);
+        setContextOpen(false);
+        setTurnReveal({
+          conversationId: message.conversationId,
+          messageId: message.messageId,
+          ...(message.contextId ? { contextId: message.contextId } : {}),
+          revision: ++turnRevealRevisionRef.current,
+        });
       }
       if (message.type === "sendResult") {
         const revision = ++sendResultRevisionRef.current;
@@ -445,6 +598,7 @@ export function App() {
             key={`thread:${renderedActive.id}`}
             locale={appState.locale}
             scrollMemory={conversationScrollMemoryRef.current}
+            turnReveal={turnReveal?.conversationId === renderedActive.id ? turnReveal : undefined}
           />
         )}
       </main>
@@ -592,19 +746,6 @@ function contextChipTitle(context: ContextSnapshot) {
   if (!compact) return context.fileName;
   const excerpt = compact.length > 96 ? `${compact.slice(0, 95)}…` : compact;
   return `“${excerpt}”`;
-}
-
-function contextDeliveryModes(contexts: readonly ContextSnapshot[]) {
-  let inlineChars = 0;
-  return new Map(
-    contexts.map((context) => {
-      const inline =
-        context.content.length <= MAX_INLINE_CONTEXT_CHARS &&
-        inlineChars + context.content.length <= MAX_INLINE_CONTEXT_BUNDLE_CHARS;
-      if (inline) inlineChars += context.content.length;
-      return [context.id, inline ? "inline" : "file"] as const;
-    }),
-  );
 }
 
 function Header({
@@ -1003,6 +1144,19 @@ const SCROLL_TAIL_THRESHOLD_PX = 24;
 const SCROLL_FOLLOW_FALLBACK_MS = 48;
 const USER_SCROLL_INTENT_TTL_MS = 1_000;
 const USER_MESSAGE_NAVIGATION_MIN_ITEMS = 4;
+const NON_SOURCE_CALL_NAMES = new Set(["catch", "for", "if", "match", "switch", "while", "with"]);
+
+function contextSourceSymbols(content: string) {
+  const symbols = new Set(
+    extractAnswerSourceDefinitions(content).map((definition) => definition.name),
+  );
+  for (const match of content.matchAll(/(?:^|[^\p{L}\p{N}_$])([\p{L}_$][\p{L}\p{N}_$]*)\s*\(/gu)) {
+    const symbol = match[1];
+    if (symbol && !NON_SOURCE_CALL_NAMES.has(symbol)) symbols.add(symbol);
+    if (symbols.size >= 512) break;
+  }
+  return symbols;
+}
 
 function keyboardScrollDirection(
   event: KeyboardEvent,
@@ -1041,10 +1195,12 @@ function MessageList({
   conversation,
   locale,
   scrollMemory,
+  turnReveal,
 }: {
   conversation: Conversation;
   locale: AppState["locale"];
   scrollMemory: Map<string, ConversationScrollState>;
+  turnReveal?: TurnRevealRequest;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
   const activeConversationIdRef = useRef(conversation.id);
@@ -1065,6 +1221,7 @@ function MessageList({
     [visibleMessages],
   );
   const [activeUserMessageId, setActiveUserMessageId] = useState<string>();
+  const [tracedUserMessageId, setTracedUserMessageId] = useState<string>();
   const visibleMessagesRef = useRef(visibleMessages);
   visibleMessagesRef.current = visibleMessages;
   const lastUserId = useMemo(
@@ -1081,6 +1238,24 @@ function MessageList({
     for (const message of visibleMessages) {
       result.set(message.id, previousUserId);
       if (message.role === "user") previousUserId = message.id;
+    }
+    return result;
+  }, [visibleMessages]);
+  const sourceSymbolKeys = useMemo(() => {
+    const result = new Map<string, string>();
+    let currentSymbols = "";
+    for (const message of visibleMessages) {
+      if (message.role === "user") {
+        const contexts = getMessageContexts(message);
+        if (contexts.length > 0) {
+          const symbols = new Set(
+            contexts.flatMap((context) => [...contextSourceSymbols(context.content)]),
+          );
+          currentSymbols = [...symbols].sort().join("\0");
+        }
+      } else {
+        result.set(message.id, currentSymbols);
+      }
     }
     return result;
   }, [visibleMessages]);
@@ -1204,6 +1379,17 @@ function MessageList({
     },
     [saveScrollState],
   );
+
+  useEffect(() => {
+    if (!turnReveal || turnReveal.conversationId !== conversation.id) return;
+    if (!userMessages.some((message) => message.id === turnReveal.messageId)) return;
+    jumpToUserMessage(turnReveal.messageId);
+    setTracedUserMessageId(turnReveal.messageId);
+    const timer = window.setTimeout(() => {
+      setTracedUserMessageId((current) => (current === turnReveal.messageId ? undefined : current));
+    }, 2_800);
+    return () => window.clearTimeout(timer);
+  }, [conversation.id, jumpToUserMessage, turnReveal, userMessages]);
 
   useEffect(() => {
     const handleUserMessageNavigation = (event: KeyboardEvent) => {
@@ -1510,6 +1696,8 @@ function MessageList({
               reserveTurnViewport={
                 hasTurnRunway && latestAssistantBelongsToTurn && message.id === lastAssistantId
               }
+              sourceSymbolKey={sourceSymbolKeys.get(message.id) ?? ""}
+              traceTarget={message.id === tracedUserMessageId}
               turnAnchor={message.id === lastUserId}
             />
           );
@@ -1544,6 +1732,8 @@ interface MessageCardProps {
   locale: AppState["locale"];
   message: ConversationMessage;
   reserveTurnViewport: boolean;
+  sourceSymbolKey: string;
+  traceTarget: boolean;
   turnAnchor: boolean;
 }
 
@@ -1601,6 +1791,8 @@ const MessageCard = memo(function MessageCard({
   locale,
   message,
   reserveTurnViewport,
+  sourceSymbolKey,
+  traceTarget,
   turnAnchor,
 }: MessageCardProps) {
   const t = strings[locale];
@@ -1614,10 +1806,15 @@ const MessageCard = memo(function MessageCard({
     return (
       <article
         aria-label={t.yourQuestion}
-        className="message message--user"
+        className={`message message--user ${traceTarget ? "message--trace-target" : ""}`}
         data-turn-anchor={turnAnchor ? "true" : undefined}
         data-user-message-id={message.id}
       >
+        {traceTarget && (
+          <span className="message-trace-label" role="status">
+            {t.matchedSelection}
+          </span>
+        )}
         {contexts.length > 0 && (
           <SentContextList contexts={contexts} conversationId={conversationId} locale={locale} />
         )}
@@ -1664,7 +1861,10 @@ const MessageCard = memo(function MessageCard({
         {displayMarkdown ? (
           <Markdown
             content={displayMarkdown}
+            conversationId={conversationId}
             locale={locale}
+            messageId={message.id}
+            sourceSymbolKey={sourceSymbolKey}
             streaming={message.status === "streaming"}
           />
         ) : message.status === "streaming" ? (
@@ -1725,6 +1925,8 @@ function areMessageCardsEqual(previous: MessageCardProps, next: MessageCardProps
     previous.isLatestAssistant === next.isLatestAssistant &&
     previous.locale === next.locale &&
     previous.reserveTurnViewport === next.reserveTurnViewport &&
+    previous.sourceSymbolKey === next.sourceSymbolKey &&
+    previous.traceTarget === next.traceTarget &&
     previous.turnAnchor === next.turnAnchor &&
     previous.message.id === next.message.id &&
     previous.message.role === next.message.role &&
@@ -1749,31 +1951,284 @@ function runErrorsEqual(
 }
 
 const markdownRehypePlugins = [rehypeSanitize, rehypeHighlight];
-const markdownRemarkPlugins = [remarkGfm];
-const markdownComponents: Record<AppState["locale"], Components> = {
-  "zh-CN": {
-    a: ({ children, href }) => <ExternalLink href={href}>{children}</ExternalLink>,
-    img: ({ alt, src }) => <ExternalLink href={src}>{alt || "图片链接"}</ExternalLink>,
-  },
-  en: {
-    a: ({ children, href }) => <ExternalLink href={href}>{children}</ExternalLink>,
-    img: ({ alt, src }) => <ExternalLink href={src}>{alt || "Image link"}</ExternalLink>,
-  },
+const SOURCE_REFERENCE_HOST = "source.ask2gpt.invalid";
+
+interface MarkdownAstNode {
+  type: string;
+  value?: string;
+  url?: string;
+  children?: MarkdownAstNode[];
+}
+
+function sourceReferenceHref(reference: string) {
+  return `https://${SOURCE_REFERENCE_HOST}/open?reference=${encodeURIComponent(reference)}`;
+}
+
+function referenceFromSourceHref(href: string | undefined) {
+  if (!href) return undefined;
+  try {
+    const url = new URL(href);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== SOURCE_REFERENCE_HOST ||
+      url.pathname !== "/open"
+    ) {
+      return undefined;
+    }
+    const reference = url.searchParams.get("reference");
+    return reference && reference.length <= 768 ? reference : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sourceReferenceTextNodes(value: string): MarkdownAstNode[] | undefined {
+  const references = parseAnswerSourceReferences(value);
+  if (references.length === 0) return undefined;
+  const nodes: MarkdownAstNode[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    if (reference.textRange.start > cursor) {
+      nodes.push({ type: "text", value: value.slice(cursor, reference.textRange.start) });
+    }
+    nodes.push({
+      type: "link",
+      url: sourceReferenceHref(reference.raw),
+      children: [{ type: "text", value: reference.raw }],
+    });
+    cursor = reference.textRange.end;
+  }
+  if (cursor < value.length) nodes.push({ type: "text", value: value.slice(cursor) });
+  return nodes;
+}
+
+function remarkSourceReferences() {
+  return (tree: MarkdownAstNode) => {
+    const visit = (node: MarkdownAstNode) => {
+      if (
+        !node.children ||
+        node.type === "link" ||
+        node.type === "linkReference" ||
+        node.type === "image" ||
+        node.type === "imageReference"
+      ) {
+        return;
+      }
+      const nextChildren: MarkdownAstNode[] = [];
+      for (const child of node.children) {
+        if (child.type === "text" && typeof child.value === "string") {
+          nextChildren.push(...(sourceReferenceTextNodes(child.value) ?? [child]));
+        } else {
+          visit(child);
+          nextChildren.push(child);
+        }
+      }
+      node.children = nextChildren;
+    };
+    visit(tree);
+  };
+}
+
+const markdownRemarkPlugins = [remarkGfm, remarkSourceReferences];
+const codeLanguageLabels: Record<string, string> = {
+  bash: "Bash",
+  c: "C",
+  cpp: "C++",
+  cs: "C#",
+  csharp: "C#",
+  css: "CSS",
+  diff: "Diff",
+  dockerfile: "Dockerfile",
+  go: "Go",
+  html: "HTML",
+  java: "Java",
+  javascript: "JavaScript",
+  js: "JavaScript",
+  json: "JSON",
+  jsonc: "JSONC",
+  jsx: "JSX",
+  kotlin: "Kotlin",
+  markdown: "Markdown",
+  md: "Markdown",
+  plaintext: "Plain text",
+  powershell: "PowerShell",
+  ps1: "PowerShell",
+  py: "Python",
+  python: "Python",
+  rust: "Rust",
+  scss: "SCSS",
+  sh: "Shell",
+  shell: "Shell",
+  sql: "SQL",
+  svelte: "Svelte",
+  text: "Plain text",
+  ts: "TypeScript",
+  tsx: "TSX",
+  typescript: "TypeScript",
+  vue: "Vue",
+  xml: "XML",
+  yaml: "YAML",
+  yml: "YAML",
 };
+
+function reactNodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(reactNodeText).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) return reactNodeText(node.props.children);
+  return "";
+}
+
+function codeBlockLanguage(children: ReactNode, locale: AppState["locale"]) {
+  if (!isValidElement<{ className?: string }>(children)) return codeBlockFallbackLabel[locale];
+  const language = /(?:^|\s)language-([^\s]+)/u.exec(children.props.className ?? "")?.[1];
+  if (!language) return codeBlockFallbackLabel[locale];
+  return codeLanguageLabels[language.toLowerCase()] ?? language;
+}
+
+function MarkdownCodeBlock({
+  children,
+  locale,
+}: {
+  children?: ReactNode;
+  locale: AppState["locale"];
+}) {
+  const language = codeBlockLanguage(children, locale);
+  const code = reactNodeText(children).replace(/\n$/u, "");
+  return (
+    <figure className="markdown-code-block">
+      <figcaption className="markdown-code-block__toolbar">
+        <span className="markdown-code-block__language">{language}</span>
+        <button
+          aria-label={codeBlockCopyLabel[locale]}
+          className="markdown-code-block__copy"
+          onClick={() => postMessage({ type: "copy", text: code })}
+          title={codeBlockCopyLabel[locale]}
+          type="button"
+        >
+          <CopyIcon />
+          <span>{copyLabel[locale]}</span>
+        </button>
+      </figcaption>
+      <pre>{children}</pre>
+    </figure>
+  );
+}
+
+interface MarkdownSourceTrace {
+  conversationId: string;
+  messageId: string;
+  sourceSymbols: ReadonlySet<string>;
+}
+
+function SourceReferenceButton({
+  kind,
+  locale,
+  reference,
+  trace,
+}: {
+  kind: "file-line" | "symbol";
+  locale: AppState["locale"];
+  reference: string;
+  trace: MarkdownSourceTrace;
+}) {
+  const label =
+    kind === "file-line"
+      ? locale === "en"
+        ? `Open ${reference} in the editor`
+        : `在编辑器中打开 ${reference}`
+      : locale === "en"
+        ? `Find the definition of ${reference}`
+        : `查找 ${reference} 的定义`;
+  return (
+    <button
+      aria-label={label}
+      className={`source-reference source-reference--${kind}`}
+      onClick={() =>
+        postMessage({
+          type: "openSourceReference",
+          conversationId: trace.conversationId,
+          messageId: trace.messageId,
+          kind,
+          reference,
+        })
+      }
+      title={label}
+      type="button"
+    >
+      {kind === "file-line" ? <FileIcon /> : <CodeIcon />}
+      <span>{reference}</span>
+    </button>
+  );
+}
+
+function createMarkdownComponents(
+  locale: AppState["locale"],
+  trace: MarkdownSourceTrace,
+): Components {
+  return {
+    a: ({ children, href }) => {
+      const reference = referenceFromSourceHref(href);
+      return reference ? (
+        <SourceReferenceButton
+          kind="file-line"
+          locale={locale}
+          reference={reference}
+          trace={trace}
+        />
+      ) : (
+        <ExternalLink href={href}>{children}</ExternalLink>
+      );
+    },
+    code: ({ children, className }) => {
+      const value = reactNodeText(children);
+      const isBlock = value.includes("\n") || /(?:^|\s)language-/u.test(className ?? "");
+      if (!isBlock) {
+        const fileReference = parseAnswerSourceReferences(value).find(
+          (candidate) =>
+            candidate.textRange.start === 0 && candidate.textRange.end === value.length,
+        );
+        if (fileReference) {
+          return (
+            <SourceReferenceButton
+              kind="file-line"
+              locale={locale}
+              reference={fileReference.raw}
+              trace={trace}
+            />
+          );
+        }
+        const symbol = matchKnownAnswerSourceSymbol(value, trace.sourceSymbols);
+        if (symbol) {
+          return (
+            <SourceReferenceButton kind="symbol" locale={locale} reference={value} trace={trace} />
+          );
+        }
+      }
+      return <code className={className}>{children}</code>;
+    },
+    img: ({ alt, src }) => (
+      <ExternalLink href={src}>{alt || (locale === "en" ? "Image link" : "图片链接")}</ExternalLink>
+    ),
+    pre: ({ children }) => <MarkdownCodeBlock locale={locale}>{children}</MarkdownCodeBlock>,
+  };
+}
 
 const StreamingMarkdownBlock = memo(function StreamingMarkdownBlock({
   content,
   highlight,
   locale,
+  trace,
 }: {
   content: string;
   highlight: boolean;
   locale: AppState["locale"];
+  trace: MarkdownSourceTrace;
 }) {
+  const components = useMemo(() => createMarkdownComponents(locale, trace), [locale, trace]);
   return (
     <div className="streaming-markdown__block">
       <ReactMarkdown
-        components={markdownComponents[locale]}
+        components={components}
         rehypePlugins={highlight ? markdownRehypePlugins : undefined}
         remarkPlugins={markdownRemarkPlugins}
       >
@@ -1914,13 +2369,27 @@ function splitStableMarkdownBlocks(content: string) {
 
 const Markdown = memo(function Markdown({
   content,
+  conversationId,
   locale,
+  messageId,
+  sourceSymbolKey,
   streaming,
 }: {
   content: string;
+  conversationId: string;
   locale: AppState["locale"];
+  messageId: string;
+  sourceSymbolKey: string;
   streaming: boolean;
 }) {
+  const trace = useMemo<MarkdownSourceTrace>(
+    () => ({
+      conversationId,
+      messageId,
+      sourceSymbols: new Set(sourceSymbolKey ? sourceSymbolKey.split("\0") : []),
+    }),
+    [conversationId, messageId, sourceSymbolKey],
+  );
   // Use one stable block tree for both streaming and terminal states. Complete
   // blocks retain their React identity while only the growing tail is parsed;
   // terminal syntax highlighting updates fenced blocks without replacing the
@@ -1933,6 +2402,7 @@ const Markdown = memo(function Markdown({
           highlight={!streaming && /(?:```|~~~)/u.test(block)}
           key={index}
           locale={locale}
+          trace={trace}
         />
       ))}
     </div>
@@ -1967,7 +2437,6 @@ function SentContextList({
 }) {
   const t = strings[locale];
   const [showAll, setShowAll] = useState(false);
-  const delivery = contextDeliveryModes(contexts);
   const visibleContexts = showAll ? contexts : contexts.slice(0, 2);
   const hiddenCount = Math.max(0, contexts.length - visibleContexts.length);
   return (
@@ -1976,7 +2445,6 @@ function SentContextList({
         <ContextBadge
           context={context}
           conversationId={conversationId}
-          delivery={delivery.get(context.id) ?? "inline"}
           key={contextKey(context)}
           locale={locale}
         />
@@ -1999,12 +2467,10 @@ function SentContextList({
 function ContextBadge({
   context,
   conversationId,
-  delivery,
   locale,
 }: {
   context: ContextSnapshot;
   conversationId: string;
-  delivery: "inline" | "file";
   locale: AppState["locale"];
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -2027,6 +2493,9 @@ function ContextBadge({
         >
           {context.kind === "selection" ? <CodeIcon /> : <FileIcon />}
           <span>{context.fileName}</span>
+          <small className="sent-context__line-range">
+            L{context.startLine}–{context.endLine}
+          </small>
         </button>
         <button
           aria-controls={previewId}
@@ -2046,7 +2515,7 @@ function ContextBadge({
             {" · "}
             {context.charCount.toLocaleString()} {t.characters}
             {context.unsaved ? ` · ${t.unsaved}` : ""}
-            {` · ${delivery === "file" ? t.sentAsFile : t.sentInline}`}
+            {` · ${t.packagedContext}`}
           </small>
           <pre>{context.content}</pre>
         </div>
@@ -2177,7 +2646,7 @@ function QueuedFollowUpList({
                 <textarea
                   aria-label={t.editQueuedFollowUp}
                   autoFocus
-                  maxLength={20_000}
+                  maxLength={MAX_COMPOSER_CHARS}
                   onChange={(event) => setEditingText(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) {
@@ -2373,6 +2842,35 @@ function Composer({
     dispatchPrewarmAtByConversationRef.current.set(conversation.id, now);
     postMessage({ type: "prepareConversation", conversationId: conversation.id });
   }, [backendReady, conversation.id, newConversationPending, runBusy, submitting]);
+
+  const applyCodeTaskAction = useCallback(
+    (prompt: string): CodeTaskApplyResult => {
+      if (newConversationPending || submissionReadOnly) return "limit-reached";
+      const targetConversationId = conversation.id;
+      const currentDraft = draftsByConversationRef.current.get(targetConversationId) ?? text;
+      const { result, text: nextText } = appendCodeTaskPrompt(currentDraft, prompt);
+      if (result === "applied") {
+        draftsByConversationRef.current.set(targetConversationId, nextText);
+        setText(nextText);
+        requestDispatchPrewarm();
+      }
+      queueMicrotask(() => {
+        if (activeConversationIdRef.current !== targetConversationId) return;
+        const input = inputRef.current;
+        input?.focus();
+        input?.setSelectionRange(nextText.length, nextText.length);
+      });
+      return result;
+    },
+    [
+      conversation.id,
+      inputRef,
+      newConversationPending,
+      requestDispatchPrewarm,
+      submissionReadOnly,
+      text,
+    ],
+  );
 
   useEffect(() => {
     const region = regionRef.current;
@@ -2710,11 +3208,18 @@ function Composer({
             locale={locale}
           />
         )}
+        {visibleContexts.some((context) => context.kind === "selection") && (
+          <CodeTaskQuickActions
+            disabled={contextLocked || newConversationPending || submissionReadOnly}
+            locale={locale}
+            onSelect={applyCodeTaskAction}
+          />
+        )}
         <textarea
           aria-busy={submitting}
           aria-describedby={composerDescriptionId}
           aria-label={t.composerLabel}
-          maxLength={20_000}
+          maxLength={MAX_COMPOSER_CHARS}
           onChange={(event) => {
             const nextText = event.target.value;
             draftsByConversationRef.current.set(conversation.id, nextText);
@@ -2821,6 +3326,61 @@ function Composer({
         </div>
       </div>
     </footer>
+  );
+}
+
+function CodeTaskQuickActions({
+  disabled,
+  locale,
+  onSelect,
+}: {
+  disabled: boolean;
+  locale: AppState["locale"];
+  onSelect: (prompt: string) => CodeTaskApplyResult;
+}) {
+  const copy = codeTaskActionCopy[locale];
+  const [announcement, setAnnouncement] = useState("");
+  return (
+    <section aria-label={copy.label} className="code-task-actions">
+      <div className="code-task-actions__heading">
+        <span aria-hidden="true" className="code-task-actions__mark">
+          <CodeIcon />
+        </span>
+        <strong>{copy.label}</strong>
+        <small>{copy.hint}</small>
+      </div>
+      <div aria-label={copy.groupLabel} className="code-task-actions__list" role="group">
+        {copy.actions.map((action, index) => (
+          <button
+            aria-label={`${action.label} · ${copy.hint}`}
+            className="code-task-action"
+            data-code-task={action.id}
+            disabled={disabled}
+            key={action.id}
+            onClick={() => {
+              const result = onSelect(action.prompt);
+              setAnnouncement(
+                result === "applied"
+                  ? `${action.label}：${copy.applied}`
+                  : result === "already-added"
+                    ? copy.alreadyAdded
+                    : copy.limitReached,
+              );
+            }}
+            title={action.prompt}
+            type="button"
+          >
+            <span aria-hidden="true" className="code-task-action__index">
+              {String(index + 1).padStart(2, "0")}
+            </span>
+            <span>{action.label}</span>
+          </button>
+        ))}
+      </div>
+      <span aria-live="polite" className="sr-only" role="status">
+        {announcement}
+      </span>
+    </section>
   );
 }
 
@@ -3154,7 +3714,6 @@ function PendingContextList({
   const t = strings[locale];
   const automaticIds = new Set(automaticContextIds);
   const totalChars = contexts.reduce((total, context) => total + context.charCount, 0);
-  const delivery = contextDeliveryModes(contexts);
   const previewContext = contexts.find((context) => context.id === previewContextId);
 
   const closeReview = useCallback((restoreFocus: boolean) => {
@@ -3274,7 +3833,6 @@ function PendingContextList({
               <PendingContextRow
                 conversationId={conversationId}
                 context={context}
-                delivery={delivery.get(context.id) ?? "inline"}
                 expanded={previewContextId === context.id}
                 automatic={automaticIds.has(context.id)}
                 key={contextKey(context)}
@@ -3304,7 +3862,6 @@ function PendingContextRow({
   automatic,
   conversationId,
   context,
-  delivery,
   expanded,
   locked,
   locale,
@@ -3314,7 +3871,6 @@ function PendingContextRow({
   automatic: boolean;
   conversationId: string;
   context: ContextSnapshot;
-  delivery: "inline" | "file";
   expanded: boolean;
   locked: boolean;
   locale: AppState["locale"];
@@ -3346,7 +3902,7 @@ function PendingContextRow({
             {context.language} · L{context.startLine}–{context.endLine} ·{" "}
             {context.charCount.toLocaleString()}
             {context.unsaved ? ` · ${t.unsaved}` : ""}
-            {` · ${delivery === "file" ? t.sentAsFile : t.sentInline}`}
+            {` · ${t.packagedContext}`}
           </small>
         </span>
       </button>
@@ -3436,6 +3992,19 @@ function ContextMenu({
       ref={menuRef}
       role="menu"
     >
+      <button
+        onClick={() => {
+          postMessage({ type: "attachSelection", conversationId });
+          onClose();
+        }}
+        role="menuitem"
+      >
+        <CodeIcon />
+        <span>
+          <strong>{t.currentSelection}</strong>
+          <small>{t.selectionDetail}</small>
+        </span>
+      </button>
       <button
         onClick={() => {
           postMessage({ type: "attachCurrentFile", conversationId });
@@ -4054,6 +4623,7 @@ const strings = {
     transcript: "问答记录",
     openChatGpt: "打开浏览器会话",
     yourQuestion: "你的问题",
+    matchedSelection: "匹配此选区",
     answer: "回答",
     regenerate: "重新生成",
     retry: "重试",
@@ -4071,10 +4641,7 @@ const strings = {
     showMoreContexts: "显示更多代码上下文",
     showFewerContexts: "收起代码上下文",
     showLess: "收起",
-    sentAsFile: "作为代码文件发送",
-    sentInline: "内联到问题",
-    fileAttachments: "个文件",
-    inlineContexts: "个内联片段",
+    packagedContext: "封装为代码上下文",
     reviewContexts: "审阅代码上下文",
     closeContextReview: "关闭上下文审阅",
     previewContext: "预览上下文",
@@ -4108,6 +4675,8 @@ const strings = {
     addContext: "添加上下文",
     currentFile: "当前文件",
     fileDetail: "读取当前编辑器缓冲区",
+    currentSelection: "当前选区",
+    selectionDetail: "附加编辑器中选中的代码",
     chooseFiles: "选择文件…",
     filesDetail: "显式选择并打包多个代码文件",
     context: "上下文",
@@ -4247,6 +4816,7 @@ const strings = {
     transcript: "Q&A transcript",
     openChatGpt: "Open browser chat",
     yourQuestion: "Your question",
+    matchedSelection: "Matched selection",
     answer: "Answer",
     regenerate: "Regenerate",
     retry: "Retry",
@@ -4264,10 +4834,7 @@ const strings = {
     showMoreContexts: "Show more code context",
     showFewerContexts: "Show fewer code contexts",
     showLess: "Show less",
-    sentAsFile: "sent as a code file",
-    sentInline: "inlined in the question",
-    fileAttachments: "files",
-    inlineContexts: "inline snippets",
+    packagedContext: "packaged code context",
     reviewContexts: "Review code context",
     closeContextReview: "Close context review",
     previewContext: "Preview context",
@@ -4302,6 +4869,8 @@ const strings = {
     addContext: "Add context",
     currentFile: "Current file",
     fileDetail: "Read the active editor buffer",
+    currentSelection: "Current selection",
+    selectionDetail: "Attach the code selected in the editor",
     chooseFiles: "Choose files…",
     filesDetail: "Explicitly select and bundle code files",
     context: "Context",

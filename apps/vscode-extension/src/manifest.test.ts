@@ -82,34 +82,93 @@ describe("VS Code discoverability manifest", () => {
     expect(manifest.scripts.package).toBe("node ../../scripts/package-vscode.mjs");
   });
 
-  it("leaves the single visible New conversation button inside the Codex-style webview header", () => {
+  it("keeps New conversation in the webview header and exposes selection in the view title", () => {
     expect(manifest.contributes.menus.commandPalette).toContainEqual({
       command: "ask2gpt.newConversation",
     });
-    expect(manifest.contributes.menus).not.toHaveProperty("view/title");
+    expect(manifest.contributes.menus["view/title"]).not.toContainEqual(
+      expect.objectContaining({ command: "ask2gpt.newConversation" }),
+    );
   });
 
-  it("reserves the selection command for the single runtime lightbulb action", () => {
+  it("puts the selection command in standard editor action surfaces", () => {
     const attachCommand = "ask2gpt.attachSelection";
+    const findRelatedTurnCommand = "ask2gpt.findRelatedTurn";
     const obsoleteCommand = "ask2gpt.askAboutSelection";
+    const selectionWhen =
+      "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/";
     const exposedCommands = manifest.contributes.commands.map(({ command }) => command);
 
     expect(exposedCommands).toContain(attachCommand);
     expect(exposedCommands).not.toContain(obsoleteCommand);
     expect(manifest.activationEvents).toContain(`onCommand:${attachCommand}`);
     expect(manifest.activationEvents).not.toContain(`onCommand:${obsoleteCommand}`);
-    expect(manifest.contributes.menus).not.toHaveProperty("editor/context");
     expect(manifest.contributes.menus.commandPalette).toContainEqual({
       command: attachCommand,
-      when: "false",
+      when: selectionWhen,
     });
     expect(manifest.contributes.commands).toContainEqual(
       expect.objectContaining({
         command: attachCommand,
+        icon: "$(comment-discussion)",
+        shortTitle: "Ask2GPT",
         title: "问 Ask2GPT（使用当前选区） / Ask About Selection",
       }),
     );
-    expect(manifest.contributes.menus).not.toHaveProperty("editor/title");
+    expect(
+      manifest.contributes.commands.find(({ command }) => command === attachCommand),
+    ).not.toHaveProperty("enablement");
+    expect(manifest.contributes.menus["editor/title"]).toContainEqual({
+      command: attachCommand,
+      group: "navigation@1",
+      when: selectionWhen,
+    });
+    expect(manifest.contributes.menus["editor/context"]).toContainEqual({
+      command: attachCommand,
+      group: "navigation@10",
+      when: selectionWhen,
+    });
+    expect(manifest.contributes.menus["view/title"]).toContainEqual({
+      command: attachCommand,
+      group: "navigation@1",
+      when: "view == ask2gpt.sidebar",
+    });
+    expect(exposedCommands).toContain(findRelatedTurnCommand);
+    expect(manifest.activationEvents).toContain(`onCommand:${findRelatedTurnCommand}`);
+    expect(manifest.contributes.commands).toContainEqual(
+      expect.objectContaining({
+        category: "Ask2GPT",
+        command: findRelatedTurnCommand,
+        icon: "$(references)",
+      }),
+    );
+    expect(
+      manifest.contributes.commands.find(({ command }) => command === findRelatedTurnCommand),
+    ).not.toHaveProperty("enablement");
+    const relatedTurnMenuEntries = Object.entries(manifest.contributes.menus).flatMap(
+      ([menu, entries]) =>
+        entries
+          .filter(({ command, when }) => command === findRelatedTurnCommand && when !== "false")
+          .map((entry) => ({ menu, ...entry })),
+    );
+    expect(relatedTurnMenuEntries).toEqual([
+      { menu: "commandPalette", command: findRelatedTurnCommand, when: selectionWhen },
+      {
+        menu: "editor/title",
+        command: findRelatedTurnCommand,
+        group: "navigation@2",
+        when: selectionWhen,
+      },
+      {
+        menu: "editor/context",
+        command: findRelatedTurnCommand,
+        group: "navigation@11",
+        when: selectionWhen,
+      },
+    ]);
+    expect(manifest.contributes.menus["view/title"]).not.toContainEqual(
+      expect.objectContaining({ command: findRelatedTurnCommand }),
+    );
     expect(manifest.contributes).not.toHaveProperty("keybindings");
     expect(manifest).not.toHaveProperty("enabledApiProposals");
     const visibleMenuEntries = Object.entries(manifest.contributes.menus).flatMap(
@@ -118,7 +177,15 @@ describe("VS Code discoverability manifest", () => {
           .filter(({ command, when }) => command === attachCommand && when !== "false")
           .map((entry) => ({ menu, ...entry })),
     );
-    expect(visibleMenuEntries).toEqual([]);
+    expect(visibleMenuEntries).toHaveLength(4);
+    expect(visibleMenuEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ menu: "commandPalette", when: selectionWhen }),
+        expect.objectContaining({ menu: "editor/title", when: selectionWhen }),
+        expect.objectContaining({ menu: "editor/context", when: selectionWhen }),
+        expect.objectContaining({ menu: "view/title", when: "view == ask2gpt.sidebar" }),
+      ]),
+    );
     expect(manifest.contributes).not.toHaveProperty("codeLens");
     expect(manifest.contributes.menus).not.toHaveProperty("chat/editor/inlineGutter");
     expect(manifest.contributes.menus).not.toHaveProperty("editor/content");
@@ -126,6 +193,6 @@ describe("VS Code discoverability manifest", () => {
       Object.keys(manifest.contributes.menus).filter(
         (menu) => menu.startsWith("editor/") || menu.startsWith("chat/editor/"),
       ),
-    ).toEqual([]);
+    ).toEqual(["editor/title", "editor/context"]);
   });
 });

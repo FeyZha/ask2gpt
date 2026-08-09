@@ -218,10 +218,18 @@ export type WebviewToHostMessage =
   | { type: "resumeQueue"; conversationId: string }
   | { type: "stop"; conversationId: string; targetRunId: string }
   | { type: "regenerate"; conversationId: string; messageId: string }
+  | { type: "attachSelection"; conversationId: string }
   | { type: "attachCurrentFile"; conversationId: string }
   | { type: "attachFiles"; conversationId: string }
   | { type: "removeContext"; conversationId: string; contextId: string }
   | { type: "openContext"; conversationId: string; contextId: string }
+  | {
+      type: "openSourceReference";
+      conversationId: string;
+      messageId: string;
+      kind: "file-line" | "symbol";
+      reference: string;
+    }
   | { type: "copy"; text: string }
   | { type: "retryConnection" }
   | { type: "openChatGpt" }
@@ -235,7 +243,8 @@ export type HostToWebviewMessage =
   | { type: "generationUpdate"; update: GenerationViewUpdate }
   | { type: "notice"; level: "info" | "warning" | "error"; message: string }
   | { type: "sendResult"; accepted: boolean; conversationId: string; requestId: string }
-  | { type: "focusComposer" };
+  | { type: "focusComposer" }
+  | { type: "revealTurn"; conversationId: string; messageId: string; contextId?: string };
 
 export function latestUserMessage(messages: ConversationMessage[]) {
   return [...messages].reverse().find((message) => message.role === "user");

@@ -19,6 +19,8 @@ test("preview state satisfies the current AppState invariants", () => {
   const state = validatePreviewState(createPreviewState());
   assert.equal(state.activeConversationId, "preview-main");
   assert.equal(state.backend.connection.phase, "ready");
+  assert.equal(state.backend.connection.hostVersion, "0.1.0");
+  assert.equal(state.backend.connection.relayVersion, "0.1.0");
   assert.equal(state.backend.connection.protocolVersion, 15);
   assert.equal(state.backend.selectorVersion, 50);
   assert.equal(state.backend.project.name, "ask2gpt-tour");
@@ -29,7 +31,15 @@ test("preview state satisfies the current AppState invariants", () => {
   });
   assert.equal(state.contextLocked, false);
   assert.equal(state.pendingContexts.length, 2);
+  assert.deepEqual(
+    state.pendingContexts.map((context) => context.kind),
+    ["selection", "current-file"],
+  );
   assert.ok(state.pendingContexts.every((context) => context.fileName === "insight-board.ts"));
+  assert.match(
+    state.conversations[0].messages[1].markdown,
+    /insight-board\.ts:68.*`summarize\(\)`/u,
+  );
   assert.deepEqual(state.automaticContextIds, []);
 });
 
@@ -85,9 +95,34 @@ test("preview server injects state and serves the current built webview assets",
   assert.match(harness, /clientRequestId/u);
   assert.match(harness, /conversationId === "preview-secondary"/u);
   assert.ok(script.length > 100_000, "expected the current bundled React webview");
+  for (const actionId of [
+    "explain",
+    "find-issues",
+    "fix-error",
+    "review",
+    "refactor",
+    "comments",
+    "tests",
+    "performance-security",
+  ]) {
+    assert.match(script, new RegExp(actionId, "u"));
+  }
+  assert.match(script, /代码任务快捷动作/u);
+  assert.match(script, /只填入，不自动发送/u);
+  assert.match(script, /openSourceReference/u);
+  assert.match(script, /source\.ask2gpt\.invalid/u);
+  assert.match(script, /Matched selection/u);
   assert.match(style, /\.composer/u);
   assert.match(style, /--type-body:/u);
   assert.match(style, /\.conversation-view/u);
+  assert.match(style, /\.markdown-code-block/u);
+  assert.match(style, /--code-keyword:/u);
+  assert.match(style, /\.hljs-addition/u);
+  assert.match(style, /\.code-task-actions/u);
+  assert.match(style, /\.code-task-action:focus-visible/u);
+  assert.match(style, /\.source-reference:focus-visible/u);
+  assert.match(style, /\.message--trace-target/u);
+  assert.match(style, /@media\s*\((?:max-width:\s*340px|width<=340px)\)/u);
   assert.match(style, /history-panel-in/u);
   assert.match(style, /message--assistant\[data-latest-assistant=(?:"true"|true)\]/u);
   assert.match(style, /prefers-reduced-motion:\s*reduce/u);

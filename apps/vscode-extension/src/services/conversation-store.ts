@@ -962,6 +962,9 @@ function normalizeMessage(value: unknown, fallbackCreatedAt: string): Conversati
     status,
     createdAt: isIsoDate(value.createdAt) ? value.createdAt : fallbackCreatedAt,
     ...(contexts.length > 0 ? { contexts } : {}),
+    ...(role === "user" && contexts.length > 0 && value.contextTransportVersion === 2
+      ? { contextTransportVersion: 2 as const }
+      : {}),
     ...(runError ? { runError } : {}),
     ...(terminalReceipt ? { terminalReceipt } : {}),
   };

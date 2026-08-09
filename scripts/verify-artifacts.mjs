@@ -80,8 +80,12 @@ if (extensionPackage.publisher !== "FeyZha") {
 }
 assertVSIXShortcutSurface(extensionPackage);
 const extensionBundle = readText(vsixArchive, "extension/dist/extension.cjs");
+const webviewBundle = readText(vsixArchive, "extension/dist/webview/webview.js");
+const webviewStyles = readText(vsixArchive, "extension/dist/webview/webview.css");
 assertProtocolBundle(extensionBundle, "VSIX extension host");
 assertSelectionShortcutBundle(extensionBundle, readText(vsixArchive, "extension/readme.md"));
+assertCodeTaskShortcutWebview(webviewBundle, webviewStyles);
+assertTraceabilityBundles(extensionBundle, webviewBundle, webviewStyles);
 assertNoLegacyContent(vsixArchive, "VSIX");
 
 process.stdout.write(
@@ -159,6 +163,9 @@ function assertContentRuntimeBundle(bundle, label, expectedRevision) {
 
 function assertVSIXShortcutSurface(extensionPackage) {
   const selectionCommandId = "ask2gpt.attachSelection";
+  const findRelatedTurnCommandId = "ask2gpt.findRelatedTurn";
+  const selectionWhen = "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/";
+  const selectionViewWhen = "view == ask2gpt.sidebar";
   const contributes = extensionPackage.contributes ?? {};
   const commands = Array.isArray(contributes.commands) ? contributes.commands : [];
   const menus =
@@ -174,14 +181,25 @@ function assertVSIXShortcutSurface(extensionPackage) {
           .map((entry) => ({ menu, entry }))
       : [],
   );
-  const hiddenPaletteEntry = Array.isArray(menus.commandPalette)
+  const paletteEntry = Array.isArray(menus.commandPalette)
     ? menus.commandPalette.find((entry) => entry?.command === selectionCommandId)
     : undefined;
+  const findRelatedTurnCommand = commands.find(
+    (entry) => entry?.command === findRelatedTurnCommandId,
+  );
+  const findRelatedTurnMenuEntries = Object.entries(menus).flatMap(([menu, entries]) =>
+    Array.isArray(entries)
+      ? entries
+          .filter((entry) => entry?.command === findRelatedTurnCommandId && entry.when !== "false")
+          .map((entry) => ({ menu, entry }))
+      : [],
+  );
   const expectedCommands = [
     "ask2gpt.attachCurrentFile",
     "ask2gpt.attachFiles",
     selectionCommandId,
     "ask2gpt.copyDiagnostics",
+    findRelatedTurnCommandId,
     "ask2gpt.newConversation",
     "ask2gpt.open",
     "ask2gpt.retryConnection",
@@ -193,38 +211,123 @@ function assertVSIXShortcutSurface(extensionPackage) {
     JSON.stringify(actualCommands) !== JSON.stringify(expectedCommands) ||
     commands.some((entry) => entry?.command === "ask2gpt.askAboutSelection") ||
     selectionCommand?.enablement !== undefined ||
-    selectionCommand?.icon !== undefined ||
+    selectionCommand?.icon !== "$(comment-discussion)" ||
+    findRelatedTurnCommand?.enablement !== undefined ||
+    findRelatedTurnCommand?.icon !== "$(references)" ||
     selectionCommand?.title !== "问 Ask2GPT（使用当前选区） / Ask About Selection" ||
     !extensionPackage.activationEvents?.includes(`onCommand:${selectionCommandId}`) ||
-    hiddenPaletteEntry?.when !== "false" ||
-    editorShortcutMenus.length !== 0 ||
-    selectionMenuEntries.length !== 0 ||
+    !extensionPackage.activationEvents?.includes(`onCommand:${findRelatedTurnCommandId}`) ||
+    paletteEntry?.when !== selectionWhen ||
+    JSON.stringify(editorShortcutMenus) !== JSON.stringify(["editor/title", "editor/context"]) ||
+    selectionMenuEntries.length !== 4 ||
+    !selectionMenuEntries.every(({ menu, entry }) =>
+      menu === "view/title" ? entry.when === selectionViewWhen : entry.when === selectionWhen,
+    ) ||
+    findRelatedTurnMenuEntries.length !== 3 ||
+    !findRelatedTurnMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "commandPalette" && entry.when === selectionWhen && entry.group === undefined,
+    ) ||
+    !findRelatedTurnMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "editor/title" && entry.when === selectionWhen && entry.group === "navigation@2",
+    ) ||
+    !findRelatedTurnMenuEntries.some(
+      ({ menu, entry }) =>
+        menu === "editor/context" &&
+        entry.when === selectionWhen &&
+        entry.group === "navigation@11",
+    ) ||
+    findRelatedTurnMenuEntries.some(({ menu }) => menu === "view/title") ||
     contributes.keybindings !== undefined ||
     contributes.codeLens !== undefined ||
-    menus["editor/context"] !== undefined ||
+    menus["editor/title"]?.[0]?.group !== "navigation@1" ||
+    menus["editor/context"]?.[0]?.group !== "navigation@10" ||
+    menus["view/title"]?.[0]?.group !== "navigation@1" ||
     menus["editor/content"] !== undefined ||
     menus["chat/editor/inlineGutter"] !== undefined
   ) {
-    throw new Error("VSIX selected-code surface is not reserved for one runtime lightbulb action.");
+    throw new Error(
+      "VSIX selected-code surface does not use the reviewed editor and view actions.",
+    );
   }
 }
 
 function assertSelectionShortcutBundle(bundle, readme) {
   const selectionCommand = "ask2gpt.attachSelection";
   const selectionContext = "ask2gpt.hasAttachableSelection";
-  const currentTitle = "Ask Ask2GPT about this selection";
+  const codeActionTitle = "Ask Ask2GPT about this selection";
+  const publicTitle = "Ask About Selection";
   const obsoleteTitles = ["Add selection to Ask2GPT", "Add Selection to Chat"];
   if (
     !bundle.includes(selectionCommand) ||
     !bundle.includes("ask2gpt.selection") ||
     !bundle.includes("registerCodeActionsProvider") ||
-    !readme.includes(currentTitle) ||
+    !bundle.includes(codeActionTitle) ||
+    !readme.includes(publicTitle) ||
     bundle.includes(selectionContext) ||
     obsoleteTitles.some((title) => bundle.includes(title) || readme.includes(title))
   ) {
     throw new Error(
-      "VSIX selected-code shortcut bundle is stale relative to the reviewed lightbulb source.",
+      "VSIX selected-code shortcut bundle is stale relative to the reviewed editor actions.",
     );
+  }
+}
+
+function assertCodeTaskShortcutWebview(bundle, styles) {
+  const actionIds = [
+    "explain",
+    "find-issues",
+    "fix-error",
+    "review",
+    "refactor",
+    "comments",
+    "tests",
+    "performance-security",
+  ];
+  const missingIds = actionIds.filter((id) => !bundle.includes(id));
+  const requiredCopy = [
+    "代码任务快捷动作",
+    "只填入，不自动发送",
+    "Code task shortcuts",
+    "Fills the draft without sending",
+  ];
+  const missingCopy = requiredCopy.filter((copy) => !bundle.includes(copy));
+  const requiredSelectors = [
+    ".code-task-actions",
+    ".code-task-actions__list",
+    ".code-task-action",
+    ".code-task-action:focus-visible",
+  ];
+  const missingSelectors = requiredSelectors.filter((selector) => !styles.includes(selector));
+
+  if (missingIds.length > 0 || missingCopy.length > 0 || missingSelectors.length > 0) {
+    throw new Error(
+      `VSIX code-task shortcut webview is stale: missing ${[
+        ...missingIds,
+        ...missingCopy,
+        ...missingSelectors,
+      ].join(", ")}.`,
+    );
+  }
+}
+
+function assertTraceabilityBundles(extensionBundle, webviewBundle, styles) {
+  const extensionMarkers = [
+    "ask2gpt.findRelatedTurn",
+    "openSourceReference",
+    "vscode.executeDocumentSymbolProvider",
+    "SOURCE_CONTEXT_UNTRUSTED",
+  ];
+  const webviewMarkers = ["openSourceReference", "source.ask2gpt.invalid", "source-reference"];
+  const styleMarkers = [".source-reference", ".source-reference:focus-visible"];
+  const missing = [
+    ...extensionMarkers.filter((marker) => !extensionBundle.includes(marker)),
+    ...webviewMarkers.filter((marker) => !webviewBundle.includes(marker)),
+    ...styleMarkers.filter((marker) => !styles.includes(marker)),
+  ];
+  if (missing.length > 0) {
+    throw new Error(`VSIX traceability bundle is stale: missing ${missing.join(", ")}.`);
   }
 }
 

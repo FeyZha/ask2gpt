@@ -1,6 +1,6 @@
 {
   "name": "ask2gpt",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "publisher": "FeyZha",
   "displayName": "Ask2GPT",
@@ -37,6 +37,7 @@
     "onCommand:ask2gpt.open",
     "onCommand:ask2gpt.newConversation",
     "onCommand:ask2gpt.attachSelection",
+    "onCommand:ask2gpt.findRelatedTurn",
     "onCommand:ask2gpt.attachCurrentFile",
     "onCommand:ask2gpt.attachFiles",
     "onCommand:ask2gpt.retryConnection"
@@ -106,7 +107,16 @@
       {
         "command": "ask2gpt.attachSelection",
         "title": "问 Ask2GPT（使用当前选区） / Ask About Selection",
-        "category": "Ask2GPT"
+        "shortTitle": "Ask2GPT",
+        "category": "Ask2GPT",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "ask2gpt.findRelatedTurn",
+        "title": "查找关联对话 / Find Related Turn",
+        "shortTitle": "关联对话",
+        "category": "Ask2GPT",
+        "icon": "$(references)"
       },
       {
         "command": "ask2gpt.attachCurrentFile",
@@ -171,7 +181,42 @@
         },
         {
           "command": "ask2gpt.attachSelection",
-          "when": "false"
+          "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/"
+        },
+        {
+          "command": "ask2gpt.findRelatedTurn",
+          "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "ask2gpt.attachSelection",
+          "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ask2gpt.findRelatedTurn",
+          "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "ask2gpt.attachSelection",
+          "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/",
+          "group": "navigation@10"
+        },
+        {
+          "command": "ask2gpt.findRelatedTurn",
+          "when": "editorHasSelection && resourceScheme =~ /^(file|untitled|vscode-remote)$/",
+          "group": "navigation@11"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "ask2gpt.attachSelection",
+          "when": "view == ask2gpt.sidebar",
+          "group": "navigation@1"
         }
       ]
     }

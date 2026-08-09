@@ -3,6 +3,38 @@
 All notable changes to Ask2GPT are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.0] - 2026-08-08
+
+### Added
+
+- ChatGPT-style fenced code blocks with a language toolbar, a block-level copy action and expanded
+  multicolor syntax highlighting that follows VS Code theme colors.
+- A selected-code Ask2GPT action in the always-visible Ask2GPT view title, editor title bar, editor
+  context menu, Command Palette and Composer context menu.
+- Eight selection-aware code task shortcuts for explanation, issue finding, error fixing, review,
+  refactoring, comments, unit tests, and performance/security analysis. Shortcuts fill an isolated,
+  editable conversation draft and never send automatically.
+- Host-verified source tracing: context cards open their captured lines, answer references such as
+  `file.py:34` and attached function symbols open their source definitions, and an editor selection
+  can reveal the sent conversation turn that used it.
+
+### Changed
+
+- Streaming code blocks keep their lightweight stable rendering and apply full syntax highlighting
+  when the answer reaches a terminal state.
+- Code context now stays packaged as compact cards/file capsules. The visible ChatGPT prompt contains
+  only the human-written question, while bounded snapshots are uploaded as in-memory text files.
+- Versioned context-transport receipts and ChatGPT presentation matching keep old inline turns and new
+  packaged turns compact during history restoration.
+- The Relay hot-upgrade compatibility line now covers adjacent `0.1.x` patch releases starting at
+  `0.1.0`; formal installations still require matching VSIX and Relay versions.
+
+### Fixed
+
+- Minimized-window dispatch no longer submits fully off-screen Chrome bounds. Relay restores the owned
+  home window at Chrome-managed bounds without focus and minimizes it again after completion, avoiding
+  Chromium's “at least 50% within visible screen space” rejection before a packaged-context send.
+
 ## [0.0.1] - 2026-08-08
 
 ### Added

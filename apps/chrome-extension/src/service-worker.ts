@@ -381,10 +381,6 @@ const PARKED_WINDOW_HEIGHT = 760;
 const PARKED_WINDOW_MAX_POSITION_ADJUSTMENT = 256;
 const DISPATCH_INTENT_PREWARM_HOLD_MS = 10_000;
 const DISPATCH_INTENT_PREWARM_POLL_MS = 50;
-// A minimized home window is restored only at these safe off-screen bounds,
-// without taking OS focus, then returned to its original bounds and state.
-const PARKED_WINDOW_BOUNDS = { height: 100, left: -16_000, top: -16_000, width: 100 } as const;
-const PARKED_WINDOW_SAFE_EDGE = -8_000;
 const MAIN_WORLD_SEND_ATTRIBUTE = "data-ask2gpt-main-world-send";
 const MAIN_WORLD_COMPOSER_ATTRIBUTE = "data-ask2gpt-main-world-composer";
 const MAIN_WORLD_SCOPE_ATTRIBUTE = "data-ask2gpt-main-world-scope";
@@ -7502,8 +7498,9 @@ async function withComposerReadyForDispatch<T>(
   // its document timers and React submission path are frozen. When the content
   // runtime reports a hidden document (or cannot answer from an inactive tab),
   // select that exact owned tab in its original, non-focused Chrome window.
-  // A minimized window is restored at safe off-screen bounds for the run and
-  // minimized again at terminal cleanup. Neither path focuses the OS window.
+  // A minimized window is restored at Chrome's own valid restore bounds for
+  // the run, then minimized again at terminal cleanup. Neither path focuses
+  // the OS window.
   let enhancedWakeAttempt: Promise<boolean> | undefined;
   const prepareEnhancedRenderer = async () => {
     if (!enhancedBackgroundEnabled) return false;
@@ -8228,9 +8225,9 @@ async function withConversationTabActiveInHomeWindow<T>(
       await parkMinimizedChromeWindow(windowId, tabId, restoreBounds);
       parked = true;
     }
-    // The minimized-send path has already moved the normal window far outside
-    // the virtual desktop. Selecting the exact owned tab now wakes React without
-    // focusing Chrome or exposing the full browsing window.
+    // The minimized-send path has restored the normal window behind the user's
+    // foreground application. Selecting the exact owned tab now wakes React
+    // without focusing Chrome.
     if (!targetWasActive) {
       await updateTabWithInternalActivation(
         windowId,
@@ -8375,28 +8372,10 @@ async function parkMinimizedChromeWindow(
   restoreBounds: ChromeWindowBounds | undefined,
 ) {
   try {
-    // Chrome can leave the promise unresolved when state, focus and bounds are
-    // changed together on an already-minimized native window. Set its restore
-    // bounds while it is still hidden, verify them, then restore only its state.
-    const positionedWindow = await promiseWithTimeout(
-      chrome.windows.update(windowId, PARKED_WINDOW_BOUNDS),
-      1_500,
-      "Timed out while positioning the minimized Chrome window off-screen.",
-    );
-    if (
-      positionedWindow.state !== "minimized" ||
-      positionedWindow.left === undefined ||
-      positionedWindow.top === undefined ||
-      positionedWindow.left > PARKED_WINDOW_SAFE_EDGE ||
-      positionedWindow.top > PARKED_WINDOW_SAFE_EDGE
-    ) {
-      throw relayFailure(
-        "CHATGPT_REMOTE_UNAVAILABLE",
-        "Chrome could not prepare the minimized Relay window safely off-screen; the question was not sent.",
-        tabId,
-      );
-    }
-
+    // Chrome rejects extension-provided bounds unless at least half of the
+    // window intersects a current display. Reuse Chrome's own restore bounds
+    // instead of guessing display coordinates, which is also robust when a
+    // monitor is detached while the browser is minimized.
     const parkedWindow = await promiseWithTimeout(
       chrome.windows.update(windowId, {
         drawAttention: false,
@@ -8404,19 +8383,12 @@ async function parkMinimizedChromeWindow(
         state: "normal",
       }),
       1_500,
-      "Timed out while restoring the off-screen Relay window.",
+      "Timed out while restoring the minimized Relay window.",
     );
-    if (
-      parkedWindow.focused !== false ||
-      parkedWindow.state !== "normal" ||
-      parkedWindow.left === undefined ||
-      parkedWindow.top === undefined ||
-      parkedWindow.left > PARKED_WINDOW_SAFE_EDGE ||
-      parkedWindow.top > PARKED_WINDOW_SAFE_EDGE
-    ) {
+    if (parkedWindow.focused !== false || parkedWindow.state !== "normal") {
       throw relayFailure(
         "CHATGPT_REMOTE_UNAVAILABLE",
-        "Chrome could not keep the minimized Relay window safely off-screen; the question was not sent.",
+        "Chrome could not restore the minimized Relay window without taking focus; the question was not sent.",
         tabId,
       );
     }
@@ -8427,7 +8399,12 @@ async function parkMinimizedChromeWindow(
     } else if (restoreBounds) {
       await chrome.windows.update(windowId, restoreBounds).catch(() => undefined);
     }
-    throw error;
+    if (hasRelayFailureCode(error) && error instanceof Error) throw error;
+    throw relayFailure(
+      "CHATGPT_REMOTE_UNAVAILABLE",
+      "Chrome could not safely prepare the minimized Relay window without taking focus. Restore Chrome once, then retry.",
+      tabId,
+    );
   }
 }
 

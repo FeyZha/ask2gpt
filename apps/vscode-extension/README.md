@@ -21,14 +21,27 @@ API key is required. Chrome 116+ and VS Code 1.96+ are supported.
 
 - Click the Ask2GPT icon in the Activity Bar, or run
   `Ask2GPT: 打开问答窗口 / Open Q&A`.
-- Select code and use the yellow-lightbulb action
-  `问 Ask2GPT（使用当前选区） / Ask Ask2GPT about this selection`.
-- Use the Composer `+` button to attach the current file or selected text files.
+- Select code and click the always-visible Ask2GPT action in the Ask2GPT view title. The same
+  `问 Ask2GPT（使用当前选区） / Ask About Selection` command is also available from the editor
+  title, editor context menu and Command Palette.
+- Use the Composer `+` button to attach the current selection, current file or selected text files.
+- After attaching a selection, choose Explain, Find issues, Fix errors, Review, Refactor, Add comments,
+  Unit tests, or Performance/security. A shortcut only fills the conversation's editable draft; it
+  never sends automatically.
 - Review every context item before sending; Ask2GPT never scans the workspace for more files.
+- Click a context card or a verified `file.ts:line`/inline symbol in an answer to return to attached
+  source. With code selected, **Find Related Turn** locates the sent question that used that snapshot.
 
-Ask2GPT supports streaming Markdown, multi-turn conversations, title/history sync, model-option sync,
-stop/regenerate, queued follow-ups, encrypted extension-private history, and isolated routing across
-multiple VS Code windows.
+Code context remains a compact attachment card in the VS Code transcript and a file capsule on the
+ChatGPT page. Only the human-written question appears as prompt text; the Relay uploads each bounded
+snapshot as an in-memory text file for ChatGPT to read.
+Source links are resolved only against snapshots explicitly attached before that answer; they never
+trigger a workspace-wide file search.
+
+Ask2GPT supports streaming Markdown, ChatGPT-style code blocks with multicolor syntax highlighting and
+block-level copy, multi-turn conversations, title/history sync, model-option sync, stop/regenerate,
+queued follow-ups, encrypted extension-private history, and isolated routing across multiple VS Code
+windows.
 
 Ask2GPT is best for explanation, analysis, comparison, and planning. Use a coding Agent when the task
 needs repository search, file edits, terminal commands, tests, or Git operations.

@@ -7,6 +7,11 @@ const contextNavigationMock = vi.hoisted(() => ({
   openContextFromState: vi.fn(async () => undefined),
 }));
 
+const sourceTraceMock = vi.hoisted(() => ({
+  openAnswerSourceReferenceFromState: vi.fn(async () => undefined),
+  openAnswerSymbolFromState: vi.fn(async () => undefined),
+}));
+
 vi.mock("vscode", () => ({
   commands: {
     executeCommand: vi.fn(async () => undefined),
@@ -17,6 +22,7 @@ vi.mock("vscode", () => ({
     openExternal: vi.fn(async () => true),
   },
   window: {
+    activeTextEditor: undefined,
     showWarningMessage: vi.fn(async () => undefined),
   },
   Uri: {
@@ -28,15 +34,77 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("./context-navigation", () => contextNavigationMock);
+vi.mock("./source-trace", () => sourceTraceMock);
 
 import { Ask2GPTViewProvider } from "./webview-provider";
 
 afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+  (vscode.window as { activeTextEditor?: unknown }).activeTextEditor = undefined;
 });
 
 describe("Ask2GPTViewProvider state delivery", () => {
+  it("captures the exact active selection for the composer selection action", async () => {
+    const state = appState({ activeRuns: 0 });
+    const attachSelection = vi.fn();
+    const controller = {
+      attachSelection,
+      getState: () => state,
+      onState: () => ({ dispose: vi.fn() }),
+    };
+    (vscode.window as { activeTextEditor?: unknown }).activeTextEditor = {
+      document: {
+        uri: { scheme: "file", toString: () => "file:///workspace/index.ts" },
+        version: 7,
+      },
+      selection: {
+        isEmpty: false,
+        start: { line: 4, character: 2 },
+        end: { line: 6, character: 11 },
+      },
+    };
+    let receiveMessage: ((message: WebviewToHostMessage) => void) | undefined;
+    const view = {
+      onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
+      visible: true,
+      webview: {
+        asWebviewUri: (value: unknown) => value,
+        cspSource: "test-source",
+        html: "",
+        onDidReceiveMessage: vi.fn((listener: (message: WebviewToHostMessage) => void) => {
+          receiveMessage = listener;
+          return { dispose: vi.fn() };
+        }),
+        options: {},
+        postMessage: vi.fn(async () => true),
+      },
+    };
+    const provider = new Ask2GPTViewProvider(
+      { path: "extension" } as never,
+      controller as never,
+      { error: vi.fn(), info: vi.fn() } as never,
+      vi.fn(async () => undefined),
+      vi.fn(async () => undefined),
+    );
+    provider.resolveWebviewView(view as never);
+
+    receiveMessage?.({ type: "attachSelection", conversationId: "conversation-1" });
+
+    await vi.waitFor(() =>
+      expect(attachSelection).toHaveBeenCalledWith("conversation-1", {
+        uri: "file:///workspace/index.ts",
+        documentVersion: 7,
+        startLine: 4,
+        startCharacter: 2,
+        endLine: 6,
+        endCharacter: 11,
+      }),
+    );
+    provider.dispose();
+  });
+
   it("reveals the contributed view, focuses it, and focuses the composer after ready", async () => {
     const state = appState({ activeRuns: 0 });
     const controller = {
@@ -84,6 +152,134 @@ describe("Ask2GPTViewProvider state delivery", () => {
     expect(postMessage).toHaveBeenCalledOnce();
     expect(postMessage).toHaveBeenCalledWith({ type: "focusComposer" });
 
+    provider.dispose();
+  });
+
+  it("delivers authoritative state before revealing a turn in a ready renderer", async () => {
+    const state = appState({ activeRuns: 0 });
+    let releaseState!: (delivered: boolean) => void;
+    const stateDelivery = new Promise<boolean>((resolve) => {
+      releaseState = resolve;
+    });
+    const postMessage = vi.fn((message: unknown) =>
+      (message as { type?: string }).type === "state" ? stateDelivery : Promise.resolve(true),
+    );
+    const harness = createStateDeliveryHarness(() => state, postMessage);
+    harness.ready();
+    postMessage.mockClear();
+
+    await harness.provider.revealTurn("conversation-1", "assistant-1", "context-1");
+
+    expect(postMessage).toHaveBeenCalledOnce();
+    expect(postMessage).toHaveBeenLastCalledWith({ type: "state", state });
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "revealTurn" }));
+
+    releaseState(true);
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledTimes(2));
+    expect(postMessage.mock.calls.map(([message]) => message)).toEqual([
+      { type: "state", state },
+      {
+        type: "revealTurn",
+        conversationId: "conversation-1",
+        messageId: "assistant-1",
+        contextId: "context-1",
+      },
+    ]);
+    harness.provider.dispose();
+  });
+
+  it("retains a turn reveal until an unresolved renderer announces readiness", async () => {
+    const state = appState({ activeRuns: 0 });
+    const postMessage = vi.fn(async () => true);
+    const harness = createStateDeliveryHarness(() => state, postMessage);
+
+    await harness.provider.revealTurn("conversation-1", "assistant-1");
+    expect(postMessage).not.toHaveBeenCalled();
+
+    harness.ready();
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledOnce());
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "revealTurn",
+      conversationId: "conversation-1",
+      messageId: "assistant-1",
+    });
+    harness.provider.dispose();
+  });
+
+  it("redelivers an in-flight turn reveal when its renderer is replaced", async () => {
+    const state = appState({ activeRuns: 0 });
+    let firstReceive: ((message: WebviewToHostMessage) => void) | undefined;
+    let secondReceive: ((message: WebviewToHostMessage) => void) | undefined;
+    let releaseOldReveal!: (delivered: boolean) => void;
+    const oldRevealDelivery = new Promise<boolean>((resolve) => {
+      releaseOldReveal = resolve;
+    });
+    const firstPost = vi.fn((message: unknown) =>
+      (message as { type?: string }).type === "revealTurn"
+        ? oldRevealDelivery
+        : Promise.resolve(true),
+    );
+    const secondPost = vi.fn(async () => true);
+    const controller = {
+      getState: () => state,
+      onState: () => ({ dispose: vi.fn() }),
+    };
+    const makeView = (
+      postMessage: (message: unknown) => PromiseLike<boolean>,
+      capture: (listener: (message: WebviewToHostMessage) => void) => void,
+    ) => ({
+      onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
+      visible: true,
+      webview: {
+        asWebviewUri: (value: unknown) => value,
+        cspSource: "test-source",
+        html: "",
+        onDidReceiveMessage: vi.fn((listener: (message: WebviewToHostMessage) => void) => {
+          capture(listener);
+          return { dispose: vi.fn() };
+        }),
+        options: {},
+        postMessage,
+      },
+    });
+    const provider = new Ask2GPTViewProvider(
+      { path: "extension" } as never,
+      controller as never,
+      { error: vi.fn(), info: vi.fn() } as never,
+      vi.fn(async () => undefined),
+      vi.fn(async () => undefined),
+    );
+    provider.resolveWebviewView(
+      makeView(firstPost, (listener) => {
+        firstReceive = listener;
+      }) as never,
+    );
+    firstReceive?.({ type: "ready" });
+
+    await provider.revealTurn("conversation-1", "assistant-1");
+    await vi.waitFor(() => expect(firstPost).toHaveBeenCalledTimes(2));
+    expect(firstPost).toHaveBeenLastCalledWith({
+      type: "revealTurn",
+      conversationId: "conversation-1",
+      messageId: "assistant-1",
+    });
+
+    provider.resolveWebviewView(
+      makeView(secondPost, (listener) => {
+        secondReceive = listener;
+      }) as never,
+    );
+    secondReceive?.({ type: "ready" });
+
+    await vi.waitFor(() =>
+      expect(secondPost).toHaveBeenCalledWith({
+        type: "revealTurn",
+        conversationId: "conversation-1",
+        messageId: "assistant-1",
+      }),
+    );
+    releaseOldReveal(true);
     provider.dispose();
   });
 
@@ -415,6 +611,77 @@ describe("Ask2GPTViewProvider state delivery", () => {
       "conversation-1",
       "context-1",
     );
+    provider.dispose();
+  });
+
+  it("routes file and symbol source references through the current host state", async () => {
+    const state = appState({ activeRuns: 0 });
+    const controller = {
+      getState: () => state,
+      onState: () => ({ dispose: vi.fn() }),
+    };
+    let receiveMessage: ((message: WebviewToHostMessage) => Promise<void> | void) | undefined;
+    const view = {
+      onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
+      visible: true,
+      webview: {
+        asWebviewUri: (value: unknown) => value,
+        cspSource: "test-source",
+        html: "",
+        onDidReceiveMessage: vi.fn(
+          (listener: (message: WebviewToHostMessage) => Promise<void> | void) => {
+            receiveMessage = listener;
+            return { dispose: vi.fn() };
+          },
+        ),
+        options: {},
+        postMessage: vi.fn(async () => true),
+      },
+    };
+    const provider = new Ask2GPTViewProvider(
+      { path: "extension" } as never,
+      controller as never,
+      { error: vi.fn(), info: vi.fn() } as never,
+      vi.fn(async () => undefined),
+      vi.fn(async () => undefined),
+    );
+    provider.resolveWebviewView(view as never);
+
+    void receiveMessage?.({
+      type: "openSourceReference",
+      conversationId: "conversation-1",
+      messageId: "assistant-1",
+      kind: "file-line",
+      reference: "src/store.ts:34-36",
+    });
+    await vi.waitFor(() =>
+      expect(sourceTraceMock.openAnswerSourceReferenceFromState).toHaveBeenCalledWith(
+        state,
+        "conversation-1",
+        "assistant-1",
+        "src/store.ts:34-36",
+      ),
+    );
+
+    void receiveMessage?.({
+      type: "openSourceReference",
+      conversationId: "conversation-1",
+      messageId: "assistant-1",
+      kind: "symbol",
+      reference: "VectorStore.search()",
+    });
+    await vi.waitFor(() =>
+      expect(sourceTraceMock.openAnswerSymbolFromState).toHaveBeenCalledWith(
+        state,
+        "conversation-1",
+        "assistant-1",
+        "VectorStore.search()",
+      ),
+    );
+
+    expect(sourceTraceMock.openAnswerSourceReferenceFromState).toHaveBeenCalledOnce();
+    expect(sourceTraceMock.openAnswerSymbolFromState).toHaveBeenCalledOnce();
     provider.dispose();
   });
 

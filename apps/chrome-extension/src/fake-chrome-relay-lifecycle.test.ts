@@ -116,6 +116,32 @@ describe("Fake Chrome tab-message lifecycle", () => {
     );
     await expect(chrome.tabs.get(tabId)).resolves.toMatchObject({ windowId });
   });
+
+  it("matches Chrome's visible-screen constraint for extension-managed window bounds", async () => {
+    const { harness, windowId } = await createHarness();
+
+    await expect(
+      chrome.windows.update(windowId, {
+        height: 100,
+        left: -16_000,
+        top: -16_000,
+        width: 100,
+      }),
+    ).rejects.toThrow(
+      "Invalid value for bounds. Bounds must be at least 50% within visible screen space.",
+    );
+    expect(harness.windowBounds(windowId)).toEqual({
+      height: 900,
+      left: 100,
+      top: 100,
+      width: 1_200,
+    });
+
+    await expect(chrome.windows.update(windowId, { left: -600, top: 100 })).resolves.toMatchObject({
+      left: -600,
+      top: 100,
+    });
+  });
 });
 
 async function createHarness() {

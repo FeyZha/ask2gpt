@@ -28,7 +28,7 @@ import type {
 import type { ContextService } from "./services/context-service";
 import type { ConversationStore, ConversationStoreLoadReport } from "./services/conversation-store";
 import type { SafeLogger } from "./services/logger";
-import { buildVisiblePrompt } from "./services/prompt-builder";
+import { buildLegacyVisiblePrompt } from "./services/prompt-builder";
 import type { SelectionReference } from "./selection-reference";
 
 const controllers: Ask2GPTController[] = [];
@@ -823,6 +823,64 @@ describe("Ask2GPTController", () => {
     });
   });
 
+  it("builds transcript proofs with each context transport version", async () => {
+    const initial = conversation("versioned-context-proof");
+    initial.remoteUrl = "https://chatgpt.com/c/versioned-context-proof";
+    const context = explicitContext();
+    const legacyQuestion = "LEGACY_[TURN] & <one>";
+    const packagedQuestion = "PACKAGED_[TURN] & <two>";
+    initial.messages = [
+      {
+        id: "legacy-user",
+        role: "user",
+        markdown: legacyQuestion,
+        status: "complete",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        contexts: [context],
+      },
+      {
+        id: "legacy-answer",
+        role: "assistant",
+        markdown: "LEGACY_ANSWER",
+        status: "complete",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      },
+      {
+        id: "packaged-user",
+        role: "user",
+        markdown: packagedQuestion,
+        status: "complete",
+        createdAt: "2026-01-01T00:00:02.000Z",
+        contexts: [context],
+        contextTransportVersion: 2,
+      },
+      {
+        id: "packaged-answer",
+        role: "assistant",
+        markdown: "PACKAGED_ANSWER",
+        status: "complete",
+        createdAt: "2026-01-01T00:00:03.000Z",
+      },
+    ];
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([initial]), backend, initial.id);
+
+    await controller.send("NEXT_TURN");
+
+    const expectedMessages = [
+      ["user", promptInlinePresentationV1(buildLegacyVisiblePrompt(legacyQuestion, [context]))],
+      ["assistant", "LEGACY_ANSWER"],
+      ["user", promptInlinePresentationV1(packagedQuestion)],
+      ["assistant", "PACKAGED_ANSWER"],
+    ] as const;
+    expect(backend.sent[0]?.transcriptProof?.messageHashes).toEqual(
+      expectedMessages.map(([role, markdown]) => ({
+        role,
+        sha256: sha256(JSON.stringify([role, markdown])),
+      })),
+    );
+  });
+
   it("deduplicates, removes, stores, and clears explicit attachment bundles", async () => {
     const store = new FakeStore([conversation("contexts")]);
     const backend = new FakeBackend();
@@ -847,8 +905,14 @@ describe("Ask2GPTController", () => {
     expect(
       controller.activeConversation?.messages[0]?.contexts?.map((context) => context.id),
     ).toEqual(["context-1", "context-2"]);
-    expect(backend.sent[0]?.prompt).toContain("Context 1/2:");
-    expect(backend.sent[0]?.prompt).toContain("Context 2/2:");
+    expect(backend.sent[0]?.prompt).toBe("解释这些代码");
+    expect(backend.sent[0]?.attachments).toEqual([
+      expect.objectContaining({ id: "context-1", fileName: "index.L1-L1.ts" }),
+      expect.objectContaining({ id: "context-2", fileName: "other.ts" }),
+    ]);
+    expect(controller.activeConversation?.messages[0]).toMatchObject({
+      contextTransportVersion: 2,
+    });
   });
 
   it("deduplicates repeated snapshots by content identity instead of generated id", async () => {
@@ -958,9 +1022,17 @@ describe("Ask2GPTController", () => {
     await controller.send(question);
 
     expect(backend.sent).toHaveLength(1);
-    expect(backend.sent[0]?.prompt).toContain(`Question:\n${question}`);
+    expect(backend.sent[0]?.prompt).toBe(question);
+    expect(backend.sent[0]?.attachments).toEqual([
+      expect.objectContaining({ id: "context-1", fileName: "index.L1-L1.ts" }),
+    ]);
     expect(controller.activeConversation?.messages).toEqual([
-      expect.objectContaining({ role: "user", markdown: question, contexts: [explicitContext()] }),
+      expect.objectContaining({
+        role: "user",
+        markdown: question,
+        contexts: [explicitContext()],
+        contextTransportVersion: 2,
+      }),
       expect.objectContaining({ role: "assistant", status: "streaming" }),
     ]);
     expect(
@@ -2052,12 +2124,13 @@ describe("Ask2GPTController", () => {
     const local = conversation("history-rebuild");
     local.remoteUrl = "https://chatgpt.com/c/remote-history";
     const context = explicitContext();
+    const question = "解释 [user_name] *tag* `x` & <safe>";
     const createdAt = local.createdAt;
     local.messages = [
       {
         id: "local-user",
         role: "user",
-        markdown: "解释这段代码",
+        markdown: question,
         status: "complete",
         createdAt,
         contexts: [context],
@@ -2097,7 +2170,7 @@ describe("Ask2GPTController", () => {
       messages: [
         {
           role: "user",
-          markdown: buildVisiblePrompt("解释这段代码", [context]),
+          markdown: promptInlinePresentationV1(buildLegacyVisiblePrompt(question, [context])),
         },
         { role: "assistant", markdown: "新回答" },
       ],
@@ -2116,7 +2189,7 @@ describe("Ask2GPTController", () => {
       expect.objectContaining({
         id: "local-user",
         role: "user",
-        markdown: "解释这段代码",
+        markdown: question,
         contexts: [context],
       }),
       expect.objectContaining({
@@ -2135,6 +2208,104 @@ describe("Ask2GPTController", () => {
       "local-assistant",
       "local-notice",
     ]);
+  });
+
+  it("keeps version-2 attachment cards compact when ChatGPT decorates the user turn", async () => {
+    const local = conversation("packaged-attachment-history");
+    local.remoteUrl = "https://chatgpt.com/c/packaged-attachment-history";
+    const context = explicitContext();
+    const question = "Review [user_name] & <safe>";
+    local.messages = [
+      {
+        id: "packaged-local-user",
+        role: "user",
+        markdown: question,
+        status: "complete",
+        createdAt: local.createdAt,
+        contexts: [context],
+        contextTransportVersion: 2,
+      },
+      {
+        id: "packaged-local-assistant",
+        role: "assistant",
+        markdown: "Old answer",
+        status: "complete",
+        createdAt: local.createdAt,
+      },
+    ];
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([local]), backend, local.id);
+
+    backend.emit({
+      type: "history",
+      conversationId: local.id,
+      remoteUrl: local.remoteUrl,
+      messages: [
+        {
+          role: "user",
+          markdown: promptInlinePresentationV1(`${question}\n\nindex.L1-L1.ts`),
+        },
+        { role: "assistant", markdown: "New answer" },
+      ],
+      observedAt: new Date().toISOString(),
+      complete: true,
+    });
+
+    await vi.waitFor(() => expect(controller.activeConversation?.syncStatus).toBe("synced"));
+    expect(controller.activeConversation?.messages[0]).toMatchObject({
+      id: "packaged-local-user",
+      markdown: question,
+      contexts: [context],
+      contextTransportVersion: 2,
+    });
+  });
+
+  it("does not fold a remote attachment decoration with a different filename", async () => {
+    const local = conversation("mismatched-attachment-history");
+    local.remoteUrl = "https://chatgpt.com/c/mismatched-attachment-history";
+    const context = explicitContext();
+    const question = "Review this selection";
+    local.messages = [
+      {
+        id: "mismatched-local-user",
+        role: "user",
+        markdown: question,
+        status: "complete",
+        createdAt: local.createdAt,
+        contexts: [context],
+        contextTransportVersion: 2,
+      },
+      {
+        id: "mismatched-local-assistant",
+        role: "assistant",
+        markdown: "Old answer",
+        status: "complete",
+        createdAt: local.createdAt,
+      },
+    ];
+    const backend = new FakeBackend();
+    const controller = await createController(new FakeStore([local]), backend, local.id);
+    const mismatchedRemote = promptInlinePresentationV1(`${question}\n\nindex.L1-L2.ts`);
+
+    backend.emit({
+      type: "history",
+      conversationId: local.id,
+      remoteUrl: local.remoteUrl,
+      messages: [
+        { role: "user", markdown: mismatchedRemote },
+        { role: "assistant", markdown: "New answer" },
+      ],
+      observedAt: new Date().toISOString(),
+      complete: true,
+    });
+
+    await vi.waitFor(() => expect(controller.activeConversation?.syncStatus).toBe("synced"));
+    expect(controller.activeConversation?.messages[0]).toMatchObject({
+      role: "user",
+      markdown: mismatchedRemote,
+    });
+    expect(controller.activeConversation?.messages[0]?.id).not.toBe("mismatched-local-user");
+    expect(controller.activeConversation?.messages[0]?.contexts).toBeUndefined();
   });
 
   it("merges incomplete remote history without deleting local messages", async () => {
@@ -2404,7 +2575,9 @@ describe("Ask2GPTController", () => {
     };
     const backend = new FakeBackend();
     const controller = await createController(new FakeStore([local]), backend, local.id);
-    const foldedPrompt = buildVisiblePrompt("解释这段代码", [context]).replace(/\n/gu, " ");
+    const foldedPrompt = promptInlinePresentationV1(
+      buildLegacyVisiblePrompt("解释这段代码", [context]),
+    );
 
     backend.emit({
       type: "history",
@@ -3983,6 +4156,16 @@ function completedPromotionConversation(): Conversation {
 
 function sha256(value: string) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function promptInlinePresentationV1(value: string) {
+  return value
+    .replace(/\s+/gu, " ")
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/([\\`[\]*_])/gu, "\\$1")
+    .trim();
 }
 
 function transcriptSha256(messages: readonly { role: "user" | "assistant"; markdown: string }[]) {

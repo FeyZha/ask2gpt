@@ -1,6 +1,6 @@
 # Ask2GPT — Chrome Relay 编程助手：架构与安全边界
 
-本文描述 0.0.1 MVP 和 Relay 协议 v15。
+本文描述 0.1.0 和 Relay 协议 v15。
 
 产品架构目标是在 VS Code 中提供 Codex 风格的对话体验，同时使用用户已登录的 ChatGPT 网页
 会话作为回答来源：模型、消息、流式回答、标题和当前可见历史以 ChatGPT 页面为事实来源。
@@ -41,8 +41,8 @@ https://chatgpt.com/
 - Chrome Service Worker 扫描固定端口段，并可同时维护到多个 VS Code 窗口的连接。
 - v15 连接使用显式 WebSocket subprotocol `ask2gpt.v15`。宿主先发送 `relay.ready` 固定
   本窗口的 `instanceId`，Chrome 再发送 `relay.hello`；宿主校验 loopback Origin、固定扩展
-  ID、协议版本、产品发布线、消息 schema、方向和目标 `instanceId`。v15 只接受 `0.0.1` 起且
-  产品补丁版本一致或相差 1 的 `0.0.x` 双端临时互连，正式安装仍要求同版；低于该版本、相差
+  ID、协议版本、产品发布线、消息 schema、方向和目标 `instanceId`。v15 只接受 `0.1.0` 起且
+  产品补丁版本一致或相差 1 的 `0.1.x` 双端临时互连，正式安装仍要求同版；低于该版本、相差
   两版及以上或跨协议发布线仍然 fail closed。
 - `relay.hello/relay.ready` 是版本和路由协商，不是密码学身份认证。
 - v15 不使用验证码、`pair.request`、HMAC、nonce、`pairingId`、共享密钥或 SecretStorage
@@ -129,13 +129,14 @@ closed，不会自动重放问题或切换到其他后端。
 1. Webview 只提交文本和用户主动触发的操作；宿主对每条消息做类型、长度和 ID 校验。生成中
    的排队、停止以及“停止后发送”还必须携带渲染该操作时的 `targetRunId`；迟到命令与当前
    run 不一致时 fail closed。
-2. 每个会话拥有独立的待发送草稿上下文，新会话默认不附加任何代码。用户可通过黄色灯泡中的
-   唯一 Ask2GPT Quick Fix 明确附加当前选区，或通过 Composer 的 `+` 附加当前文件/选择
-   文本文件；这些快照都来自编辑器内存缓冲区，并且在 Composer 中可见、可预览和可移除。
+2. 每个会话拥有独立的待发送草稿上下文，新会话默认不附加任何代码。用户可通过 Ask2GPT 侧栏
+   标题栏、编辑器标题栏、右键菜单、命令面板或黄色灯泡中的动作明确附加当前选区，或通过
+   Composer 的 `+` 附加当前选区/当前文件/选择文本文件；这些快照都来自编辑器内存缓冲区，并且在 Composer 中可见、
+   可预览和可移除。
 3. 宿主对所有合法非空 prompt 使用同一发送和并发检查，不做本地意图分类或产品 handoff。
 4. 宿主按会话保存、去重并持久化待发送 Context Bundle。会话切换不得清空草稿或把附件
-   带入其他会话；发送时原子冻结用户可见的快照。短片段进入可见 Prompt，较大快照随
-   `conversation.send` 作为受限文本附件交给 Chrome。
+   带入其他会话；发送时原子冻结用户可见的快照。可见 Prompt 始终只有用户问题，所有快照均随
+   `conversation.send` 作为受限文本附件交给 Chrome，并以内存 `File` 上传。
 5. 每个本地 run 只产生一次 `conversation.send`。Host 与 Relay 不因超时、断线、SPA 替换或
    恢复重发该命令；Content Script 只处理这一命令对应的一次页面提交事务。
 6. Chrome 按明确映射选择标签页；新会话从已绑定 Project 根页创建。Service Worker 与
@@ -157,9 +158,10 @@ closed，不会自动重放问题或切换到其他后端。
    move/press/release。关闭“增强后台接收”时仅为这次指针动作建立短时 debugger 会话，不启用
    Network 域并在释放后立即断开。从 `mousePressed` 开始结果即视为不确定且不可重试，只能进入只读恢复。
    若 exact owned 标签页在发送前处于后台，Service Worker 会在不聚焦 Chrome 窗口的情况下短暂选择
-   该标签页，并要求间隔 350 ms 的两次 composer 稳定就绪证明。最小化的 home window 会先移动到
-   经过边界校验的屏幕外坐标并临时恢复为 normal，使 React 与页面提交处理器真正运行；终态后恢复
-   原边界、原 active 标签页和最小化状态。只读历史预热可以把标签页放入最大 980×760、
+   该标签页，并要求间隔 350 ms 的两次 composer 稳定就绪证明。最小化的 home window 会使用 Chrome
+   自己维护的合法 restore bounds、以 `focused=false` 临时恢复为 normal，使 React 与页面提交处理器
+   真正运行；终态后恢复原边界、原 active 标签页和最小化状态。Relay 不再提供完全离屏坐标，以符合
+   Chromium“窗口至少 50% 位于可见显示区域”的约束。只读历史预热可以把标签页放入最大 980×760、
    `focused=false` 的临时窗口，但非幂等发送边界明确拒绝临时窗口，必须先回到 home window。
    用户在租约期间主动切换标签页、聚焦窗口或改变窗口状态时，恢复逻辑保留用户的新选择。
    前台、后台和最小化场景共用同一 MAIN-world 验证与 trusted-pointer 路径；若 1.5 秒内没有请求生命周期、当前用户消息或
@@ -184,8 +186,21 @@ closed，不会自动重放问题或切换到其他后端。
 
 Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文件，不枚举、搜索或上传工作区，
 也不会根据问题推测应读取哪些其他文件。用户移除默认附件后，本草稿保持无上下文且不会偷偷
-重新添加。无上下文时 ChatGPT 只看到原始问题；有上下文时只看到发送前可见的内联片段和代码
-文件附件。
+重新添加。无上下文时 ChatGPT 只看到原始问题；有上下文时页面仍显示原始问题，并以代码文件
+胶囊封装用户发送前可见的快照，不把源码和运输元数据展开到问题正文。
+
+### 源码追踪
+
+- 待发送和已发送的上下文卡片只向 Host 发送 `conversationId + contextId`；Host 从权威
+  `AppState` 反查 URI、打开文档，并优先用快照内容在当前文档中做唯一重定位。
+- 回答中的 `file:line` 与明确函数引用由 Markdown AST 标成轻量按钮。Webview 只发送
+  `conversationId + assistantMessageId + kind + reference`，不发送 URI；Host 必须重新解析权威
+  assistant markdown，确认引用真实存在，再只在该回答之前已附加的 context 和附件别名中解析。
+- 函数定位仅对这些已附加 URI 调用只读的 Document Symbol Provider；无语言服务时可从有界快照
+  的定义索引回退。文件名或定义有歧义时使用 VS Code QuickPick，不随机选择。
+- “查找关联对话”在命令点击时扫描加密状态中已发送 user message 的 context 快照，以相同 URI、
+  内容和行范围匹配当前选区；命中后先切换权威会话，再发送 `revealTurn` 让 Webview 滚动并短暂标记。
+- 源码追踪不会调用工作区文件枚举或搜索；未在该轮明确附加的文件不会因回答文本而被打开。
 
 ### 后台模型同步
 
@@ -217,13 +232,16 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 单项内容最多 40,000 字符；
 - 所有项内容合计最多 60,000 字符；
 - 问题最多 20,000 字符；
-- 单项不超过 6,000 字符且内联合计不超过 12,000 字符时进入 Prompt；其余大型上下文绝不
-  填入输入框，而是通过页面 `input[type=file]` 以内存 `File` 形式上传，不创建工作区或
-  临时文件；
-- 包含内联元数据、附件清单和分隔符的最终可见 Prompt 最多 100,000 字符。
+- 所有上下文都不填入输入框，而是通过页面 `input[type=file]` 以内存 `File` 形式上传，不创建
+  工作区文件或临时文件；
+- 用户消息持久化 `contextTransportVersion` 收据：缺省值按旧版内联/附件规则恢复，版本 `2`
+  按“纯问题 + 全附件”恢复，避免升级后把运输文本写回前端。
+- 待发送上下文包含选区时，Webview 在 Composer 内显示 8 个静态代码任务快捷动作。点击只修改当前
+  会话的本地草稿并聚焦输入框，不新增 Host/protocol 消息，也不自动发送、排队或打断；只有用户
+  确认发送后，草稿文本才与仍封装的选区上下文一起进入既有发送链路。
 
 任一层超限均明确拒绝，不静默截断。Content Script 必须观察到每个附件文件名且发送控件
-恢复可用后才提交，否则返回 `CHATGPT_ATTACHMENT_FAILED` 并 fail closed。最终 Prompt 不包含
+恢复可用后才提交，否则返回 `CHATGPT_ATTACHMENT_FAILED` 并 fail closed。可见 Prompt 不包含
 本地 URI、工作区目录清单、未选择的编辑器内容、本地完整历史或隐藏系统策略。
 
 ## 会话存储
@@ -293,7 +311,7 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 
 - Webview 使用“任务工具栏 / 单栏消息流 / 底部一体化 Composer”结构和 VS Code 主题变量。
 - 正常状态完全隐藏连接设施；短暂连接状态延迟显示为轻量行，失败才显示一个下一步操作。
-- Composer 左下角 `+` 常驻；默认选区/当前文件和额外附件都以紧凑卡片显示，发送前可预览、
+- Ask2GPT 侧栏标题栏的选区动作常驻；Composer 左下角 `+` 也提供“当前选区”。选区、当前文件和额外附件都以紧凑卡片显示，发送前可预览、
   移除或切换，审阅浮层锚定在 Composer。
 - Composer 尾部只有一个状态主按钮：空闲时 Send、生成且空输入时 Stop、生成且有输入时
   Queue 或“停止后发送”。默认行为来自 `ask2gpt.followUpQueueMode`，回车规则来自
@@ -304,6 +322,8 @@ Ask2GPT 的自动读取严格限于活动编辑器中的当前选区或当前文
 - 240px、320px 和 400px 下保持单栏，菜单、文件名、预览和操作按钮不越界。
 - 流式 Markdown 只替换当前快照，不重新挂载整段消息或重播入场动画。
 - `prefers-reduced-motion` 下关闭非必要动画和顺滑滚动，保留等价状态文本。
+- 回答源码引用使用点状下划线、图标与真实按钮；反查轮次显示短暂左侧追踪条和“匹配此选区”标签，
+  在高对比与 reduced-motion 模式仍保留非颜色状态。
 
 ## 不可信边界与隐私
 
@@ -336,7 +356,7 @@ Popup 中明确点击“重新加载 Relay”；该动作只重启本地伴生�
 
 固定 Chrome 扩展 ID、Origin、WebSocket subprotocol、协议版本、schema、方向、帧大小、
 envelope ID 和 `instanceId` 校验可以减少误连接、远程页面滥用和跨窗口串线，但不能证明
-对端进程身份。这是 0.0.1 MVP 为降低安装和多窗口摩擦所采用的明确风险取舍。
+对端进程身份。这是当前个人开发场景为降低安装和多窗口摩擦所采用的明确风险取舍。
 
 需要抵御本机恶意进程时，应使用 Native Messaging、带操作系统 ACL 的本机 IPC，或其他
 能够验证端点身份的方案，而不是 protocol v15 的零配置 loopback relay。

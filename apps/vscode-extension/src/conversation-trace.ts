@@ -1,0 +1,219 @@
+import type { ContextKind } from "@ask2gpt/protocol";
+
+import type { SelectionReference } from "./selection-reference";
+import type { AppState } from "./types";
+
+const URI_MATCH_SCORE = 1_000;
+const EXACT_CONTENT_SCORE = 600;
+const CONTEXT_CONTAINS_SELECTION_SCORE = 400;
+const SELECTION_CONTAINS_CONTEXT_SCORE = 300;
+const EXACT_RANGE_SCORE = 300;
+const RANGE_OVERLAP_BASE_SCORE = 100;
+const RANGE_OVERLAP_RATIO_SCORE = 100;
+const EXPLICIT_SELECTION_SCORE = 20;
+
+export type ConversationTraceContentMatch =
+  "exact" | "context-contains-selection" | "selection-contains-context" | "none";
+
+export type ConversationTraceMatchKind =
+  "exact" | "content-and-range" | "content" | "range-overlap";
+
+/** A sent user turn whose durable context snapshot relates to an editor selection. */
+export interface ConversationTraceMatch {
+  score: number;
+  matchKind: ConversationTraceMatchKind;
+  contentMatch: ConversationTraceContentMatch;
+  exactRange: boolean;
+  overlapStartLine?: number;
+  overlapEndLine?: number;
+  conversationId: string;
+  conversationTitle: string;
+  conversationUpdatedAt: string;
+  conversationArchivedAt?: string;
+  messageId: string;
+  messageCreatedAt: string;
+  messageMarkdown: string;
+  contextId: string;
+  contextKind: ContextKind;
+  contextFileName: string;
+  contextStartLine: number;
+  contextEndLine: number;
+  contextUnsaved: boolean;
+}
+
+/**
+ * Finds sent user turns related to an exact click-time editor selection.
+ *
+ * The search deliberately sees only `conversation.messages`: pending composer
+ * contexts and queued follow-ups are not durable sent turns. A URI match is
+ * mandatory, then literal content and line overlap contribute to relevance.
+ * Results are relevance-first and newest-first within equal relevance, with
+ * stable ID tie-breakers so AppState ordering cannot change the result.
+ */
+export function findConversationTraceMatches(
+  state: Pick<AppState, "conversations">,
+  reference: SelectionReference,
+  selectedContent: string,
+): ConversationTraceMatch[] {
+  if (!isValidSelection(reference) || selectedContent.length === 0) return [];
+
+  const selectedRange = selectionLineRange(reference);
+  const matches: ConversationTraceMatch[] = [];
+
+  for (const conversation of state.conversations) {
+    for (const message of conversation.messages) {
+      if (message.role !== "user") continue;
+      for (const context of message.contexts ?? []) {
+        if (context.uri !== reference.uri) continue;
+
+        const overlap = lineRangeOverlap(selectedRange, context);
+        const contentMatch = classifyContentMatch(context.content, selectedContent);
+        if (!overlap && contentMatch === "none") continue;
+
+        const exactRange =
+          context.startLine === selectedRange.startLine &&
+          context.endLine === selectedRange.endLine;
+        const score = traceScore(
+          context.kind,
+          contentMatch,
+          exactRange,
+          overlap?.lineCount ?? 0,
+          selectedRange.endLine - selectedRange.startLine + 1,
+        );
+
+        matches.push({
+          score,
+          matchKind: classifyMatchKind(contentMatch, Boolean(overlap), exactRange),
+          contentMatch,
+          exactRange,
+          ...(overlap
+            ? { overlapStartLine: overlap.startLine, overlapEndLine: overlap.endLine }
+            : {}),
+          conversationId: conversation.id,
+          conversationTitle: conversation.title,
+          conversationUpdatedAt: conversation.updatedAt,
+          ...(conversation.archivedAt ? { conversationArchivedAt: conversation.archivedAt } : {}),
+          messageId: message.id,
+          messageCreatedAt: message.createdAt,
+          messageMarkdown: message.markdown,
+          contextId: context.id,
+          contextKind: context.kind,
+          contextFileName: context.fileName,
+          contextStartLine: context.startLine,
+          contextEndLine: context.endLine,
+          contextUnsaved: context.unsaved,
+        });
+      }
+    }
+  }
+
+  return matches.sort(compareTraceMatches);
+}
+
+function isValidSelection(reference: SelectionReference) {
+  const coordinates = [
+    reference.startLine,
+    reference.startCharacter,
+    reference.endLine,
+    reference.endCharacter,
+  ];
+  if (
+    reference.uri.length === 0 ||
+    !Number.isInteger(reference.documentVersion) ||
+    reference.documentVersion < 0 ||
+    coordinates.some((coordinate) => !Number.isInteger(coordinate) || coordinate < 0)
+  ) {
+    return false;
+  }
+  return (
+    reference.endLine > reference.startLine ||
+    (reference.endLine === reference.startLine && reference.endCharacter > reference.startCharacter)
+  );
+}
+
+function selectionLineRange(reference: SelectionReference) {
+  return {
+    startLine: reference.startLine + 1,
+    // Match ContextService's inclusive, one-based snapshot range when a
+    // selection ends at column zero of the following line.
+    endLine:
+      reference.endCharacter === 0 && reference.endLine > reference.startLine
+        ? reference.endLine
+        : reference.endLine + 1,
+  };
+}
+
+function lineRangeOverlap(
+  selected: { startLine: number; endLine: number },
+  context: { startLine: number; endLine: number },
+) {
+  const startLine = Math.max(selected.startLine, context.startLine);
+  const endLine = Math.min(selected.endLine, context.endLine);
+  if (endLine < startLine) return undefined;
+  return { startLine, endLine, lineCount: endLine - startLine + 1 };
+}
+
+function classifyContentMatch(
+  contextContent: string,
+  selectedContent: string,
+): ConversationTraceContentMatch {
+  if (contextContent === selectedContent) return "exact";
+  if (contextContent.includes(selectedContent)) return "context-contains-selection";
+  if (contextContent.length > 0 && selectedContent.includes(contextContent)) {
+    return "selection-contains-context";
+  }
+  return "none";
+}
+
+function traceScore(
+  contextKind: ContextKind,
+  contentMatch: ConversationTraceContentMatch,
+  exactRange: boolean,
+  overlapLines: number,
+  selectedLines: number,
+) {
+  let score = URI_MATCH_SCORE;
+  if (contentMatch === "exact") score += EXACT_CONTENT_SCORE;
+  else if (contentMatch === "context-contains-selection") {
+    score += CONTEXT_CONTAINS_SELECTION_SCORE;
+  } else if (contentMatch === "selection-contains-context") {
+    score += SELECTION_CONTAINS_CONTEXT_SCORE;
+  }
+
+  if (exactRange) score += EXACT_RANGE_SCORE;
+  else if (overlapLines > 0) {
+    score +=
+      RANGE_OVERLAP_BASE_SCORE +
+      Math.round(
+        (Math.min(overlapLines, selectedLines) / selectedLines) * RANGE_OVERLAP_RATIO_SCORE,
+      );
+  }
+  if (contextKind === "selection") score += EXPLICIT_SELECTION_SCORE;
+  return score;
+}
+
+function classifyMatchKind(
+  contentMatch: ConversationTraceContentMatch,
+  overlaps: boolean,
+  exactRange: boolean,
+): ConversationTraceMatchKind {
+  if (contentMatch === "exact" && exactRange) return "exact";
+  if (contentMatch !== "none" && overlaps) return "content-and-range";
+  if (contentMatch !== "none") return "content";
+  return "range-overlap";
+}
+
+function compareTraceMatches(left: ConversationTraceMatch, right: ConversationTraceMatch) {
+  return (
+    right.score - left.score ||
+    compareNewestFirst(left.messageCreatedAt, right.messageCreatedAt) ||
+    compareNewestFirst(left.conversationUpdatedAt, right.conversationUpdatedAt) ||
+    left.conversationId.localeCompare(right.conversationId) ||
+    left.messageId.localeCompare(right.messageId) ||
+    left.contextId.localeCompare(right.contextId)
+  );
+}
+
+function compareNewestFirst(left: string, right: string) {
+  return right.localeCompare(left);
+}

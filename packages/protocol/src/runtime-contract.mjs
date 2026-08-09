@@ -3,8 +3,8 @@ export const RELAY_WEBSOCKET_PROTOCOL = `ask2gpt.v${PROTOCOL_VERSION}`;
 export const RELAY_STATUS_REQUEST_TYPE = "relay.status.request";
 
 const CURRENT_PRODUCT_MAJOR = 0;
-const CURRENT_PRODUCT_MINOR = 0;
-const CURRENT_MINIMUM_PATCH = 1;
+const CURRENT_PRODUCT_MINOR = 1;
+const CURRENT_MINIMUM_PATCH = 0;
 
 export function isRelayProductVersionCompatible(hostVersion, relayVersion) {
   if (hostVersion === relayVersion) return true;

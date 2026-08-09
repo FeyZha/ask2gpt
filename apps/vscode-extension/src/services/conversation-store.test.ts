@@ -184,6 +184,37 @@ describe("ConversationStore", () => {
     });
   });
 
+  it("round-trips the packaged context transport receipt without exposing source text", async () => {
+    const root = await temporaryRoot();
+    const store = new ConversationStore(root, new MemorySecrets());
+    const value = conversation("Packaged context");
+    value.messages[0]!.contexts = [
+      {
+        id: "context-packaged",
+        kind: "selection",
+        fileName: "worker.ts",
+        uri: "file:///workspace/worker.ts",
+        language: "typescript",
+        startLine: 3,
+        endLine: 5,
+        content: "export const packaged = true;",
+        charCount: 29,
+        unsaved: true,
+      },
+    ];
+    value.messages[0]!.contextTransportVersion = 2;
+
+    await store.save(value);
+
+    expect(await readFile(primaryPath(root, FIRST_ID), "utf8")).not.toContain(
+      "export const packaged",
+    );
+    expect((await store.loadAll())[0]?.messages[0]).toMatchObject({
+      contextTransportVersion: 2,
+      contexts: [expect.objectContaining({ id: "context-packaged" })],
+    });
+  });
+
   it("round-trips a paused follow-up queue inside the encrypted conversation record", async () => {
     const root = await temporaryRoot();
     const secrets = new MemorySecrets();
